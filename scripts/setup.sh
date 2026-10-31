@@ -2,16 +2,19 @@
 set -euo pipefail
 
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-runtime="${XDG_DATA_HOME:-$HOME/.local/share}/gh-dash-share"
+runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
 launcher="$bin_directory/ghd"
 parent_path="$PATH"
-install_marker='gh-dash-share-v1'
-agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/gh-dash-share/issue-agent"
+install_marker='mini-factory-v1'
+agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent"
+# Installations made before the rename to mini-factory; upgrades replace only their launcher.
+legacy_runtime="${XDG_DATA_HOME:-$HOME/.local/share}/gh-dash-share"
+legacy_agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/gh-dash-share/issue-agent"
 nm_home="${NM_HOME:-$HOME/.no-mistakes}"
 nm_config="$nm_home/config.yaml"
 nm_source="$bundle/no-mistakes/config.yaml"
-nm_backup="$nm_config.gh-dash-share-backup"
+nm_backup="$nm_config.mini-factory-backup"
 # Tested release: v1.105.0 (prerelease). Stable v1.84.0 lacks the bot settings in no-mistakes/config.yaml.
 nm_minimum='1.105.0'
 nm_template_agent='agent: codex # Initialize to the chosen pipeline agent during first setup.'
@@ -53,7 +56,7 @@ cleanup() {
 	trap - EXIT HUP INT TERM
 	if [ "$replacement_complete" -eq 0 ] && { [ "$replacement_started" -eq 1 ] || { [ -n "$backup" ] && [ -d "$backup/runtime" ]; }; }; then
 		if [ -d "$runtime" ] && [ ! -L "$runtime" ] &&
-			[ "$(cat "$runtime/.gh-dash-share-install" 2>/dev/null || true)" = "$install_marker" ]; then
+			[ "$(cat "$runtime/.mini-factory-install" 2>/dev/null || true)" = "$install_marker" ]; then
 			rm -rf -- "$runtime"
 		fi
 		if [ -n "$backup" ] && [ -d "$backup/runtime" ]; then
@@ -101,8 +104,14 @@ detect_platform() {
 	esac
 }
 
+legacy_installation_is_managed() {
+	[ -d "$legacy_runtime" ] && [ ! -L "$legacy_runtime" ] && [ -O "$legacy_runtime" ] &&
+		[ -f "$legacy_runtime/.gh-dash-share-install" ] && [ ! -L "$legacy_runtime/.gh-dash-share-install" ] &&
+		[ "$(cat "$legacy_runtime/.gh-dash-share-install")" = 'gh-dash-share-v1' ]
+}
+
 check_destinations() {
-	local existing quoted expected
+	local existing quoted expected legacy_quoted legacy_expected
 	case "$HOME:$runtime" in
 	/*:/*) ;;
 	*) die 'HOME and XDG_DATA_HOME must be absolute paths' ;;
@@ -111,15 +120,19 @@ check_destinations() {
 	if [ -e "$runtime" ] || [ -L "$runtime" ]; then
 		[ -d "$runtime" ] && [ ! -L "$runtime" ] && [ -O "$runtime" ] ||
 			die "refusing unrelated or unsafe installation path: $runtime"
-		[ -f "$runtime/.gh-dash-share-install" ] && [ ! -L "$runtime/.gh-dash-share-install" ] &&
-			[ "$(cat "$runtime/.gh-dash-share-install")" = "$install_marker" ] ||
+		[ -f "$runtime/.mini-factory-install" ] && [ ! -L "$runtime/.mini-factory-install" ] &&
+			[ "$(cat "$runtime/.mini-factory-install")" = "$install_marker" ] ||
 			die "refusing unrelated existing installation directory: $runtime"
 	fi
 	printf -v quoted '%q' "$runtime/bin/ghd"
-	expected="$(printf '#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %s "$@"\n' "$quoted")"
+	expected="$(printf '#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %s "$@"\n' "$quoted")"
+	printf -v legacy_quoted '%q' "$legacy_runtime/bin/ghd"
+	legacy_expected="$(printf '#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %s "$@"\n' "$legacy_quoted")"
 	if [ -e "$launcher" ] || [ -L "$launcher" ]; then
-		[ -f "$launcher" ] && [ ! -L "$launcher" ] && [ -O "$launcher" ] &&
-			[ "$(cat "$launcher")" = "$expected" ] || die "refusing unrelated existing launcher: $launcher"
+		[ -f "$launcher" ] && [ ! -L "$launcher" ] && [ -O "$launcher" ] || die "refusing unrelated existing launcher: $launcher"
+		[ "$(cat "$launcher")" = "$expected" ] ||
+			{ [ "$(cat "$launcher")" = "$legacy_expected" ] && legacy_installation_is_managed; } ||
+			die "refusing unrelated existing launcher: $launcher"
 	fi
 	existing="$(command -v ghd 2>/dev/null || true)"
 	[ -z "$existing" ] || [ "$existing" = "$launcher" ] ||
@@ -133,19 +146,26 @@ check_source_clone() {
 	esac
 	# The No-Mistakes config link targets this clone, so setup must not run from the runtime copy.
 	[ "$bundle" != "$(cd "$runtime" 2>/dev/null && pwd -P)" ] ||
-		die 'run make setup from your retained gh-dash-share clone, not the installed runtime copy'
+		die 'run make setup from your retained mini-factory clone, not the installed runtime copy'
 	[ -f "$nm_source" ] && [ ! -L "$nm_source" ] ||
-		die "missing tracked No-Mistakes config: $nm_source; run make setup from your gh-dash-share clone"
+		die "missing tracked No-Mistakes config: $nm_source; run make setup from your mini-factory clone"
 }
 
 select_issue_agent() {
-	local saved=''
+	local saved='' legacy=''
 	if [ -e "$agent_setting" ] || [ -L "$agent_setting" ]; then
 		[ -f "$agent_setting" ] || die "issue agent setting is not a regular file: $agent_setting"
 		IFS= read -r saved <"$agent_setting" || true
+	elif [ -f "$legacy_agent_setting" ] && [ ! -L "$legacy_agent_setting" ]; then
+		# Upgrades keep the choice saved before the rename; the legacy file is left untouched.
+		IFS= read -r legacy <"$legacy_agent_setting" || true
+		case "$legacy" in
+		claude | codex | cursor) ;;
+		*) legacy='' ;;
+		esac
 	fi
 	case "${ISSUE_AGENT:-}" in
-	'') issue_agent="$saved" ;;
+	'') issue_agent="${saved:-$legacy}" ;;
 	claude | codex | cursor) issue_agent="$ISSUE_AGENT" ;;
 	*) die 'ISSUE_AGENT must be claude, codex, or cursor' ;;
 	esac
@@ -342,7 +362,7 @@ no_mistakes_is_suitable() {
 
 install_github_cli_ubuntu() {
 	local scratch repository_line
-	scratch="$(mktemp -d "${TMPDIR:-/tmp}/gh-dash-share-gh.XXXXXX")"
+	scratch="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-gh.XXXXXX")"
 	if ! curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o "$scratch/keyring.gpg"; then
 		rm -rf -- "$scratch"
 		return 1
@@ -364,7 +384,7 @@ install_native_tool() {
 	# Cursor's installer replaces both of its command names.
 	[ "$tool" != cursor-agent ] || { [ ! -e "$bin_directory/agent" ] && [ ! -L "$bin_directory/agent" ]; } ||
 		die "an unrelated $bin_directory/agent exists and Cursor's installer would replace it; resolve it before installation"
-	scratch="$(mktemp -d "${TMPDIR:-/tmp}/gh-dash-share-native.XXXXXX")"
+	scratch="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-native.XXXXXX")"
 	if curl -fsSL "$url" -o "$scratch/install.sh"; then
 		case "$tool" in
 		codex)
@@ -395,7 +415,7 @@ install_bundle() {
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review-dispatch.sh)
 	mkdir -p -- "$(dirname "$runtime")" "$bin_directory"
-	stage="$(mktemp -d "$(dirname "$runtime")/.gh-dash-share-stage.XXXXXX")"
+	stage="$(mktemp -d "$(dirname "$runtime")/.mini-factory-stage.XXXXXX")"
 	for input in "${inputs[@]}" 'tests/*.py'; do
 		case "$input" in
 		tests/*)
@@ -415,16 +435,16 @@ install_bundle() {
 		esac
 	done
 	chmod 755 "$stage/bin/ghd" "$stage/scripts/setup.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
-	printf '%s\n' "$install_marker" >"$stage/.gh-dash-share-install"
+	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
 	"$stage/scripts/doctor.sh" --bundle "$stage" --integrity-only || die 'replacement bundle failed validation; existing installation preserved'
-	launcher_stage="$(mktemp "$bin_directory/.gh-dash-share-launcher.XXXXXX")"
+	launcher_stage="$(mktemp "$bin_directory/.mini-factory-launcher.XXXXXX")"
 	printf -v quoted '%q' "$runtime/bin/ghd"
-	printf '#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %s "$@"\n' "$quoted" >"$launcher_stage"
+	printf '#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %s "$@"\n' "$quoted" >"$launcher_stage"
 	chmod 755 "$launcher_stage"
 	bash -n "$launcher_stage"
 	# Installers can take minutes; recheck ownership before replacing anything.
 	check_destinations
-	backup="$(mktemp -d "$(dirname "$runtime")/.gh-dash-share-backup.XXXXXX")"
+	backup="$(mktemp -d "$(dirname "$runtime")/.mini-factory-backup.XXXXXX")"
 	if [ -d "$runtime" ]; then
 		mv -- "$runtime" "$backup/runtime"
 	fi

@@ -396,7 +396,7 @@ else:
 
 class DistributionTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="gh-dash-share tests ")
+        self.temporary = tempfile.TemporaryDirectory(prefix="mini-factory tests ")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "home with spaces"
@@ -425,7 +425,7 @@ class DistributionTests(unittest.TestCase):
                     "PATH": str(self.home / ".local/bin") + os.pathsep + str(self.mock), "MOCK_BIN": str(self.mock), "MOCK_LOG": str(self.log),
                     "REAL_GIT": REAL_GIT or "", "LANG": "C", "TERM": "dumb",
                     "PYTHONDONTWRITEBYTECODE": "1"}
-        self.installed = Path(self.env["XDG_DATA_HOME"]) / "gh-dash-share"
+        self.installed = Path(self.env["XDG_DATA_HOME"]) / "mini-factory"
         self.wrapper = self.home / ".local/bin/ghd"
 
     def run_script(self, script, *args, cwd=None, env=None):
@@ -640,6 +640,109 @@ class DistributionTests(unittest.TestCase):
         self.assertNotEqual(self.setup().returncode, 0)
         self.assertTrue(self.installed.is_symlink())
         self.assertEqual(list(unrelated.iterdir()), [])
+
+    def legacy_installation(self, issue_agent=None):
+        # The layout setup created before the rename from gh-dash-share to mini-factory.
+        legacy = Path(self.env["XDG_DATA_HOME"]) / "gh-dash-share"
+        (legacy / "bin").mkdir(parents=True)
+        (legacy / "bin/ghd").write_text("#!/usr/bin/env bash\n")
+        (legacy / "bin/ghd").chmod(0o755)
+        (legacy / ".gh-dash-share-install").write_text("gh-dash-share-v1\n")
+        launcher = subprocess.run([
+            "bash", "-c", 'printf \'#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %q "$@"\n\' "$1"',
+            "legacy-launcher", str(legacy / "bin/ghd"),
+        ], capture_output=True, text=True, check=True).stdout
+        self.wrapper.parent.mkdir(parents=True, exist_ok=True)
+        self.wrapper.write_text(launcher)
+        self.wrapper.chmod(0o755)
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share/issue-agent"
+        if issue_agent:
+            setting.parent.mkdir(parents=True, exist_ok=True)
+            setting.write_text(issue_agent + "\n")
+        return legacy, setting
+
+    def test_upgrade_from_legacy_installation_keeps_issue_agent(self):
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
+        for kind in ("claude", "cursor"):
+            with self.subTest(kind=kind):
+                legacy, legacy_setting = self.legacy_installation(kind)
+                self.assert_success(self.interactive_setup("y"))
+                self.assertIn("# mini-factory managed launcher v1\n", self.wrapper.read_text())
+                self.assertIn(str(self.installed / "bin/ghd").replace(" ", "\\ "), self.wrapper.read_text())
+                self.assertEqual(setting.read_text(), kind + "\n")
+                self.assertTrue((self.bundle / "no-mistakes/config.yaml").read_text().startswith(f"agent: {kind} "))
+                # The legacy runtime and setting are left in place, never deleted or rewritten.
+                self.assertEqual((legacy / ".gh-dash-share-install").read_text(), "gh-dash-share-v1\n")
+                self.assertEqual(legacy_setting.read_text(), kind + "\n")
+                self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+                self.assert_success(self.setup())
+                self.assertEqual(setting.read_text(), kind + "\n")
+                self.assert_no_actions()
+                # Reset to a fresh legacy installation for the next agent.
+                shutil.rmtree(legacy)
+                shutil.rmtree(legacy_setting.parent)
+                shutil.rmtree(self.installed)
+                shutil.rmtree(setting.parent)
+                self.wrapper.unlink()
+                (self.home / ".no-mistakes/config.yaml").unlink()
+                shutil.copy2(BUNDLE / "no-mistakes/config.yaml", self.bundle / "no-mistakes/config.yaml")
+
+    def test_legacy_issue_agent_yields_to_override_and_new_setting(self):
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
+        _, legacy_setting = self.legacy_installation("claude")
+        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="cursor"))
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        self.assertEqual(setting.read_text(), "cursor\n")
+        self.assert_success(self.setup())
+        self.assertEqual(setting.read_text(), "cursor\n")
+        self.assertEqual(legacy_setting.read_text(), "claude\n")
+
+    def test_invalid_legacy_issue_agent_defaults_to_codex(self):
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
+        _, legacy_setting = self.legacy_installation("unknown")
+        self.assert_success(self.interactive_setup("y"))
+        self.assertEqual(setting.read_text(), "codex\n")
+        self.assertEqual(legacy_setting.read_text(), "unknown\n")
+
+    def test_fresh_install_defaults_issue_agent_to_codex(self):
+        self.install()
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
+        self.assertEqual(setting.read_text(), "codex\n")
+        self.assertFalse((Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share").exists())
+        self.assert_success(self.setup())
+        self.assertEqual(setting.read_text(), "codex\n")
+
+    def test_refuses_modified_or_unverified_legacy_launcher(self):
+        legacy, _ = self.legacy_installation()
+        original = self.wrapper.read_text()
+        marker = legacy / ".gh-dash-share-install"
+        cases = {
+            "modified launcher": lambda: self.wrapper.write_text(original + "echo extra\n"),
+            "missing marker": lambda: marker.unlink(),
+            "wrong marker": lambda: marker.write_text("gh-dash-share-v2\n"),
+            "symlinked marker": lambda: (marker.unlink(), marker.symlink_to(self.bundle / "README.md")),
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                change()
+                launcher = self.wrapper.read_text()
+                result = self.setup()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("refusing unrelated existing launcher", result.stderr)
+                self.assertEqual(self.wrapper.read_text(), launcher)
+                self.assertFalse(self.installed.exists())
+                self.wrapper.write_text(original)
+                if marker.is_symlink():
+                    marker.unlink()
+                marker.write_text("gh-dash-share-v1\n")
+        # A symlinked legacy runtime is never trusted, even with a valid marker behind it.
+        moved = self.root / "moved legacy runtime"
+        legacy.rename(moved)
+        legacy.symlink_to(moved, target_is_directory=True)
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.wrapper.read_text(), original)
+        self.assertFalse(self.installed.exists())
 
     def test_noninteractive_missing_dependency_never_installs(self):
         (self.mock / "gh").unlink()
@@ -946,7 +1049,7 @@ class DistributionTests(unittest.TestCase):
                                "friend/target", "8", *args, cwd=repo, env=env)
 
     def save_issue_agent(self, kind):
-        setting = Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share/issue-agent"
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
         setting.parent.mkdir(parents=True, exist_ok=True)
         setting.write_text(kind + "\n")
         return setting
@@ -1110,7 +1213,7 @@ class DistributionTests(unittest.TestCase):
     def test_no_mistakes_config_link_initializes_once_and_preserves_edits(self):
         source = self.bundle / "no-mistakes/config.yaml"
         link = self.home / ".no-mistakes/config.yaml"
-        setting = Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share/issue-agent"
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
         self.assert_success(self.interactive_setup("y", ISSUE_AGENT="claude"))
         self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
         self.assertTrue(link.is_symlink())
@@ -1124,7 +1227,7 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(source.read_text(), edited)
         self.assertEqual(os.readlink(link), str(source))
         self.assertEqual(setting.read_text(), "cursor\n")
-        self.assertFalse(link.with_name("config.yaml.gh-dash-share-backup").exists())
+        self.assertFalse(link.with_name("config.yaml.mini-factory-backup").exists())
         self.assert_no_actions()
 
     def test_existing_no_mistakes_config_is_backed_up_never_followed_or_overwritten(self):
@@ -1134,7 +1237,7 @@ class DistributionTests(unittest.TestCase):
         personal.write_text("agent: codex\nlog_level: debug\n")
         link = directory / "config.yaml"
         link.symlink_to(personal)
-        backup = directory / "config.yaml.gh-dash-share-backup"
+        backup = directory / "config.yaml.mini-factory-backup"
         self.assert_success(self.interactive_setup("y"))
         self.assertEqual(os.readlink(backup), str(personal))
         self.assertEqual(personal.read_text(), "agent: codex\nlog_level: debug\n")
@@ -1186,7 +1289,7 @@ class DistributionTests(unittest.TestCase):
         self.assertLess(commands.index(["daemon", "restart"]), commands.index(["update", "--beta"]))
         self.assertEqual(os.readlink(link), str(self.bundle / "no-mistakes/config.yaml"))
         # The native default written by the first daemon start is preserved, not overwritten.
-        self.assertEqual(link.with_name("config.yaml.gh-dash-share-backup").read_text(), "agent: auto\n")
+        self.assertEqual(link.with_name("config.yaml.mini-factory-backup").read_text(), "agent: auto\n")
         self.assert_no_actions(allow_onboarding=True)
 
     def test_cursor_pipeline_installs_user_owned_acpx_for_system_node(self):
