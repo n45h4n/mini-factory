@@ -1,13 +1,13 @@
-# gh-dash-share
+# mini-factory
 
 ```sh
-git clone https://github.com/n45h4n/gh-dash-share.git
-cd gh-dash-share
+git clone https://github.com/n45h4n/mini-factory.git
+cd mini-factory
 make setup ISSUE_AGENT=codex   # or claude, or cursor
 ```
 
 `ISSUE_AGENT` selects the agent for both issue actions and is saved in
-`${XDG_CONFIG_HOME:-$HOME/.config}/gh-dash-share/issue-agent`. Without it, the
+`${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent`. Without it, the
 first setup saves `codex` and later runs keep the saved choice; rerun with a new
 value to change it. **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
@@ -312,7 +312,7 @@ absolute path (never to the runtime copy):
 
 - missing: the link is created;
 - already the correct link: left alone;
-- anything else: with consent, renamed to `config.yaml.gh-dash-share-backup`
+- anything else: with consent, renamed to `config.yaml.mini-factory-backup`
   (a symbolic link is renamed, never followed) and then linked. If that backup
   already exists, setup changes nothing and reports the conflict.
 
@@ -376,8 +376,8 @@ This bundle does not require any bot globally.
 ## Managed files, diagnostics, and updates
 
 Setup copies the runtime into
-`${XDG_DATA_HOME:-$HOME/.local/share}/gh-dash-share/`, with a
-`.gh-dash-share-install` ownership marker, and installs the managed wrapper
+`${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/`, with a
+`.mini-factory-install` ownership marker, and installs the managed wrapper
 `~/.local/bin/ghd`. The dashboard runtime works on its own, but the clone must
 stay where it is for the No-Mistakes configuration link above; run setup from
 the clone, never from the runtime copy. Updates replace only this project's
@@ -449,7 +449,7 @@ and Python 3.9+. It does not install packages or authenticate/run agents.
 
 ## Maintainer: development
 
-This repository is now the source of truth for gh-dash-share. Make changes here
+This repository is now the source of truth for mini-factory. Make changes here
 to the launcher, setup/doctor scripts, gh-dash configuration, workers, and tests.
 No dotfiles checkout or export step is required.
 

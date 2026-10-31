@@ -74,7 +74,7 @@ read_issue_agent_setting() {
 	else
 		config_base="$HOME/.config"
 	fi
-	setting_path="$config_base/gh-dash-share/issue-agent"
+	setting_path="$config_base/mini-factory/issue-agent"
 	selected_kind=codex
 	if [ -e "$setting_path" ] || [ -L "$setting_path" ]; then
 		[ -f "$setting_path" ] || die "issue agent setting is not a regular file: $setting_path"

@@ -52,7 +52,7 @@ def agent_authenticated(kind):
 
 
 def issue_agent_setting():
-    path = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "gh-dash-share/issue-agent"
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "mini-factory/issue-agent"
     try:
         value = path.read_text().strip()
     except OSError:
@@ -212,7 +212,7 @@ def main():
     modes.add_argument("--integrity-only", action="store_true")
     modes.add_argument("--installation-only", action="store_true")
     args = parser.parse_args()
-    bundle = args.bundle or Path(os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")) / "gh-dash-share"
+    bundle = args.bundle or Path(os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")) / "mini-factory"
     failures = []
 
     def check(ok, success, failure):
@@ -297,12 +297,12 @@ def main():
     launcher = Path.home() / ".local/bin/ghd"
     active = shutil.which("ghd")
     expected_wrapper = output([
-        "bash", "-c", 'printf \'#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %q "$@"\n\' "$1"',
-        "gh-dash-share-doctor", str(bundle / "bin/ghd"),
+        "bash", "-c", 'printf \'#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %q "$@"\n\' "$1"',
+        "mini-factory-doctor", str(bundle / "bin/ghd"),
     ])
     try:
         managed = (not launcher.is_symlink() and launcher.read_text() == expected_wrapper
-                   and (bundle / ".gh-dash-share-install").read_text() == "gh-dash-share-v1\n")
+                   and (bundle / ".mini-factory-install").read_text() == "mini-factory-v1\n")
     except OSError:
         managed = False
     check(active and Path(active).resolve() == launcher.resolve() and managed,
