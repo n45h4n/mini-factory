@@ -150,7 +150,7 @@ elif name == "node":
     else:
         fail()
 elif name == "npm":
-    # The default global prefix models a root-owned system Node such as NodeSource's /usr.
+    # The default global prefix models a root-owned system Node in /usr.
     default_prefix = os.environ.get("MOCK_NPM_PREFIX", "/usr")
     if args == ["prefix", "-g"]:
         print(default_prefix)
@@ -312,14 +312,13 @@ elif name in ("brew", "sudo", "apt-get"):
     if name == "brew" and args == ["--version"]:
         print("Homebrew 4.6.0")
     elif name == "sudo" and args[:1] == ["mkdir"] and all(
-            value in ("mkdir", "-p", "-m", "755", "/etc/apt/keyrings", "/etc/apt/sources.list.d", "/etc/apt/preferences.d")
+            value in ("mkdir", "-p", "-m", "755", "/etc/apt/keyrings", "/etc/apt/sources.list.d")
             for value in args):
         pass
     elif "install" in args or "upgrade" in args or "update" in args:
         if os.environ.get("MOCK_INSTALL_FAIL"):
             fail("simulated interrupted package installation")
-        # Homebrew's node formula and NodeSource's nodejs package both provide npm.
-        provided = {"gh": ("gh",), "node": ("node", "npm"), "nodejs": ("node", "npm")}
+        provided = {"gh": ("gh",)}
         for command in (command for package in args for command in provided.get(package, ())):
             shutil.copyfile(root / "mock-cli", root / command)
             (root / command).chmod(0o755)
@@ -378,8 +377,7 @@ elif name == "curl":
                 # The native installer ends by restarting the daemon under set -e.
                 script += '"$destination/no-mistakes" daemon restart >/dev/null\n'
         destination.write_text(script)
-    elif url in ("https://cli.github.com/packages/githubcli-archive-keyring.gpg",
-                 "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"):
+    elif url == "https://cli.github.com/packages/githubcli-archive-keyring.gpg":
         destination.write_bytes(b"MOCK official keyring\n")
     else:
         fail("unexpected upstream URL")
@@ -1191,31 +1189,16 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(link.with_name("config.yaml.gh-dash-share-backup").read_text(), "agent: auto\n")
         self.assert_no_actions(allow_onboarding=True)
 
-    def test_fresh_cursor_pipeline_installs_node_then_user_owned_acpx(self):
+    def test_cursor_pipeline_installs_user_owned_acpx_for_system_node(self):
         (self.mock / "acpx").unlink()
-        result = self.interactive_setup("y", ISSUE_AGENT="cursor")
-        self.assert_success(result)
-        self.assertIn("brew install node", result.stdout)
-        self.assertIn(["install", "node"], [c["args"] for c in self.calls("brew")])
+        for name in ("node", "npm"):
+            (self.mock / name).symlink_to("mock-cli")
+        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="cursor"))
         # Without a user-writable global prefix, acpx goes beside the other commands instead of using sudo.
         self.assertEqual([c["args"] for c in self.calls("npm") if c["args"][:1] == ["install"]],
                          [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
         self.assertTrue((self.wrapper.parent / "acpx").is_file())
         self.assertFalse(self.calls("sudo"))
-        self.assert_no_actions(allow_onboarding=True)
-
-    def test_mocked_ubuntu_cursor_pipeline_installs_nodesource_node(self):
-        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
-            self.skipTest("Ubuntu detection reads the native os-release file")
-        (self.mock / "acpx").unlink()
-        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="cursor", MOCK_OS="Linux", MOCK_ARCH="x86_64"))
-        self.assertTrue(any("https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" in c["args"] for c in self.calls("curl")))
-        actions = [c["args"] for c in self.calls("sudo")]
-        self.assertIn(["apt-get", "install", "-y", "--no-install-recommends", "nodejs"], actions)
-        for path in ("/etc/apt/keyrings/nodesource.asc", "/etc/apt/sources.list.d/nodesource.list", "/etc/apt/preferences.d/nodejs"):
-            self.assertTrue(any(path in args for args in actions), path)
-        self.assertIn(["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"], [c["args"] for c in self.calls("npm")])
-        self.assertTrue((self.wrapper.parent / "acpx").is_file())
         self.assert_no_actions(allow_onboarding=True)
 
     def test_cursor_pipeline_reuses_suitable_node_npm_and_acpx(self):
@@ -1232,28 +1215,28 @@ class DistributionTests(unittest.TestCase):
                          [["install", "-g", "acpx@latest"]])
         self.assertTrue((prefix / "bin/acpx").is_file())
         self.assertFalse(self.calls("brew"))
-        # A rerun finds acpx and needs neither Node installation nor npm.
+        # A rerun finds acpx and needs no npm.
         self.log.unlink()
         self.assert_success(self.setup(**environment))
         self.assertFalse(self.calls("npm") + self.calls("brew"))
         self.assert_no_actions()
 
-    def test_declined_node_installation_reports_incomplete_setup(self):
+    def test_missing_node_reports_incomplete_setup_without_installing_it(self):
         (self.mock / "acpx").unlink()
         (self.home / ".codex").mkdir()
         source = self.bundle / "no-mistakes/config.yaml"
         source.write_text(source.read_text().replace("agent: codex", "agent: cursor", 1))
-        for run in (self.setup, lambda **environment: self.interactive_setup("n", **environment)):
+        for run in (self.setup, lambda **environment: self.interactive_setup("y", **environment)):
             result = run(ISSUE_AGENT="cursor")
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("Remaining action: put Node.js 22.13+ with npm first on PATH", result.stdout)
             self.assertIn("authentication/setup actions remain pending", result.stdout)
-        self.assertIn("brew install node", result.stdout)
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])])
+        self.assertFalse(self.calls("sudo"))
         self.assertFalse(self.calls("npm"))
         self.assertFalse((self.wrapper.parent / "acpx").exists())
         self.assertTrue(self.installed.is_dir())
-        self.assert_no_actions()
+        self.assert_no_actions(allow_onboarding=True)
 
     def test_doctor_reports_unfinished_agent_and_pipeline_onboarding(self):
         self.install()
@@ -1271,15 +1254,18 @@ class DistributionTests(unittest.TestCase):
                 self.assertNotIn("AUTH_SECRET_SENTINEL", result.stdout + result.stderr)
         source = self.bundle / "no-mistakes/config.yaml"
         original = source.read_text()
-        # Native doctor reports a runnable agent, which does not prove its login.
+        # Other native selections rely on native doctor instead of blocking onboarding.
         self.save_issue_agent("codex")
         for selection in ("auto", "acp:cursor"):
             with self.subTest(selection=selection):
                 source.write_text(original.replace("agent: codex", "agent: " + selection, 1))
-                result = self.run_script(doctor, env={"MOCK_CLAUDE_AUTH": "pending"})
+                result = self.run_script(doctor)
+                self.assert_success(result)
+                self.assertIn("NOTE: No-Mistakes pipeline agent " + selection + " login not checked", result.stdout)
+                self.assertIn("Authentication/setup: complete", result.stdout)
+                result = self.run_script(doctor, env={"MOCK_NM_DOCTOR": "fail"})
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("FAIL: No-Mistakes pipeline agent " + selection + " authentication unverified", result.stdout)
-                self.assertIn("Authentication/setup: pending", result.stdout)
+                self.assertIn("No-Mistakes pipeline agent not ready", result.stdout)
         source.write_text(original.replace("agent: codex", "agent: cursor", 1))
         (self.mock / "acpx").unlink()
         result = self.run_script(doctor)

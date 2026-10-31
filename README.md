@@ -118,13 +118,11 @@ with consent, each through its own upstream installer, placing commands in
 
 None of these needs Node/npm. The exception is Cursor as the **No-Mistakes
 pipeline agent**: No-Mistakes runs it through the ACP runner `acpx`, which needs
-Node.js 22.13+. Setup reuses a suitable Node/npm on `PATH`; otherwise it offers
-`brew install node` (or `brew upgrade node`) on macOS, or Node.js 24 LTS from the
-[NodeSource apt repository](https://github.com/nodesource/distributions) on Ubuntu
-(it shows the key, source list, and apt pin it writes before asking). It then offers
-acpx's documented `npm install -g acpx@latest`, adding `--prefix ~/.local` when
-npm's global prefix is not user-writable so acpx never needs sudo. Declining
-either step leaves the prerequisite reported as pending.
+Node.js 22.13+. Setup does not install Node.js; with a suitable Node/npm already
+on `PATH` it offers acpx's documented `npm install -g acpx@latest`, adding
+`--prefix ~/.local` when npm's global prefix is not user-writable so acpx never
+needs sudo. Without a suitable Node/npm, or when you decline, setup reports
+Node.js 22.13+ and acpx as a remaining action.
 Cursor as the issue agent alone does not need acpx. Existing installations whose
 capabilities fail doctor need deliberate repair/update through their own
 installer; setup does not silently upgrade unrelated software.
@@ -393,9 +391,7 @@ the Codex directory and native Herdr integrations above, the issue-agent
 setting, and the No-Mistakes configuration link. On Ubuntu an approved
 GitHub CLI installation writes
 `/etc/apt/keyrings/githubcli-archive-keyring.gpg` and
-`/etc/apt/sources.list.d/github-cli.list`; an approved Node.js installation
-writes `/etc/apt/keyrings/nodesource.asc`,
-`/etc/apt/sources.list.d/nodesource.list`, and `/etc/apt/preferences.d/nodejs`.
+`/etc/apt/sources.list.d/github-cli.list`.
 It never copies the maintainer's
 credentials or personal config. Existing gh-dash, Herdr, shell and unrelated
 agent settings are preserved.
@@ -420,10 +416,10 @@ issue agent, authentication for Codex, the issue agent, and the pipeline agent,
 their Herdr integrations, `acpx` when Cursor is the pipeline agent, the
 No-Mistakes configuration link, and the pipeline agent's readiness via native
 `no-mistakes doctor` (run without update checks or telemetry). Doctor checks
-pipeline login only for `agent: claude`, `codex`, or `cursor`; other native
-selections such as `auto`, `acp:...`, or agent lists stay pending as
-authentication unverified, because native doctor proves only that the agent
-runs. Outside Herdr it
+pipeline login only for `agent: claude`, `codex`, or `cursor`; for other native
+selections such as `auto`, `acp:...`, or agent lists it prints a note and relies
+on native doctor, which proves only that the agent runs, so log in to that agent
+through its own CLI. Outside Herdr it
 skips runtime-context checks and explains how to enter a pane. Inside Herdr it
 checks the inherited route, active compatible server, Codex and issue-agent
 detection manifests, target repository, and Git transport. It never starts

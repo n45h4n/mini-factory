@@ -209,7 +209,7 @@ read_pipeline_agent() {
 	case "$pipeline_agent" in
 	claude | codex | cursor) ;;
 	*)
-		notice "No-Mistakes pipeline agent: ${pipeline_agent:-unset} (not provisioned by setup; log in through its native CLI, doctor reports its authentication as unverified)."
+		notice "No-Mistakes pipeline agent: ${pipeline_agent:-unset} (not provisioned by setup; log in through its native CLI, doctor relies on native no-mistakes doctor for it)."
 		pipeline_agent=''
 		;;
 	esac
@@ -477,49 +477,15 @@ node_is_suitable() {
 		node --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, ""); split($0, v, "."); exit !(v[1] > 22 || (v[1] == 22 && v[2] >= 13))}'
 }
 
-install_node_ubuntu() {
-	local scratch status=0
-	scratch="$(mktemp -d "${TMPDIR:-/tmp}/gh-dash-share-node.XXXXXX")"
-	# Chained so a failed step stops here even when the caller handles the status.
-	curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o "$scratch/nodesource.asc" &&
-		printf 'deb [arch=%s signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_24.x nodistro main\n' \
-			"$(dpkg --print-architecture)" >"$scratch/nodesource.list" &&
-		printf 'Package: nodejs\nPin: origin deb.nodesource.com\nPin-Priority: 600\n' >"$scratch/nodejs" &&
-		sudo mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d /etc/apt/preferences.d &&
-		sudo install -m 644 "$scratch/nodesource.asc" /etc/apt/keyrings/nodesource.asc &&
-		sudo install -m 644 "$scratch/nodesource.list" /etc/apt/sources.list.d/nodesource.list &&
-		sudo install -m 644 "$scratch/nodejs" /etc/apt/preferences.d/nodejs &&
-		sudo apt-get update &&
-		sudo apt-get install -y --no-install-recommends nodejs || status=$?
-	rm -rf -- "$scratch"
-	return "$status"
-}
-
-# Ubuntu's own nodejs is too old or lacks npm, so Ubuntu uses NodeSource's LTS package, which bundles npm.
-install_node() {
-	local action=install
-	if [ "$platform" = macos ]; then
-		command -v brew >/dev/null 2>&1 || { notice 'Homebrew is required to install Node.js; follow the macOS bootstrap instructions in README.md'; return 0; }
-		if brew list --versions node >/dev/null 2>&1; then action=upgrade; fi
-		consent "acpx needs Node.js 22.13+ with npm. Homebrew change: brew $action node. No general brew update/upgrade or shell edits." || return 0
-		HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew "$action" node || notice "brew $action node failed"
-	else
-		command -v sudo >/dev/null 2>&1 || { notice 'sudo is required to install Node.js from the NodeSource apt repository; ask the host administrator'; return 0; }
-		consent 'acpx needs Node.js 22.13+ with npm. Install Node.js 24 LTS from the NodeSource apt repository (https://deb.nodesource.com/node_24.x)? This writes /etc/apt/keyrings/nodesource.asc, /etc/apt/sources.list.d/nodesource.list, and /etc/apt/preferences.d/nodejs (preferring its nodejs, which bundles npm), then runs sudo apt-get update and sudo apt-get install nodejs, replacing Ubuntu nodejs/npm packages if present.' || return 0
-		install_node_ubuntu || notice 'Node.js installation from NodeSource failed'
-	fi
-}
-
 # No-Mistakes runs Cursor through the ACP runner acpx, which needs Node.js 22.13+.
 ensure_acp_runner() {
 	local prefix
 	local npm_arguments=(install -g acpx@latest)
 	[ "$pipeline_agent" = cursor ] || return 0
 	command -v acpx >/dev/null 2>&1 && return 0
-	{ command -v npm >/dev/null 2>&1 && node_is_suitable; } || install_node
 	if command -v npm >/dev/null 2>&1 && node_is_suitable; then
 		prefix="$(npm prefix -g 2>/dev/null || true)"
-		# A root-owned global prefix (such as NodeSource's /usr) gets a user-owned acpx in $bin_directory, never sudo.
+		# A root-owned global prefix (such as a system Node's /usr) gets a user-owned acpx in $bin_directory, never sudo.
 		[ -n "$prefix" ] && [ -w "$prefix/lib/node_modules" ] && [ -w "$prefix/bin" ] ||
 			npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
 		if consent "The No-Mistakes pipeline agent is cursor, which runs through the ACP runner acpx. Install it with its documented npm ${npm_arguments[*]}?"; then

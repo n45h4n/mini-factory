@@ -280,8 +280,8 @@ def main():
               label + " authentication/setup pending: " + login)
     # Native doctor only proves the resolved agent is runnable, not logged in.
     if no_mistakes_config.exists() and pipeline not in AGENTS:
-        check(False, "", "No-Mistakes pipeline agent " + (pipeline or "unset/list") + " authentication unverified: "
-              "set agent: claude|codex|cursor in your clone's no-mistakes/config.yaml so doctor can check its login")
+        print("NOTE: No-Mistakes pipeline agent " + (pipeline or "unset/list") + " login not checked by this doctor; "
+              "readiness relies on native no-mistakes doctor")
     integration = output(["herdr", "integration", "status"]) or ""
     for kind in dict.fromkeys(("codex", issue_agent or "codex")):
         lines = [line for line in integration.splitlines() if line.startswith(kind + ":")]
