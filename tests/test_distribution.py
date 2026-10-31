@@ -641,108 +641,12 @@ class DistributionTests(unittest.TestCase):
         self.assertTrue(self.installed.is_symlink())
         self.assertEqual(list(unrelated.iterdir()), [])
 
-    def legacy_installation(self, issue_agent=None):
-        # The layout setup created before the rename from gh-dash-share to mini-factory.
-        legacy = Path(self.env["XDG_DATA_HOME"]) / "gh-dash-share"
-        (legacy / "bin").mkdir(parents=True)
-        (legacy / "bin/ghd").write_text("#!/usr/bin/env bash\n")
-        (legacy / "bin/ghd").chmod(0o755)
-        (legacy / ".gh-dash-share-install").write_text("gh-dash-share-v1\n")
-        launcher = subprocess.run([
-            "bash", "-c", 'printf \'#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %q "$@"\n\' "$1"',
-            "legacy-launcher", str(legacy / "bin/ghd"),
-        ], capture_output=True, text=True, check=True).stdout
-        self.wrapper.parent.mkdir(parents=True, exist_ok=True)
-        self.wrapper.write_text(launcher)
-        self.wrapper.chmod(0o755)
-        setting = Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share/issue-agent"
-        if issue_agent:
-            setting.parent.mkdir(parents=True, exist_ok=True)
-            setting.write_text(issue_agent + "\n")
-        return legacy, setting
-
-    def test_upgrade_from_legacy_installation_keeps_issue_agent(self):
-        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
-        for kind in ("claude", "cursor"):
-            with self.subTest(kind=kind):
-                legacy, legacy_setting = self.legacy_installation(kind)
-                self.assert_success(self.interactive_setup("y"))
-                self.assertIn("# mini-factory managed launcher v1\n", self.wrapper.read_text())
-                self.assertIn(str(self.installed / "bin/ghd").replace(" ", "\\ "), self.wrapper.read_text())
-                self.assertEqual(setting.read_text(), kind + "\n")
-                self.assertTrue((self.bundle / "no-mistakes/config.yaml").read_text().startswith(f"agent: {kind} "))
-                # The legacy runtime and setting are left in place, never deleted or rewritten.
-                self.assertEqual((legacy / ".gh-dash-share-install").read_text(), "gh-dash-share-v1\n")
-                self.assertEqual(legacy_setting.read_text(), kind + "\n")
-                self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
-                self.assert_success(self.setup())
-                self.assertEqual(setting.read_text(), kind + "\n")
-                self.assert_no_actions()
-                # Reset to a fresh legacy installation for the next agent.
-                shutil.rmtree(legacy)
-                shutil.rmtree(legacy_setting.parent)
-                shutil.rmtree(self.installed)
-                shutil.rmtree(setting.parent)
-                self.wrapper.unlink()
-                (self.home / ".no-mistakes/config.yaml").unlink()
-                shutil.copy2(BUNDLE / "no-mistakes/config.yaml", self.bundle / "no-mistakes/config.yaml")
-
-    def test_legacy_issue_agent_yields_to_override_and_new_setting(self):
-        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
-        _, legacy_setting = self.legacy_installation("claude")
-        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="cursor"))
-        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
-        self.assertEqual(setting.read_text(), "cursor\n")
-        self.assert_success(self.setup())
-        self.assertEqual(setting.read_text(), "cursor\n")
-        self.assertEqual(legacy_setting.read_text(), "claude\n")
-
-    def test_invalid_legacy_issue_agent_defaults_to_codex(self):
-        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
-        _, legacy_setting = self.legacy_installation("unknown")
-        self.assert_success(self.interactive_setup("y"))
-        self.assertEqual(setting.read_text(), "codex\n")
-        self.assertEqual(legacy_setting.read_text(), "unknown\n")
-
     def test_fresh_install_defaults_issue_agent_to_codex(self):
         self.install()
         setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
         self.assertEqual(setting.read_text(), "codex\n")
-        self.assertFalse((Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share").exists())
         self.assert_success(self.setup())
         self.assertEqual(setting.read_text(), "codex\n")
-
-    def test_refuses_modified_or_unverified_legacy_launcher(self):
-        legacy, _ = self.legacy_installation()
-        original = self.wrapper.read_text()
-        marker = legacy / ".gh-dash-share-install"
-        cases = {
-            "modified launcher": lambda: self.wrapper.write_text(original + "echo extra\n"),
-            "missing marker": lambda: marker.unlink(),
-            "wrong marker": lambda: marker.write_text("gh-dash-share-v2\n"),
-            "symlinked marker": lambda: (marker.unlink(), marker.symlink_to(self.bundle / "README.md")),
-        }
-        for name, change in cases.items():
-            with self.subTest(name):
-                change()
-                launcher = self.wrapper.read_text()
-                result = self.setup()
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("refusing unrelated existing launcher", result.stderr)
-                self.assertEqual(self.wrapper.read_text(), launcher)
-                self.assertFalse(self.installed.exists())
-                self.wrapper.write_text(original)
-                if marker.is_symlink():
-                    marker.unlink()
-                marker.write_text("gh-dash-share-v1\n")
-        # A symlinked legacy runtime is never trusted, even with a valid marker behind it.
-        moved = self.root / "moved legacy runtime"
-        legacy.rename(moved)
-        legacy.symlink_to(moved, target_is_directory=True)
-        result = self.setup()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.wrapper.read_text(), original)
-        self.assertFalse(self.installed.exists())
 
     def test_noninteractive_missing_dependency_never_installs(self):
         (self.mock / "gh").unlink()

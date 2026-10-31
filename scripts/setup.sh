@@ -8,9 +8,6 @@ launcher="$bin_directory/ghd"
 parent_path="$PATH"
 install_marker='mini-factory-v1'
 agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent"
-# Installations made before the rename to mini-factory; upgrades replace only their launcher.
-legacy_runtime="${XDG_DATA_HOME:-$HOME/.local/share}/gh-dash-share"
-legacy_agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/gh-dash-share/issue-agent"
 nm_home="${NM_HOME:-$HOME/.no-mistakes}"
 nm_config="$nm_home/config.yaml"
 nm_source="$bundle/no-mistakes/config.yaml"
@@ -104,14 +101,8 @@ detect_platform() {
 	esac
 }
 
-legacy_installation_is_managed() {
-	[ -d "$legacy_runtime" ] && [ ! -L "$legacy_runtime" ] && [ -O "$legacy_runtime" ] &&
-		[ -f "$legacy_runtime/.gh-dash-share-install" ] && [ ! -L "$legacy_runtime/.gh-dash-share-install" ] &&
-		[ "$(cat "$legacy_runtime/.gh-dash-share-install")" = 'gh-dash-share-v1' ]
-}
-
 check_destinations() {
-	local existing quoted expected legacy_quoted legacy_expected
+	local existing quoted expected
 	case "$HOME:$runtime" in
 	/*:/*) ;;
 	*) die 'HOME and XDG_DATA_HOME must be absolute paths' ;;
@@ -126,13 +117,9 @@ check_destinations() {
 	fi
 	printf -v quoted '%q' "$runtime/bin/ghd"
 	expected="$(printf '#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %s "$@"\n' "$quoted")"
-	printf -v legacy_quoted '%q' "$legacy_runtime/bin/ghd"
-	legacy_expected="$(printf '#!/usr/bin/env bash\n# gh-dash-share managed launcher v1\nexec %s "$@"\n' "$legacy_quoted")"
 	if [ -e "$launcher" ] || [ -L "$launcher" ]; then
-		[ -f "$launcher" ] && [ ! -L "$launcher" ] && [ -O "$launcher" ] || die "refusing unrelated existing launcher: $launcher"
-		[ "$(cat "$launcher")" = "$expected" ] ||
-			{ [ "$(cat "$launcher")" = "$legacy_expected" ] && legacy_installation_is_managed; } ||
-			die "refusing unrelated existing launcher: $launcher"
+		[ -f "$launcher" ] && [ ! -L "$launcher" ] && [ -O "$launcher" ] &&
+			[ "$(cat "$launcher")" = "$expected" ] || die "refusing unrelated existing launcher: $launcher"
 	fi
 	existing="$(command -v ghd 2>/dev/null || true)"
 	[ -z "$existing" ] || [ "$existing" = "$launcher" ] ||
@@ -152,20 +139,13 @@ check_source_clone() {
 }
 
 select_issue_agent() {
-	local saved='' legacy=''
+	local saved=''
 	if [ -e "$agent_setting" ] || [ -L "$agent_setting" ]; then
 		[ -f "$agent_setting" ] || die "issue agent setting is not a regular file: $agent_setting"
 		IFS= read -r saved <"$agent_setting" || true
-	elif [ -f "$legacy_agent_setting" ] && [ ! -L "$legacy_agent_setting" ]; then
-		# Upgrades keep the choice saved before the rename; the legacy file is left untouched.
-		IFS= read -r legacy <"$legacy_agent_setting" || true
-		case "$legacy" in
-		claude | codex | cursor) ;;
-		*) legacy='' ;;
-		esac
 	fi
 	case "${ISSUE_AGENT:-}" in
-	'') issue_agent="${saved:-$legacy}" ;;
+	'') issue_agent="$saved" ;;
 	claude | codex | cursor) issue_agent="$ISSUE_AGENT" ;;
 	*) die 'ISSUE_AGENT must be claude, codex, or cursor' ;;
 	esac
