@@ -1,0 +1,7 @@
+agent: codex # Initialize to the chosen pipeline agent during first setup.
+auto_fix:
+  review: 3
+  ci: 3
+ci:
+  review_bot_comments: always
+  release_after_checks_pass: true
