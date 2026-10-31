@@ -28,10 +28,71 @@ def authenticated(argv):
         return False
 
 
+# The three issue agents keep their own native install and login flows.
+AGENTS = {
+    "claude": ("claude", "Claude Code", "claude auth login"),
+    "codex": ("codex", "Codex", "codex login --device-auth"),
+    "cursor": ("cursor-agent", "Cursor", "cursor-agent login"),
+}
+NO_MISTAKES_MINIMUM = (1, 105, 0)
+# Diagnostics stay side-effect free: no background update check or telemetry event.
+NO_MISTAKES_ENVIRONMENT = dict(os.environ, NO_MISTAKES_NO_UPDATE_CHECK="1", NO_MISTAKES_TELEMETRY="0")
+
+
+def agent_authenticated(kind):
+    if kind == "claude":
+        return authenticated(["claude", "auth", "status"])
+    if kind == "codex":
+        return authenticated(["codex", "login", "status"])
+    # Cursor's status exits 0 while logged out; read only its boolean field.
+    try:
+        return json.loads(output(["cursor-agent", "status", "--format", "json"])).get("isAuthenticated") is True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def issue_agent_setting():
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "gh-dash-share/issue-agent"
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        return None, path
+    return (value if value in AGENTS else None), path
+
+
+def pipeline_agent(config):
+    # Only the top-level scalar is read; native no-mistakes doctor validates the whole file.
+    try:
+        match = re.search(r"^agent:[ \t]*[\"']?([A-Za-z0-9_:-]+)[\"']?[ \t]*(#.*)?$", config.read_text(), re.M)
+    except OSError:
+        return None
+    return match.group(1) if match else None
+
+
+def config_link_problem(link, bundle):
+    if not link.is_symlink():
+        return "not a link to your clone's no-mistakes/config.yaml"
+    target = Path(os.readlink(link))
+    if not target.is_absolute() or target.parts[-2:] != ("no-mistakes", "config.yaml"):
+        return "links to an unrelated file: " + str(target)
+    if target.is_symlink() or not target.is_file():
+        return "link target is missing; was the clone moved or deleted? " + str(target)
+    if bundle.resolve() in target.resolve().parents:
+        return "links into the installed runtime copy instead of your clone"
+    return None
+
+
+def native_pipeline_status():
+    text = output(["no-mistakes", "doctor"], NO_MISTAKES_ENVIRONMENT) or ""
+    lines = [line.strip() for line in text.splitlines() if "gate validation" in line]
+    ready = len(lines) == 1 and "\u2713" in lines[0] and "some checks failed" not in text
+    return ready, (lines[0] if lines else "no gate validation result")
+
+
 def integrity(bundle):
     workers = bundle / "scripts/integrations/gh-dash"
-    required = [bundle / "Makefile", bundle / "README.md",
-                bundle / "gh-dash/config.yml", bundle / "scripts/doctor.py"]
+    required = [bundle / "Makefile", bundle / "README.md", bundle / "gh-dash/config.yml",
+                bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py"]
     executables = [bundle / "bin/ghd", bundle / "scripts/setup.sh", bundle / "scripts/doctor.sh"]
     executables += [workers / name for name in (
         "gh-dash-codex-issue.sh", "gh-dash-codex-issue-dispatch.sh",
@@ -45,17 +106,17 @@ def integrity(bundle):
         if output(["bash", "-n", str(path)]) is None:
             raise ValueError("bundle entrypoint failed Bash syntax check: " + str(path))
     config = (bundle / "gh-dash/config.yml").read_text()
-    if (len(re.findall(r"^\s+- key: I\s*$", config, re.M)) != 2
+    if (re.findall(r"^\s+- key: (\S+)\s*$", config, re.M) != ["I", "i", "I"]
             or config.count("gh-dash-codex-pr-review.sh") != 1
-            or config.count("gh-dash-codex-issue-dispatch.sh") != 1
+            or config.count("gh-dash-codex-issue-dispatch.sh") != 2
             or any(token in config for token in (
                 "--factory", "$HOME/dotfiles", "diffnav", "repoPaths:", "pager:",
                 "universal:", "octo", "tuicr", "lazygit", "sandbox"))):
-        raise ValueError("bundle config does not contain the two isolated I routes")
+        raise ValueError("bundle config does not contain the isolated PR I and issue i/I routes")
     compile((bundle / "scripts/doctor.py").read_bytes(), str(bundle / "scripts/doctor.py"), "exec")
 
 
-def route_check():
+def route_check(kinds):
     def document(argv, kind=None):
         raw = output(["herdr", *argv])
         try:
@@ -99,9 +160,10 @@ def route_check():
         for item in entries
     ):
         raise ValueError("invalid Herdr agent detection manifest response")
-    codex = [entry for entry in entries if entry.get("agent") == "codex"]
-    if len(codex) != 1 or not codex[0].get("active_version"):
-        raise ValueError("Herdr server has no active Codex detection manifest")
+    for kind in kinds:
+        matches = [entry for entry in entries if entry.get("agent") == kind]
+        if len(matches) != 1 or not matches[0].get("active_version"):
+            raise ValueError("Herdr server has no active " + AGENTS[kind][1] + " detection manifest")
     root = output(["git", "rev-parse", "--show-toplevel"])
     if not root:
         raise ValueError("enter the target Git repository in this Herdr pane before running ghd")
@@ -167,12 +229,22 @@ def main():
     if args.integrity_only:
         return int(bool(failures))
 
-    for name in ("bash", "git", "make", "gh", "jq", "python3", "codex", "herdr", "curl", "tar",
-                 "env", "tr", "mkdir", "rmdir", "rm", "date", "chmod", "sleep", "nohup", "stat"):
+    issue_agent, setting = issue_agent_setting()
+    no_mistakes_config = Path(os.environ.get("NM_HOME") or str(Path.home() / ".no-mistakes")) / "config.yaml"
+    pipeline = pipeline_agent(no_mistakes_config)
+    # Codex stays required for PR review even when another agent handles issues.
+    agents = list(dict.fromkeys(kind for kind in ("codex", issue_agent or "codex", pipeline) if kind in AGENTS))
+    commands = [AGENTS[kind][0] for kind in agents] + ["no-mistakes"] + (["acpx"] if pipeline == "cursor" else [])
+    for name in ("bash", "git", "make", "gh", "jq", "python3", "herdr", "curl", "tar",
+                 "env", "tr", "mkdir", "rmdir", "rm", "date", "chmod", "sleep", "nohup", "stat", *commands):
         check(shutil.which(name), name + " available", name + " missing; run make setup")
-    for name in ("git", "gh", "jq", "codex", "herdr"):
-        text = output([name, "--version"])
+    for name in ("git", "gh", "jq", "herdr", *commands):
+        text = output([name, "--version"], NO_MISTAKES_ENVIRONMENT)
         check(bool(text and text.strip()), name + " version responds", name + " version check failed")
+    match = re.search(r"version v?(\d+)\.(\d+)\.(\d+)", output(["no-mistakes", "--version"]) or "")
+    check(match and tuple(map(int, match.groups())) >= NO_MISTAKES_MINIMUM,
+          "No-Mistakes meets the tested v1.105.0 release",
+          "No-Mistakes >= v1.105.0 required; run make setup (native no-mistakes update --beta)")
     git_version = output(["git", "--version"]) or ""
     match = re.search(r"git version (\d+)\.(\d+)", git_version)
     check(match and tuple(map(int, match.groups())) >= (2, 29),
@@ -187,10 +259,11 @@ def main():
         (["herdr", "worktree", "open", "--help"], ("--cwd", "--path"), "Herdr worktree open"),
         (["herdr", "agent", "start", "--help"], ("--kind", "--pane", "--timeout"), "Herdr agent start"),
         (["herdr", "agent", "prompt", "--help"], ("--wait", "--timeout"), "Herdr agent prompt"),
-        (["herdr", "integration", "install", "--help"], ("codex",), "Herdr Codex integration installer"),
+        (["herdr", "integration", "install", "--help"], tuple(agents), "Herdr agent integration installer"),
+        (["no-mistakes", "axi", "run", "--help"], ("--yes", "--intent-file", "--closes"), "No-Mistakes unattended AXI run"),
         (["gh", "dash", "--help"], ("--config",), "gh-dash extension"),
     ):
-        text = output(argv) or ""
+        text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
         check(all(token in text for token in tokens), label + " available", label + " capability missing")
     installation_failed = bool(failures)
     print("Installation: " + ("incomplete" if installation_failed else "installed"))
@@ -199,12 +272,28 @@ def main():
 
     check(authenticated(["gh", "auth", "status", "--hostname", "github.com"]),
           "GitHub authenticated", "GitHub authentication/setup pending: gh auth login --hostname github.com --web")
-    check(authenticated(["codex", "login", "status"]),
-          "Codex authenticated", "Codex authentication/setup pending: codex login --device-auth")
+    check(issue_agent is not None, "issue agent for i and I: " + str(issue_agent),
+          "issue agent setting pending: make setup ISSUE_AGENT=claude|codex|cursor (" + str(setting) + ")")
+    for kind in agents:
+        _, label, login = AGENTS[kind]
+        check(agent_authenticated(kind), label + " authenticated",
+              label + " authentication/setup pending: " + login)
+    # Native doctor only proves the resolved agent is runnable, not logged in.
+    if no_mistakes_config.exists() and pipeline not in AGENTS:
+        check(False, "", "No-Mistakes pipeline agent " + (pipeline or "unset/list") + " authentication unverified: "
+              "set agent: claude|codex|cursor in your clone's no-mistakes/config.yaml so doctor can check its login")
     integration = output(["herdr", "integration", "status"]) or ""
-    lines = [line for line in integration.splitlines() if line.startswith("codex:")]
-    check(len(lines) == 1 and lines[0].startswith("codex: current "),
-          "Herdr Codex integration current", "Herdr Codex integration setup pending: herdr integration install codex")
+    for kind in dict.fromkeys(("codex", issue_agent or "codex")):
+        lines = [line for line in integration.splitlines() if line.startswith(kind + ":")]
+        check(len(lines) == 1 and lines[0].startswith(kind + ": current "),
+              "Herdr " + AGENTS[kind][1] + " integration current",
+              "Herdr " + AGENTS[kind][1] + " integration setup pending: herdr integration install " + kind)
+    problem = config_link_problem(no_mistakes_config, bundle)
+    check(problem is None, "No-Mistakes config links to your clone: " + str(no_mistakes_config),
+          "No-Mistakes config link pending (" + str(problem) + "); rerun make setup from your clone")
+    ready, detail = native_pipeline_status()
+    check(ready, "No-Mistakes pipeline agent ready (native doctor: " + detail + ")",
+          "No-Mistakes pipeline agent not ready (native doctor: " + detail + "); run no-mistakes doctor")
     launcher = Path.home() / ".local/bin/ghd"
     active = shutil.which("ghd")
     expected_wrapper = output([
@@ -225,8 +314,8 @@ def main():
         "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"
     )):
         try:
-            route_check()
-            print("OK: inherited Herdr route, compatible server, source repository and Codex detection")
+            route_check(list(dict.fromkeys(("codex", issue_agent or "codex"))))
+            print("OK: inherited Herdr route, compatible server, source repository and agent detection")
         except (OSError, ValueError) as error:
             check(False, "", "runtime context: " + str(error))
         if not failures:

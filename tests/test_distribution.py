@@ -13,6 +13,7 @@ import pty
 import re
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,8 +27,12 @@ REAL_GIT = shutil.which("git")
 
 # External mutations are inert and limited to explicitly tested onboarding.
 # Even a regression in setup/doctor cannot publish or dispatch a live agent.
+ISSUE_BODY = ("Body with \"quotes\", $(touch interpolated-marker), `touch backtick-marker`, and 'single' quotes.\n"
+              "Unicode \u2014 stays data.\n")
+
 MOCK = r'''#!PYTHON
 import json, os, pathlib, shutil, subprocess, sys
+ISSUE_BODY = ISSUE_BODY_LITERAL
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 root = pathlib.Path(os.environ["MOCK_BIN"])
@@ -50,17 +55,22 @@ elif name == "gh":
     elif args[:2] == ["repo", "view"]:
         if "GH_REPO" in os.environ:
             fail("inherited GH_REPO contaminated repository resolution")
-        if "nameWithOwner,sshUrl" in args:
-            print(json.dumps({"nameWithOwner": "friend/target", "sshUrl": "git@github.com:friend/target.git"}))
+        if any("sshUrl" in arg for arg in args):
+            print(json.dumps({"nameWithOwner": "friend/target", "sshUrl": "git@github.com:friend/target.git",
+                              "defaultBranchRef": {"name": "main"}}))
         else:
             print("friend/target")
+    elif args[:2] == ["issue", "view"]:
+        if "GH_REPO" in os.environ or args != ["issue", "view", "8", "--repo", "friend/target", "--json", "number,title,body"]:
+            fail("unexpected issue lookup")
+        print(json.dumps({"number": 8, "title": "Add 'quoted' $(title)", "body": ISSUE_BODY}))
     elif args[:2] == ["auth", "status"]:
         if os.environ.get("MOCK_GH_AUTH") == "pending" and not (root / "gh-authenticated").exists():
             fail("AUTH_SECRET_SENTINEL should never be displayed")
         print("github.com: logged in")
     elif args[:2] == ["auth", "login"] and "--help" in args:
         print("--web --git-protocol --hostname")
-    elif args == ["auth", "login", "--hostname", "github.com", "--web"]:
+    elif args[:5] == ["auth", "login", "--hostname", "github.com", "--web"] and args[5:] in ([], ["--scopes", "project"]):
         print("Native mock device login: open github.com/login/device in another browser")
         (root / "gh-authenticated").write_text("yes")
     elif args[:2] == ["extension", "list"]:
@@ -81,8 +91,8 @@ elif name == "gh":
             if os.environ.get("MOCK_BINDINGS"):
                 config = pathlib.Path(args[args.index("--config") + 1]).read_text()
                 commands = re.findall(r'command:\s*>[-+]?\s*\n\s*([^\n]+)', config)
-                if len(commands) != 2:
-                    fail("mock could not parse both bundled I commands")
+                if len(commands) != 3:
+                    fail("mock could not parse the bundled PR I and issue i/I commands")
                 for command in commands:
                     command = command.replace("{{.RepoName}}", "friend/target")
                     command = command.replace("{{.PrNumber}}", "7").replace("{{.IssueNumber}}", "8")
@@ -107,34 +117,123 @@ elif name == "codex":
         (root / "codex-authenticated").write_text("yes")
     else:
         fail()
+elif name == "claude":
+    if args == ["--version"]:
+        print("2.1.0 (Claude Code)")
+    elif args == ["auth", "status"]:
+        if os.environ.get("MOCK_CLAUDE_AUTH") == "pending" and not (root / "claude-authenticated").exists():
+            fail("AUTH_SECRET_SENTINEL should never be displayed")
+        print('{"loggedIn": true}')
+    elif args == ["auth", "login"]:
+        (root / "claude-authenticated").write_text("yes")
+    else:
+        fail()
+elif name == "cursor-agent":
+    if args == ["--version"]:
+        print("2026.10.22-test")
+    elif args == ["status", "--format", "json"]:
+        # Native Cursor status succeeds while logged out; only the boolean distinguishes it.
+        pending = os.environ.get("MOCK_CURSOR_AUTH") == "pending" and not (root / "cursor-authenticated").exists()
+        print(json.dumps({"isAuthenticated": not pending, "email": "AUTH_SECRET_SENTINEL"}))
+    elif args == ["login"]:
+        (root / "cursor-authenticated").write_text("yes")
+    else:
+        fail()
+elif name == "acpx":
+    if args == ["--version"]:
+        print("0.20.0")
+    else:
+        fail()
+elif name == "node":
+    if args == ["--version"]:
+        print(os.environ.get("MOCK_NODE_VERSION", "v24.11.0"))
+    else:
+        fail()
+elif name == "npm":
+    # The default global prefix models a root-owned system Node such as NodeSource's /usr.
+    default_prefix = os.environ.get("MOCK_NPM_PREFIX", "/usr")
+    if args == ["prefix", "-g"]:
+        print(default_prefix)
+    elif args == ["install", "-g", "acpx@latest"] or (
+            len(args) == 5 and args[:3] == ["install", "-g", "--prefix"] and args[4] == "acpx@latest"):
+        bin_directory = pathlib.Path(args[-2] if "--prefix" in args else default_prefix) / "bin"
+        if not os.access(bin_directory.parent, os.W_OK):
+            fail("npm ERR! code EACCES")
+        bin_directory.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / "mock-cli", bin_directory / "acpx")
+        (bin_directory / "acpx").chmod(0o755)
+    else:
+        fail()
+elif name == "no-mistakes":
+    version = "v1.105.0" if (root / "no-mistakes-updated").exists() else os.environ.get("MOCK_NM_VERSION", "v1.105.0")
+    if args == ["--version"]:
+        print("no-mistakes version " + version + " (test) 2026-10-01T00:00:00Z")
+    elif args == ["daemon", "restart"]:
+        # Native startup writes a default config when missing; releases before
+        # v1.105.0 strictly reject the tracked config's newer bot fields.
+        config = pathlib.Path(os.environ.get("NM_HOME", os.path.expanduser("~/.no-mistakes"))) / "config.yaml"
+        if tuple(map(int, version[1:].split("."))) < (1, 105, 0) and config.exists() \
+                and "review_bot_comments" in config.read_text():
+            fail("load config: field review_bot_comments not found")
+        if not config.exists() and not config.is_symlink():
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("agent: auto\n")
+    elif args == ["axi", "run", "--help"]:
+        print("--intent --intent-file --yes --closes --wait")
+    elif args == ["doctor"]:
+        if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
+            fail("doctor diagnostics must not send telemetry or check for updates")
+        if os.environ.get("MOCK_NM_DOCTOR") == "fail":
+            print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
+        else:
+            print("  \u2713 gate validation  codex is runnable")
+    elif args == ["update", "--beta"]:
+        (root / "no-mistakes-updated").write_text("yes")
+    else:
+        fail()
 elif name == "herdr":
     issue_mode = os.environ.get("MOCK_ISSUE_WORKFLOW") == "1"
-    issue_file = root / "issue-workflow.json"
+    base = pathlib.Path(os.environ.get("MOCK_WORKTREE_BASE", str(root.parent)))
+    issue_file = base / "issue-workflow.json"
     issue_state = json.loads(issue_file.read_text()) if issue_file.exists() else {}
-    def issue_worktree():
-        return {"branch": "agent/issue-8", "path": issue_state["path"],
+    # Implementation and preparation are separate Herdr workspaces, agents, and worktrees.
+    sessions = {
+        "agent/issue-8": {"alias": "target-8", "ws": "issue-ws", "tab": "issue-tab", "pane": "issue-pane",
+                          "directory": "issue worktree with spaces"},
+        "agent/prepare-issue-8": {"alias": "target-prep-8", "ws": "prep-ws", "tab": "prep-tab", "pane": "prep-pane",
+                                  "directory": "prepare worktree with spaces"},
+    }
+    def session(key, value):
+        return next((branch for branch, item in sessions.items() if item[key] == value), None)
+    def save():
+        issue_file.write_text(json.dumps(issue_state))
+    def issue_worktree(branch):
+        return {"branch": branch, "path": issue_state[branch]["path"],
                 "is_bare": False, "is_detached": False, "is_prunable": False,
-                "is_linked_worktree": True, "open_workspace_id": "issue-ws"}
-    def issue_agent():
-        return {"name": "target-8", "agent": "codex", "workspace_id": "issue-ws",
-                "tab_id": "issue-tab", "pane_id": os.environ.get("MOCK_AGENT_PANE", "issue-pane"),
-                "agent_status": os.environ.get("MOCK_AGENT_STATUS", issue_state.get("agent_status", "working"))}
+                "is_linked_worktree": True, "open_workspace_id": sessions[branch]["ws"]}
+    def issue_agent(branch):
+        item, state = sessions[branch], issue_state[branch]
+        return {"name": item["alias"], "agent": state["kind"], "workspace_id": item["ws"],
+                "tab_id": item["tab"], "pane_id": os.environ.get("MOCK_AGENT_PANE", item["pane"]),
+                "agent_status": os.environ.get("MOCK_AGENT_STATUS", state.get("agent_status", "working"))}
+    started = [branch for branch in sessions if issue_state.get(branch, {}).get("agent_started")]
     if args == ["--version"] or args == ["version"]:
         print("herdr version 0.20.0")
     elif "--help" in args:
-        print("integration install status list codex --json --cwd --workspace --pane --kind --timeout --wait --base --branch --path server agent-manifests")
+        print("integration install status list claude codex cursor --json --cwd --workspace --pane --kind --timeout --wait --base --branch --path server agent-manifests")
     elif args[:1] == ["integration"] and args[1:2] in (["status"], ["list"]):
-        if os.environ.get("MOCK_INTEGRATION") == "pending" and not (root / "herdr-integrated").exists():
-            fail("Codex integration not installed")
-        print("codex: current (test fixture)")
-    elif args == ["integration", "install", "codex"]:
-        directory = pathlib.Path(os.environ.get("CODEX_HOME", str(pathlib.Path.home() / ".codex")))
-        directory.mkdir(parents=True, exist_ok=True)
-        with (directory / "config.toml").open("a") as stream:
-            stream.write("# Mock native Herdr integration\n")
-        (directory / "herdr-agent-state.sh").write_text("# Native mock hook\n")
-        (directory / "hooks.json").write_text("{}\n")
-        (root / "herdr-integrated").write_text("yes")
+        for kind in ("claude", "codex", "cursor"):
+            pending = os.environ.get("MOCK_INTEGRATION") == "pending" and not (root / ("herdr-integrated-" + kind)).exists()
+            print(kind + (": not installed (test fixture)" if pending else ": current (test fixture)"))
+    elif args[:2] == ["integration", "install"] and args[2:] in (["claude"], ["codex"], ["cursor"]):
+        if args[2] == "codex":
+            directory = pathlib.Path(os.environ.get("CODEX_HOME", str(pathlib.Path.home() / ".codex")))
+            directory.mkdir(parents=True, exist_ok=True)
+            with (directory / "config.toml").open("a") as stream:
+                stream.write("# Mock native Herdr integration\n")
+            (directory / "herdr-agent-state.sh").write_text("# Native mock hook\n")
+            (directory / "hooks.json").write_text("{}\n")
+        (root / ("herdr-integrated-" + args[2])).write_text("yes")
     elif args[:1] == ["notification"]:
         pass
     elif args[:1] == ["status"]:
@@ -143,76 +242,87 @@ elif name == "herdr":
     elif args[:2] == ["workspace", "get"]:
         envelope("workspace_info", "workspace", {"workspace_id": args[2] if issue_mode else "ws"})
     elif args[:2] == ["tab", "get"]:
+        branch = issue_mode and session("tab", args[2])
         envelope("tab_info", "tab", {"tab_id": args[2] if issue_mode else "tab",
-            "workspace_id": "issue-ws" if issue_mode and args[2] == "issue-tab" else "ws"})
+            "workspace_id": sessions[branch]["ws"] if branch else "ws"})
     elif args[:2] == ["pane", "get"]:
-        target = issue_mode and args[2] == "issue-pane"
+        branch = issue_mode and session("pane", args[2])
         envelope("pane_info", "pane", {"pane_id": "wrong" if os.environ.get("MOCK_ROUTE") == "wrong" else args[2] if issue_mode else "pane",
-            "tab_id": "issue-tab" if target else "tab", "workspace_id": "issue-ws" if target else "ws",
-            "foreground_cwd": issue_state["path"] if target else os.getcwd()})
+            "tab_id": sessions[branch]["tab"] if branch else "tab", "workspace_id": sessions[branch]["ws"] if branch else "ws",
+            "foreground_cwd": issue_state[branch]["path"] if branch else os.getcwd()})
     elif args[:2] == ["server", "agent-manifests"]:
-        envelope("agent_manifest_status", "manifests", [{"agent": "codex",
-            "active_version": None if os.environ.get("MOCK_MANIFEST") == "missing" else "1"}])
+        envelope("agent_manifest_status", "manifests", [{"agent": kind,
+            "active_version": None if os.environ.get("MOCK_MANIFEST") in ("missing", kind) else "1"}
+            for kind in ("claude", "codex", "cursor")])
     elif issue_mode and args[:2] == ["worktree", "list"]:
         source = args[args.index("--cwd") + 1]
         print(json.dumps({"id": "test", "result": {"type": "worktree_list",
             "source": {"source_checkout_path": source, "source_workspace_id": "ws"},
-            "worktrees": [issue_worktree()] if "path" in issue_state else []}}))
+            "worktrees": [issue_worktree(branch) for branch in sessions if "path" in issue_state.get(branch, {})]}}))
     elif issue_mode and args[:2] in (["worktree", "create"], ["worktree", "open"]):
         source = pathlib.Path(args[args.index("--cwd") + 1]).resolve()
         if not source.is_relative_to(root.parent):
             fail("worktree fixture escaped disposable test root")
-        if args[args.index("--branch") + 1] != "agent/issue-8":
+        branch = args[args.index("--branch") + 1]
+        if branch not in sessions:
             fail("unexpected issue branch")
+        state = issue_state.setdefault(branch, {})
         if args[1] == "create":
-            destination = root.parent / "issue worktree with spaces"
+            destination = base / sessions[branch]["directory"]
             subprocess.run([os.environ["REAL_GIT"], "-C", str(source), "worktree", "add",
-                            str(destination), "agent/issue-8"], check=True, capture_output=True)
-            issue_state["path"] = str(destination)
-            issue_file.write_text(json.dumps(issue_state))
-        elif "path" not in issue_state:
+                            str(destination), branch], check=True, capture_output=True)
+            state["path"] = str(destination)
+            save()
+        elif "path" not in state:
             fail("cannot open absent issue worktree")
+        item = sessions[branch]
         print(json.dumps({"id": "test", "result": {"type": "worktree_created" if args[1] == "create" else "worktree_opened",
-            "workspace": {"workspace_id": "issue-ws"},
-            "tab": {"tab_id": "issue-tab", "workspace_id": "issue-ws"},
-            "root_pane": {"pane_id": "issue-pane", "tab_id": "issue-tab", "workspace_id": "issue-ws",
-                          "foreground_cwd": issue_state["path"]},
-            "worktree": issue_worktree()}}))
+            "workspace": {"workspace_id": item["ws"]},
+            "tab": {"tab_id": item["tab"], "workspace_id": item["ws"]},
+            "root_pane": {"pane_id": item["pane"], "tab_id": item["tab"], "workspace_id": item["ws"],
+                          "foreground_cwd": state["path"]},
+            "worktree": issue_worktree(branch)}}))
     elif issue_mode and args[:2] == ["agent", "list"]:
-        envelope("agent_list", "agents", [issue_agent()] if issue_state.get("agent_started") else [])
+        envelope("agent_list", "agents", [issue_agent(branch) for branch in started])
     elif issue_mode and args[:2] == ["agent", "get"]:
-        if not issue_state.get("agent_started"):
+        branch = session("alias", args[2])
+        if branch not in started:
             print(json.dumps({"id": "test", "error": {"code": "agent_not_found"}}))
             sys.exit(1)
-        envelope("agent_info", "agent", issue_agent())
+        envelope("agent_info", "agent", issue_agent(branch))
     elif issue_mode and args[:2] == ["agent", "start"]:
-        if args != ["agent", "start", "target-8", "--kind", "codex", "--pane", "issue-pane", "--timeout", "30000"]:
+        branch = session("alias", args[2])
+        if (branch is None or args[3:] != ["--kind", args[4], "--pane", sessions[branch]["pane"], "--timeout", "30000"]
+                or args[4] not in ("claude", "codex", "cursor")):
             fail("unexpected issue agent launch")
-        issue_state["agent_started"] = True
-        issue_state["agent_status"] = "idle"
-        issue_file.write_text(json.dumps(issue_state))
-        envelope("agent_started", "agent", issue_agent())
+        issue_state[branch].update(agent_started=True, agent_status="idle", kind=args[4])
+        save()
+        envelope("agent_started", "agent", issue_agent(branch))
     elif issue_mode and args[:2] in (["agent", "prompt"], ["agent", "focus"]):
-        if args[2] != "issue-pane" or not issue_state.get("agent_started"):
+        branch = session("pane", args[2])
+        if branch not in started:
             fail("issue agent action escaped validated pane")
         if args[1] == "prompt":
-            issue_state["agent_status"] = "working"
-            issue_file.write_text(json.dumps(issue_state))
-        envelope("agent_prompted" if args[1] == "prompt" else "agent_info", "agent", issue_agent())
+            issue_state[branch]["agent_status"] = "working"
+            save()
+        envelope("agent_prompted" if args[1] == "prompt" else "agent_info", "agent", issue_agent(branch))
     else:
         fail()
 elif name in ("brew", "sudo", "apt-get"):
     if name == "brew" and args == ["--version"]:
         print("Homebrew 4.6.0")
     elif name == "sudo" and args[:1] == ["mkdir"] and all(
-            value in ("mkdir", "-p", "-m", "755", "/etc/apt/keyrings", "/etc/apt/sources.list.d") for value in args):
+            value in ("mkdir", "-p", "-m", "755", "/etc/apt/keyrings", "/etc/apt/sources.list.d", "/etc/apt/preferences.d")
+            for value in args):
         pass
     elif "install" in args or "upgrade" in args or "update" in args:
         if os.environ.get("MOCK_INSTALL_FAIL"):
             fail("simulated interrupted package installation")
-        if "gh" in args:
-            shutil.copyfile(root / "mock-cli", root / "gh")
-            (root / "gh").chmod(0o755)
+        # Homebrew's node formula and NodeSource's nodejs package both provide npm.
+        provided = {"gh": ("gh",), "node": ("node", "npm"), "nodejs": ("node", "npm")}
+        for command in (command for package in args for command in provided.get(package, ())):
+            shutil.copyfile(root / "mock-cli", root / command)
+            (root / command).chmod(0o755)
     else:
         fail()
 elif name == "git":
@@ -222,7 +332,12 @@ elif name == "git":
         print(os.environ.get("MOCK_EFFECTIVE_URL", "git@github.com:friend/target.git")
               if "--get-url" in args else "0123456789abcdef0123456789abcdef01234567\tHEAD")
         sys.exit(0)
-    if any(arg in args for arg in ("worktree", "push", "fetch", "clone", "commit", "checkout", "reset")):
+    if "fetch" in args and os.environ.get("MOCK_REMOTE"):
+        # Preparation fetches GitHub's sshUrl; route it to a disposable local fixture.
+        if os.environ.get("MOCK_FETCH") == "fail":
+            fail("mock default-branch fetch failure")
+        args = [os.environ["MOCK_REMOTE"] if arg == "git@github.com:friend/target.git" else arg for arg in args]
+    elif any(arg in args for arg in ("worktree", "push", "fetch", "clone", "commit", "checkout", "reset")):
         fail("unexpected Git mutation")
     os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
 elif name == "nohup":
@@ -235,23 +350,36 @@ elif name == "curl":
         fail("unexpected download")
     url = next((argument for argument in args if argument.startswith("https://")), "")
     destination = pathlib.Path(args[args.index("-o") + 1])
-    if url in ("https://chatgpt.com/codex/install.sh", "https://herdr.dev/install.sh"):
-        tool = "codex" if "chatgpt.com" in url else "herdr"
-        variable = "CODEX_INSTALL_DIR" if tool == "codex" else "HERDR_INSTALL_DIR"
+    installers = {
+        "https://chatgpt.com/codex/install.sh": ("codex", "${CODEX_INSTALL_DIR:?}"),
+        "https://herdr.dev/install.sh": ("herdr", "${HERDR_INSTALL_DIR:?}"),
+        "https://claude.ai/install.sh": ("claude", "$HOME/.local/bin"),
+        "https://cursor.com/install": ("cursor-agent", "$HOME/.local/bin"),
+        "https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh":
+            ("no-mistakes", "${NO_MISTAKES_LINK_DIR:?}"),
+    }
+    if url in installers:
+        tool, location = installers[url]
         script = '#!/bin/sh\nset -eu\n'
         if os.environ.get("MOCK_INSTALL_FAIL"):
             script += 'echo "simulated interrupted native installation" >&2\nexit 81\n'
         else:
-            script += 'destination="${' + variable + ':?}"\n'
+            script += 'destination="' + location + '"\n'
             if tool == "codex":
                 script += '[ "$CODEX_NON_INTERACTIVE" = true ]\n'
-                script += 'case ":$PATH:" in *":$destination:"*) ;; *) exit 82 ;; esac\n'
                 script += 'mkdir -p "$HOME/.codex"\n'
+            if tool != "herdr":
+                script += 'case ":$PATH:" in *":$destination:"*) ;; *) exit 82 ;; esac\n'
             script += 'mkdir -p "$destination"\n'
-            script += 'cp "$MOCK_BIN/mock-cli" "$destination/' + tool + '"\n'
-            script += 'chmod 755 "$destination/' + tool + '"\n'
+            for command in (tool, "agent") if tool == "cursor-agent" else (tool,):
+                script += 'cp "$MOCK_BIN/mock-cli" "$destination/' + command + '"\n'
+                script += 'chmod 755 "$destination/' + command + '"\n'
+            if tool == "no-mistakes":
+                # The native installer ends by restarting the daemon under set -e.
+                script += '"$destination/no-mistakes" daemon restart >/dev/null\n'
         destination.write_text(script)
-    elif url == "https://cli.github.com/packages/githubcli-archive-keyring.gpg":
+    elif url in ("https://cli.github.com/packages/githubcli-archive-keyring.gpg",
+                 "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"):
         destination.write_bytes(b"MOCK official keyring\n")
     else:
         fail("unexpected upstream URL")
@@ -262,7 +390,7 @@ elif name == "dpkg":
         fail()
 else:
     fail()
-'''.replace("#!PYTHON", "#!" + sys.executable).replace(
+'''.replace("#!PYTHON", "#!" + sys.executable).replace("ISSUE_BODY_LITERAL", repr(ISSUE_BODY)).replace(
     "import json, os, pathlib, shutil, subprocess, sys",
     "import json, os, pathlib, re, shutil, subprocess, sys",
 )
@@ -283,7 +411,8 @@ class DistributionTests(unittest.TestCase):
         mock_script = self.mock / "mock-cli"
         mock_script.write_text(MOCK)
         mock_script.chmod(0o755)
-        for name in ("gh", "codex", "herdr", "uname", "brew", "curl", "sudo", "apt-get", "git", "nohup", "ssh", "dpkg"):
+        for name in ("gh", "codex", "claude", "cursor-agent", "acpx", "no-mistakes", "herdr", "uname",
+                     "brew", "curl", "sudo", "apt-get", "git", "nohup", "ssh", "dpkg"):
             (self.mock / name).symlink_to(mock_script.name)
         # A controlled PATH makes genuinely missing dependencies reproducible.
         utilities = ("bash sh env make jq python3 tar mkdir cp mv rm chmod cat find readlink dirname "
@@ -319,7 +448,7 @@ class DistributionTests(unittest.TestCase):
         deadline = time.monotonic() + 30
         try:
             # More than one prompt may be needed; every answer remains explicit.
-            os.write(master, ((answer + "\n") * 12).encode())
+            os.write(master, ((answer + "\n") * 24).encode())
             while time.monotonic() < deadline:
                 ready, _, _ = select.select([master], [], [], 0.1)
                 if ready:
@@ -360,9 +489,9 @@ class DistributionTests(unittest.TestCase):
         self.assertTrue(self.wrapper.is_file())
         self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
 
-    def source_repo(self, commit=True):
-        repo = self.root / "target repo with spaces"
-        repo.mkdir()
+    def source_repo(self, commit=True, base=None):
+        repo = (base or self.root) / "target repo with spaces"
+        repo.mkdir(parents=True)
         def git(*args):
             return subprocess.run([REAL_GIT, "-C", str(repo), *args], env=dict(self.env, PATH=REAL_PATH),
                                   check=True, capture_output=True, text=True).stdout.strip()
@@ -376,12 +505,26 @@ class DistributionTests(unittest.TestCase):
             git("commit", "-m", "Fixture")
         return repo, git
 
+    def advance_default_branch(self, git, message):
+        # The fixture repository doubles as the fetched remote; main differs from the captured branch.
+        parent = git("rev-parse", "main" if git("branch", "--list", "main") else "HEAD")
+        commit = git("commit-tree", parent + "^{tree}", "-p", parent, "-m", message)
+        git("update-ref", "refs/heads/main", commit)
+        return commit
+
     def issue_environment(self, repo, git, **overrides):
         return {"HERDR_SOCKET_PATH": str(self.home / "test.sock"), "HERDR_WORKSPACE_ID": "ws",
                 "HERDR_TAB_ID": "tab", "HERDR_PANE_ID": "pane", "MOCK_ISSUE_WORKFLOW": "1",
+                "MOCK_REMOTE": str(repo), "MOCK_WORKTREE_BASE": str(repo.parent),
                 "GH_DASH_SOURCE_ROOT": str(repo), "GH_DASH_SOURCE_REPO": "friend/target",
                 "GH_DASH_SOURCE_BRANCH": "feature/friend", "GH_DASH_SOURCE_SHA": git("rev-parse", "HEAD"),
                 "GH_DASH_SOURCE_DIRTY": "0", **overrides}
+
+    def herdr_calls(self, *prefix):
+        return [call["args"] for call in self.calls("herdr") if call["args"][:len(prefix)] == list(prefix)]
+
+    def notifications(self):
+        return [args[args.index("--body") + 1] for args in self.herdr_calls("notification", "show")]
 
     def assert_no_actions(self, allow_onboarding=False):
         for record in self.calls():
@@ -389,7 +532,7 @@ class DistributionTests(unittest.TestCase):
             if "--help" in args:
                 continue
             if tool == "gh":
-                self.assertNotIn(args[:2], (["pr", "comment"], ["pr", "ready"]))
+                self.assertNotIn(args[:2], (["pr", "comment"], ["pr", "ready"], ["pr", "merge"], ["issue", "edit"]))
                 if not allow_onboarding:
                     self.assertNotEqual(args[:2], ["auth", "login"])
             if tool == "herdr":
@@ -398,16 +541,24 @@ class DistributionTests(unittest.TestCase):
                     self.assertNotEqual(args[:2], ["integration", "install"] if "--help" not in args else [])
             if tool == "codex":
                 self.assertNotEqual(args[:1], ["exec"])
+            if tool == "no-mistakes":
+                # Setup and doctor never initialize repositories, drive runs, or manage the daemon.
+                self.assertNotIn(args[:1], (["init"], ["axi"], ["rerun"]))
+                if not allow_onboarding:
+                    # Only the consented native installer restarts the daemon.
+                    self.assertNotIn(args[:1], (["update"], ["daemon"]))
+            if tool in ("claude", "cursor-agent") and not allow_onboarding:
+                self.assertNotIn("login", args)
             if tool == "git":
                 self.assertNotIn("worktree", args)
 
     def test_exact_config_and_runtime_permissions(self):
         config = (self.bundle / "gh-dash/config.yml").read_text()
         self.assertEqual(re.findall(r"^([A-Za-z][A-Za-z0-9_]*):", config, re.M), ["defaults", "keybindings"])
-        self.assertEqual(re.findall(r"key:\s*(\S+)", config), ["I", "I"])
+        self.assertEqual(re.findall(r"key:\s*(\S+)", config), ["I", "i", "I"])
         self.assertIn("gh-dash-codex-pr-review.sh", config)
         self.assertIn("gh-dash-codex-issue-dispatch.sh", config)
-        for forbidden in ("--factory", "diffnav", "lazygit", "tuicr", "octo", "queue", "prepare", "sandbox", "$HOME/dotfiles", "repoPaths"):
+        for forbidden in ("--factory", "diffnav", "lazygit", "tuicr", "octo", "queue", "sandbox", "$HOME/dotfiles", "repoPaths"):
             self.assertNotIn(forbidden, config)
         for relative in ("bin/ghd", "scripts/setup.sh", "scripts/doctor.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
@@ -549,7 +700,9 @@ class DistributionTests(unittest.TestCase):
         self.assertTrue((directory / "herdr-agent-state.sh").is_file())
         self.assertIn("hooks.json", result.stdout)
         self.assertIn("config.toml", result.stdout)
-        self.assertIn(["auth", "login", "--hostname", "github.com", "--web"], [c["args"] for c in self.calls("gh")])
+        # The optional project scope is requested only because this run consented to it.
+        self.assertIn(["auth", "login", "--hostname", "github.com", "--web", "--scopes", "project"],
+                      [c["args"] for c in self.calls("gh")])
         self.assertIn(["login", "--device-auth"], [c["args"] for c in self.calls("codex")])
         self.assertIn(["integration", "install", "codex"], [c["args"] for c in self.calls("herdr")])
         self.assert_no_actions(allow_onboarding=True)
@@ -666,7 +819,7 @@ class DistributionTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 self.assertNotEqual(self.run_script(self.wrapper, *arguments, cwd=repo).returncode, 0)
 
-    def test_both_installed_binding_routes_stop_safely_without_herdr(self):
+    def test_all_installed_binding_routes_stop_safely_without_herdr(self):
         self.install()
         shutil.rmtree(self.bundle)
         repo, _ = self.source_repo()
@@ -676,10 +829,11 @@ class DistributionTests(unittest.TestCase):
         logs = []
         while time.monotonic() < deadline:
             logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 2 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
+            if len(logs) == 3 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
                 break
             time.sleep(0.02)
-        self.assertEqual(len(logs), 2)
+        self.assertEqual(sorted(file.name.rsplit("-", 2)[-1] for file in logs),
+                         ["8.log", "prepare.log", "review.log"])
         for file in logs:
             self.assertIn("HERDR_SOCKET_PATH", file.read_text())
             self.assertNotIn("/unavailable/dotfiles", file.read_text())
@@ -722,11 +876,16 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(git("rev-parse", "agent/issue-8"), captured)
         self.assertEqual((worktree / "source.txt").read_text(), "committed content\n")
         self.assertEqual((repo / "source.txt").read_text(), "uncommitted source stays here\n")
-        starts = [c for c in self.calls("herdr") if c["args"][:2] == ["agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        prompts = [c for c in self.calls("herdr") if c["args"][:2] == ["agent", "prompt"]]
-        self.assertEqual([c["args"] for c in prompts], [["agent", "prompt", "issue-pane",
-            "Fetch issue friend/target#8 and use its body as the prompt.", "--wait", "--until", "working", "--timeout", "30000"]])
+        self.assertEqual(self.herdr_calls("agent", "start"), [["agent", "start", "target-8", "--kind", "codex",
+                                                                "--pane", "issue-pane", "--timeout", "30000"]])
+        prompts = self.herdr_calls("agent", "prompt")
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0][:3] + prompts[0][4:], ["agent", "prompt", "issue-pane",
+            "--wait", "--until", "working", "--timeout", "30000"])
+        prompt = prompts[0][3]
+        self.assertTrue(prompt.startswith("Fetch issue friend/target#8 and use its body as the prompt."))
+        # The captured base stays visible and is not presented as the preparation commit.
+        self.assertIn("starts from feature/friend at " + captured, prompt)
         (worktree / "source.txt").write_text("existing issue edits\n")
         result = self.run_script(launcher, "friend/target", "8", cwd=repo,
                                  env=dict(route, MOCK_AGENT_STATUS="idle"))
@@ -782,6 +941,358 @@ class DistributionTests(unittest.TestCase):
         calls = self.calls("herdr")
         self.assertFalse(any(c["args"][:2] in (["agent", "start"], ["agent", "prompt"], ["agent", "focus"], ["worktree", "create"])
                              for c in calls))
+
+    def issue_helper(self, *args, **env):
+        repo = Path(env.pop("cwd"))
+        return self.run_script(self.bundle / "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
+                               "friend/target", "8", *args, cwd=repo, env=env)
+
+    def save_issue_agent(self, kind):
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share/issue-agent"
+        setting.parent.mkdir(parents=True, exist_ok=True)
+        setting.write_text(kind + "\n")
+        return setting
+
+    def test_selected_agent_prepares_and_implements_in_separate_sessions(self):
+        for kind in ("claude", "codex", "cursor"):
+            with self.subTest(kind=kind):
+                self.save_issue_agent(kind)
+                repo, git = self.source_repo(base=self.root / kind)
+                main = self.advance_default_branch(git, "Current default branch")
+                route = self.issue_environment(repo, git, cwd=repo)
+                captured = route["GH_DASH_SOURCE_SHA"]
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**route))
+                self.assert_success(self.issue_helper("prepare", **route))
+                self.assertEqual(self.herdr_calls("agent", "start"), [
+                    ["agent", "start", "target-8", "--kind", kind, "--pane", "issue-pane", "--timeout", "30000"],
+                    ["agent", "start", "target-prep-8", "--kind", kind, "--pane", "prep-pane", "--timeout", "30000"]])
+                prompts = self.herdr_calls("agent", "prompt")
+                self.assertEqual([args[2] for args in prompts], ["issue-pane", "prep-pane"])
+                implement, prepare = (args[3] for args in prompts)
+                # Implementation keeps the captured base; preparation inspects freshly fetched main.
+                self.assertEqual(git("rev-parse", "agent/issue-8"), captured)
+                self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
+                self.assertNotEqual(captured, main)
+                self.assertIn('no-mistakes axi run --yes --intent-file "$intent_file" --closes "$issue_number"', implement)
+                self.assertIn("starts from feature/friend at " + captured, implement)
+                self.assertTrue(prepare.startswith("Prepare issue friend/target#8 for dispatch; do not implement it."))
+                self.assertIn("main commit " + main, prepare)
+                self.assertIn("ready to dispatch, needs a decision, or already satisfied", prepare)
+                self.assertNotIn("no-mistakes", prepare)
+
+    def test_preparation_refreshes_only_when_safe_and_never_uses_a_stale_snapshot(self):
+        repo, git = self.source_repo()
+        main = self.advance_default_branch(git, "main 1")
+        route = self.issue_environment(repo, git, cwd=repo)
+        result = self.issue_helper("prepare", **dict(route, MOCK_FETCH="fail"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no older snapshot was used", result.stderr)
+        self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start")
+                         or self.herdr_calls("agent", "prompt"))
+        self.assert_success(self.issue_helper("prepare", **route))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
+        self.assertEqual(git("branch", "--list", "agent/issue-8"), "")
+        worktree = repo.parent / "prepare worktree with spaces"
+
+        newer = self.advance_default_branch(git, "main 2")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="idle")))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), newer)
+        self.assertFalse(self.herdr_calls("agent", "start"))
+        prompts = self.herdr_calls("agent", "prompt")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("main commit " + newer, prompts[0][3])
+
+        # Local changes block reuse even when the fetched default branch is unchanged.
+        (worktree / "source.txt").write_text("local change\n")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="idle")))
+        self.assertEqual((worktree / "source.txt").read_text(), "local change\n")
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
+        self.assertIn("herdr worktree remove", self.notifications()[-1])
+        (worktree / "source.txt").write_text("committed content\n")
+
+        self.advance_default_branch(git, "main 3")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="working")))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), newer)
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
+
+        (worktree / "notes.txt").write_text("keep me\n")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="idle")))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), newer)
+        self.assertEqual((worktree / "notes.txt").read_text(), "keep me\n")
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
+        self.assertTrue(any("not refreshed" in body and "herdr worktree remove" in body
+                            for body in self.notifications()))
+
+    def test_implementation_handoff_passes_captured_intent_as_data(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        self.assert_success(self.issue_helper(**route))
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        intent = Path(self.env["XDG_STATE_HOME"]) / "gh-dash-codex-issue/intents/repo-6-friend-6-target-issue-8.md"
+        content = intent.read_text()
+        self.assertTrue(content.startswith("Issue friend/target#8: Add 'quoted' $(title)\n\n"))
+        self.assertIn(ISSUE_BODY, content)
+        self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+        worktree = repo.parent / "issue worktree with spaces"
+        self.assertNotIn(worktree.resolve(), intent.resolve().parents)
+        self.assertEqual(subprocess.run([REAL_GIT, "-C", str(worktree), "status", "--porcelain"],
+                                        capture_output=True, text=True, check=True).stdout, "")
+        self.assertFalse(list(self.root.rglob("*-marker")), "issue prose was evaluated as shell source")
+        # Executing the prompt's start command must pass the captured file and closing issue as data.
+        command = prompt.split("Start the run with:\n", 1)[1].split("\nOmit --closes", 1)[0]
+        invoked = subprocess.run(["bash", "-c", 'no-mistakes() { printf "%s\\n" "$@"; }\n' + command],
+                                 capture_output=True, text=True, check=True).stdout.splitlines()
+        self.assertEqual(invoked, ["axi", "run", "--yes", "--intent-file", str(intent), "--closes", "8"])
+        for requirement in ("clean, committed worktree", "reattach to the same run", "keeping --yes",
+                            "Never merge the PR", "does not prove checks-passed"):
+            self.assertIn(requirement, prompt)
+        # Dispatch reports only a launch; the agent reports the actual No-Mistakes outcome.
+        self.assertIn("No-Mistakes outcome pending", self.notifications()[-1])
+        self.assertNotIn("passed", self.notifications()[-1])
+
+    def test_setting_change_keeps_retained_agent_without_duplicate_prompts(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        self.assert_success(self.issue_helper(**route))
+        self.save_issue_agent("claude")
+        for status in ("working", "blocked", "idle"):
+            with self.subTest(status=status):
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**dict(route, MOCK_AGENT_STATUS=status)))
+                self.assertFalse(self.herdr_calls("agent", "start"))
+                self.assertEqual(len(self.herdr_calls("agent", "prompt")), 1 if status == "idle" else 0)
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "issue-pane"]])
+                self.assertIn("Kept the existing Codex agent", self.notifications()[-1])
+
+    def test_retained_agent_detection_is_checked_instead_of_the_new_setting(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        # A new launch still requires detection for the selected kind before creating a worktree.
+        self.save_issue_agent("claude")
+        result = self.issue_helper(**dict(route, MOCK_MANIFEST="claude"))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.herdr_calls("worktree", "create"))
+        self.save_issue_agent("codex")
+        self.assert_success(self.issue_helper(**route))
+        self.save_issue_agent("claude")
+        for status in ("working", "idle"):
+            with self.subTest(status=status):
+                # The retained Codex agent stays usable without a Claude detection manifest.
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**dict(route, MOCK_AGENT_STATUS=status, MOCK_MANIFEST="claude")))
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "issue-pane"]])
+                self.assertEqual(len(self.herdr_calls("agent", "prompt")), 1 if status == "idle" else 0)
+                # Without detection for the retained Codex agent, nothing is focused or prompted.
+                self.log.write_text("")
+                result = self.issue_helper(**dict(route, MOCK_AGENT_STATUS=status, MOCK_MANIFEST="codex"))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.herdr_calls("agent", "focus"))
+                self.assertFalse(self.herdr_calls("agent", "prompt"))
+                self.assertFalse(self.herdr_calls("agent", "start"))
+
+    def test_relinking_after_codex_setup_keeps_the_pipeline_agent(self):
+        source = self.bundle / "no-mistakes/config.yaml"
+        link = self.home / ".no-mistakes/config.yaml"
+        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="codex"))
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        self.assertTrue(source.read_text().startswith("agent: codex "))
+        edited = source.read_text().replace("review: 3", "review: 1")
+        source.write_text(edited)
+        # A missing link (as after moving the clone) is relinked without re-initializing the agent.
+        link.unlink()
+        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="claude"))
+        self.assertEqual(os.readlink(link), str(source))
+        self.assertEqual(source.read_text(), edited)
+
+    def test_no_mistakes_config_link_initializes_once_and_preserves_edits(self):
+        source = self.bundle / "no-mistakes/config.yaml"
+        link = self.home / ".no-mistakes/config.yaml"
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "gh-dash-share/issue-agent"
+        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="claude"))
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), str(source))
+        self.assertTrue(source.read_text().startswith("agent: claude "))
+        self.assertEqual(setting.read_text(), "claude\n")
+        edited = source.read_text().replace("review: 3", "review: 1") + "# personal note\n"
+        source.write_text(edited)
+        self.assert_success(self.setup(ISSUE_AGENT="cursor"))
+        self.assert_success(self.setup())
+        self.assertEqual(source.read_text(), edited)
+        self.assertEqual(os.readlink(link), str(source))
+        self.assertEqual(setting.read_text(), "cursor\n")
+        self.assertFalse(link.with_name("config.yaml.gh-dash-share-backup").exists())
+        self.assert_no_actions()
+
+    def test_existing_no_mistakes_config_is_backed_up_never_followed_or_overwritten(self):
+        directory = self.home / ".no-mistakes"
+        directory.mkdir()
+        personal = self.root / "personal no-mistakes.yaml"
+        personal.write_text("agent: codex\nlog_level: debug\n")
+        link = directory / "config.yaml"
+        link.symlink_to(personal)
+        backup = directory / "config.yaml.gh-dash-share-backup"
+        self.assert_success(self.interactive_setup("y"))
+        self.assertEqual(os.readlink(backup), str(personal))
+        self.assertEqual(personal.read_text(), "agent: codex\nlog_level: debug\n")
+        self.assertEqual(os.readlink(link), str(self.bundle / "no-mistakes/config.yaml"))
+        link.unlink()
+        link.write_text("agent: codex\n# second unrelated file\n")
+        result = self.interactive_setup("y")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists", result.stdout)
+        self.assertEqual(link.read_text(), "agent: codex\n# second unrelated file\n")
+        self.assertEqual(os.readlink(backup), str(personal))
+        self.assertEqual(personal.read_text(), "agent: codex\nlog_level: debug\n")
+
+    def test_selected_agent_and_no_mistakes_install_and_login_natively(self):
+        for name in ("cursor-agent", "no-mistakes"):
+            (self.mock / name).unlink()
+        result = self.setup(ISSUE_AGENT="cursor")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.calls("curl"))
+        result = self.interactive_setup("y", ISSUE_AGENT="cursor", MOCK_CURSOR_AUTH="pending",
+                                        MOCK_INTEGRATION="pending")
+        self.assert_success(result)
+        self.assertNotIn("AUTH_SECRET_SENTINEL", result.stdout)
+        for name in ("cursor-agent", "agent", "no-mistakes"):
+            self.assertTrue((self.wrapper.parent / name).is_file(), name)
+        urls = [argument for call in self.calls("curl") for argument in call["args"] if argument.startswith("https://")]
+        self.assertIn("https://cursor.com/install", urls)
+        self.assertIn("https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh", urls)
+        self.assertIn(["login"], [c["args"] for c in self.calls("cursor-agent")])
+        installs = [args for args in self.herdr_calls("integration", "install") if "--help" not in args]
+        self.assertEqual(installs, [["integration", "install", "codex"], ["integration", "install", "cursor"]])
+        self.assertFalse(self.calls("npm"))
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_old_no_mistakes_requires_consented_native_beta_update(self):
+        result = self.setup(MOCK_NM_VERSION="v1.84.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v1.105.0", result.stdout + result.stderr)
+        self.assertFalse([c for c in self.calls("no-mistakes") if c["args"][:1] == ["update"]])
+        self.assert_success(self.interactive_setup("y", MOCK_NM_VERSION="v1.84.0"))
+        self.assertIn(["update", "--beta"], [c["args"] for c in self.calls("no-mistakes")])
+
+    def test_fresh_stable_no_mistakes_is_updated_before_config_is_linked(self):
+        (self.mock / "no-mistakes").unlink()
+        link = self.home / ".no-mistakes/config.yaml"
+        result = self.interactive_setup("y", MOCK_NM_VERSION="v1.84.0")
+        self.assert_success(result)
+        commands = [c["args"] for c in self.calls("no-mistakes")]
+        self.assertLess(commands.index(["daemon", "restart"]), commands.index(["update", "--beta"]))
+        self.assertEqual(os.readlink(link), str(self.bundle / "no-mistakes/config.yaml"))
+        # The native default written by the first daemon start is preserved, not overwritten.
+        self.assertEqual(link.with_name("config.yaml.gh-dash-share-backup").read_text(), "agent: auto\n")
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_fresh_cursor_pipeline_installs_node_then_user_owned_acpx(self):
+        (self.mock / "acpx").unlink()
+        result = self.interactive_setup("y", ISSUE_AGENT="cursor")
+        self.assert_success(result)
+        self.assertIn("brew install node", result.stdout)
+        self.assertIn(["install", "node"], [c["args"] for c in self.calls("brew")])
+        # Without a user-writable global prefix, acpx goes beside the other commands instead of using sudo.
+        self.assertEqual([c["args"] for c in self.calls("npm") if c["args"][:1] == ["install"]],
+                         [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
+        self.assertTrue((self.wrapper.parent / "acpx").is_file())
+        self.assertFalse(self.calls("sudo"))
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_cursor_pipeline_installs_nodesource_node(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        (self.mock / "acpx").unlink()
+        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="cursor", MOCK_OS="Linux", MOCK_ARCH="x86_64"))
+        self.assertTrue(any("https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" in c["args"] for c in self.calls("curl")))
+        actions = [c["args"] for c in self.calls("sudo")]
+        self.assertIn(["apt-get", "install", "-y", "--no-install-recommends", "nodejs"], actions)
+        for path in ("/etc/apt/keyrings/nodesource.asc", "/etc/apt/sources.list.d/nodesource.list", "/etc/apt/preferences.d/nodejs"):
+            self.assertTrue(any(path in args for args in actions), path)
+        self.assertIn(["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"], [c["args"] for c in self.calls("npm")])
+        self.assertTrue((self.wrapper.parent / "acpx").is_file())
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_cursor_pipeline_reuses_suitable_node_npm_and_acpx(self):
+        (self.mock / "acpx").unlink()
+        for name in ("node", "npm"):
+            (self.mock / name).symlink_to("mock-cli")
+        prefix = self.root / "npm global"
+        (prefix / "lib/node_modules").mkdir(parents=True)
+        (prefix / "bin").mkdir()
+        self.env["PATH"] += os.pathsep + str(prefix / "bin")
+        environment = {"ISSUE_AGENT": "cursor", "MOCK_NPM_PREFIX": str(prefix), "MOCK_NODE_VERSION": "v22.13.0"}
+        self.assert_success(self.interactive_setup("y", **environment))
+        self.assertEqual([c["args"] for c in self.calls("npm") if c["args"][:1] == ["install"]],
+                         [["install", "-g", "acpx@latest"]])
+        self.assertTrue((prefix / "bin/acpx").is_file())
+        self.assertFalse(self.calls("brew"))
+        # A rerun finds acpx and needs neither Node installation nor npm.
+        self.log.unlink()
+        self.assert_success(self.setup(**environment))
+        self.assertFalse(self.calls("npm") + self.calls("brew"))
+        self.assert_no_actions()
+
+    def test_declined_node_installation_reports_incomplete_setup(self):
+        (self.mock / "acpx").unlink()
+        (self.home / ".codex").mkdir()
+        source = self.bundle / "no-mistakes/config.yaml"
+        source.write_text(source.read_text().replace("agent: codex", "agent: cursor", 1))
+        for run in (self.setup, lambda **environment: self.interactive_setup("n", **environment)):
+            result = run(ISSUE_AGENT="cursor")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Remaining action: put Node.js 22.13+ with npm first on PATH", result.stdout)
+            self.assertIn("authentication/setup actions remain pending", result.stdout)
+        self.assertIn("brew install node", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])])
+        self.assertFalse(self.calls("npm"))
+        self.assertFalse((self.wrapper.parent / "acpx").exists())
+        self.assertTrue(self.installed.is_dir())
+        self.assert_no_actions()
+
+    def test_doctor_reports_unfinished_agent_and_pipeline_onboarding(self):
+        self.install()
+        doctor = self.installed / "scripts/doctor.sh"
+        self.save_issue_agent("claude")
+        result = self.setup(MOCK_CLAUDE_AUTH="pending")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Remaining action: claude auth login", result.stdout)
+        for kind, variable, label in (("claude", "MOCK_CLAUDE_AUTH", "Claude Code"), ("cursor", "MOCK_CURSOR_AUTH", "Cursor")):
+            with self.subTest(kind=kind):
+                self.save_issue_agent(kind)
+                result = self.run_script(doctor, env={variable: "pending"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAIL: " + label + " authentication/setup pending", result.stdout)
+                self.assertNotIn("AUTH_SECRET_SENTINEL", result.stdout + result.stderr)
+        source = self.bundle / "no-mistakes/config.yaml"
+        original = source.read_text()
+        # Native doctor reports a runnable agent, which does not prove its login.
+        self.save_issue_agent("codex")
+        for selection in ("auto", "acp:cursor"):
+            with self.subTest(selection=selection):
+                source.write_text(original.replace("agent: codex", "agent: " + selection, 1))
+                result = self.run_script(doctor, env={"MOCK_CLAUDE_AUTH": "pending"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAIL: No-Mistakes pipeline agent " + selection + " authentication unverified", result.stdout)
+                self.assertIn("Authentication/setup: pending", result.stdout)
+        source.write_text(original.replace("agent: codex", "agent: cursor", 1))
+        (self.mock / "acpx").unlink()
+        result = self.run_script(doctor)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("acpx missing", result.stdout)
+        self.assertIn("Installation: incomplete", result.stdout)
+        result = self.run_script(doctor, env={"MOCK_NM_DOCTOR": "fail"})
+        self.assertIn("No-Mistakes pipeline agent not ready", result.stdout)
+        self.bundle.rename(self.root / "moved clone")
+        result = self.run_script(doctor)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was the clone moved or deleted", result.stdout)
+        self.assert_no_actions()
 
     def test_doctor_outside_herdr_is_successful_and_read_only(self):
         self.install()

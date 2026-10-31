@@ -105,11 +105,13 @@ open_locked_dispatch_log() {
 	die "diagnostic log changed identity while being locked: $log_path"
 }
 
-[ "$#" -eq 2 ] ||
-	die 'usage: gh-dash-codex-issue-dispatch.sh <owner/repository> <issue-number>'
+[ "$#" -eq 2 ] || { [ "$#" -eq 3 ] && [ "$3" = prepare ]; } ||
+	die 'usage: gh-dash-codex-issue-dispatch.sh <owner/repository> <issue-number> [prepare]'
 
 selected_repo="$1"
 issue_number="$2"
+identity_suffix=
+[ "$#" -eq 2 ] || identity_suffix=-prepare
 validate_arguments
 
 for command_name in bash tr mkdir chmod nohup stat python3; do
@@ -142,7 +144,7 @@ repository_owner_lower="$(printf '%s' "$repository_owner" | LC_ALL=C tr '[:upper
 	die 'unable to normalize the repository owner'
 repository_name_lower="$(printf '%s' "$repository_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')" ||
 	die 'unable to normalize the repository name'
-repository_identity="repo-${#repository_owner_lower}-${repository_owner_lower}-${#repository_name_lower}-${repository_name_lower}-issue-${issue_number}"
+repository_identity="repo-${#repository_owner_lower}-${repository_owner_lower}-${#repository_name_lower}-${repository_name_lower}-issue-${issue_number}${identity_suffix}"
 case "$repository_identity" in
 '' | *[!a-z0-9._-]*) die 'unable to derive a safe diagnostic-log identity' ;;
 esac

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROGRAM="${0##*/}"
-NOTIFICATION_TITLE="gh-dash Codex issue"
+NOTIFICATION_TITLE="gh-dash issue"
 AGENT_START_TOTAL_ATTEMPTS=10
 AGENT_START_RETRY_INTERVAL_SECONDS=1
 DIAGNOSTIC_RETENTION_SECONDS=604800
@@ -52,8 +52,74 @@ prompt_failed() {
 	local detail="$1"
 
 	printf 'ERROR: %s: %s\n' "$PROGRAM" "$detail" >&2
-	notify 'Issue prompt failed; press I to retry.' request
+	notify "Issue prompt failed; press $issue_key to retry." request
 	exit 1
+}
+
+agent_label() {
+	case "$1" in
+	claude) printf 'Claude Code\n' ;;
+	codex) printf 'Codex\n' ;;
+	cursor) printf 'Cursor\n' ;;
+	*) printf '%s\n' "$1" ;;
+	esac
+}
+
+# make setup saves one shared choice for i and I; absent means the original Codex default.
+read_issue_agent_setting() {
+	local config_base setting_path value=
+
+	if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+		config_base="$XDG_CONFIG_HOME"
+	else
+		config_base="$HOME/.config"
+	fi
+	setting_path="$config_base/gh-dash-share/issue-agent"
+	selected_kind=codex
+	if [ -e "$setting_path" ] || [ -L "$setting_path" ]; then
+		[ -f "$setting_path" ] || die "issue agent setting is not a regular file: $setting_path"
+		IFS= read -r value <"$setting_path" || [ -n "$value" ] ||
+			die "unable to read the issue agent setting: $setting_path"
+		case "$value" in
+		claude | codex | cursor) selected_kind="$value" ;;
+		*) die "invalid issue agent setting in $setting_path; run make setup ISSUE_AGENT=claude|codex|cursor" ;;
+		esac
+	fi
+	manager_kind="$selected_kind"
+	manager_label="$(agent_label "$manager_kind")"
+}
+
+validate_fetch_url() {
+	local url="$1" expected_repository_lower="$2"
+	local remainder host path path_lower
+
+	case "$url" in
+	git@*:*)
+		remainder="${url#git@}"
+		host="${remainder%%:*}"
+		path="${remainder#*:}"
+		;;
+	ssh://git@*/*)
+		remainder="${url#ssh://git@}"
+		host="${remainder%%/*}"
+		path="${remainder#*/}"
+		;;
+	*) die 'the canonical repository SSH URL uses an unsupported transport' ;;
+	esac
+	case "$host" in
+	'' | -* | *- | .* | *. | *[!A-Za-z0-9.-]*)
+		die 'the canonical repository SSH URL has an invalid host'
+		;;
+	esac
+	case "$path" in
+	.git | */ | /* | *[!A-Za-z0-9_./-]*)
+		die 'the canonical repository SSH URL has an invalid repository path'
+		;;
+	esac
+	path="${path%.git}"
+	path_lower="$(printf '%s' "$path" | lowercase)"
+	[ "$path_lower" = "$expected_repository_lower" ] ||
+		die 'the canonical repository SSH URL does not match the selected repository'
 }
 
 require_command() {
@@ -226,7 +292,7 @@ uid = os.geteuid()
 cutoff = time.time() - int(retention_text)
 pattern = re.compile(
     r"repo-([1-9][0-9]?)-([a-z0-9-]+)-([1-9][0-9]{0,2})-"
-    r"([a-z0-9._-]+)-issue-([1-9][0-9]{0,19})[.]log"
+    r"([a-z0-9._-]+)-issue-([1-9][0-9]{0,19})(-prepare)?[.]log"
 )
 
 
@@ -251,7 +317,7 @@ def exact_identity(name):
     match = pattern.fullmatch(name)
     if match is None:
         return None
-    owner_length, owner, repository_length, repository, issue = match.groups()
+    owner_length, owner, repository_length, repository, issue, mode = match.groups()
     if (
         int(owner_length) != len(owner)
         or len(owner) > 39
@@ -263,7 +329,7 @@ def exact_identity(name):
     ):
         return None
     identity = name.removesuffix(".log")
-    expected = f"repo-{len(owner)}-{owner}-{len(repository)}-{repository}-issue-{issue}"
+    expected = f"repo-{len(owner)}-{owner}-{len(repository)}-{repository}-issue-{issue}{mode or ''}"
     return identity if identity == expected else None
 
 
@@ -410,11 +476,20 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-[ "$#" -eq 2 ] ||
-	prelock_die 'usage: gh-dash-codex-issue.sh <owner/repository> <issue-number>'
+[ "$#" -eq 2 ] || { [ "$#" -eq 3 ] && [ "$3" = prepare ]; } ||
+	prelock_die 'usage: gh-dash-codex-issue.sh <owner/repository> <issue-number> [prepare]'
 
 selected_repo="$1"
 issue_number="$2"
+if [ "$#" -eq 3 ]; then
+	issue_mode=prepare
+	issue_key=i
+	identity_suffix=-prepare
+else
+	issue_mode=implement
+	issue_key=I
+	identity_suffix=
+fi
 
 case "$selected_repo" in
 */*/* | /* | */ | *[!A-Za-z0-9_./-]*)
@@ -450,7 +525,7 @@ repository_owner_lower="$(printf '%s' "$repository_owner" | lowercase)" ||
 repository_name_lower="$(printf '%s' "$repository_name" | lowercase)" ||
 	prelock_die 'unable to normalize the repository name'
 selected_repo_lower="$repository_owner_lower/$repository_name_lower"
-lock_identity="repo-${#repository_owner_lower}-${repository_owner_lower}-${#repository_name_lower}-${repository_name_lower}-issue-${issue_number}"
+lock_identity="repo-${#repository_owner_lower}-${repository_owner_lower}-${#repository_name_lower}-${repository_name_lower}-issue-${issue_number}${identity_suffix}"
 case "$lock_identity" in
 '' | *[!a-z0-9._-]*) prelock_die 'unable to derive a safe issue lock identity' ;;
 esac
@@ -481,7 +556,7 @@ fi
 issue_locked() {
 	local message
 
-	message='Issue operation is locked. If no issue helper is running, remove the stale lock manually and press I again.'
+	message="Issue operation is locked. If no issue helper is running, remove the stale lock manually and press $issue_key again."
 	printf 'ERROR: %s: %s\nLock path: %s\n' \
 		"$PROGRAM" "$message" "$issue_lock_directory" >&2
 	notify "$message" request
@@ -543,6 +618,7 @@ prune_inactive_issue_logs
 for command_name in git gh herdr jq; do
 	require_command "$command_name"
 done
+read_issue_agent_setting
 
 source_environment_count=0
 for variable_name in \
@@ -627,11 +703,18 @@ captured_repo_lower="$(printf '%s' "$GH_DASH_SOURCE_REPO" | lowercase)"
 [ "$selected_repo_lower" = "$captured_repo_lower" ] ||
 	die "selected issue repository $selected_repo does not match captured repository $GH_DASH_SOURCE_REPO"
 
-issue_branch="agent/issue-$issue_number"
+# Preparation uses its own branch, workspace, and agent so it never shares an implementation session.
+if [ "$issue_mode" = prepare ]; then
+	issue_branch="agent/prepare-issue-$issue_number"
+	workspace_label="$repository_name#$issue_number prepare"
+	agent_alias="$(sanitize_agent_alias "$repository_name" "prep-$issue_number")"
+else
+	issue_branch="agent/issue-$issue_number"
+	workspace_label="$repository_name#$issue_number"
+	agent_alias="$(sanitize_agent_alias "$repository_name" "$issue_number")"
+	branch_base_sha="$GH_DASH_SOURCE_SHA"
+fi
 issue_branch_ref="refs/heads/$issue_branch"
-workspace_label="$repository_name#$issue_number"
-agent_alias="$(sanitize_agent_alias "$repository_name" "$issue_number")"
-prompt="Fetch issue ${selected_repo}#${issue_number} and use its body as the prompt."
 case "$agent_alias" in
 '' | [!a-z]* | *[!a-z0-9_-]*) die "unable to derive a valid Herdr agent alias: $agent_alias" ;;
 esac
@@ -713,10 +796,41 @@ require_manager_manifest() {
 }
 
 load_manager_manifests
-require_manager_manifest
 
 [ "$GH_DASH_SOURCE_BRANCH" != "$issue_branch" ] ||
 	worktree_conflict "source checkout already uses $issue_branch; refusing to create another worktree"
+
+# Preparation always inspects a fresh fetch of the remote default branch, never a stale snapshot.
+if [ "$issue_mode" = prepare ]; then
+	view_source_repository() {
+		cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner,sshUrl,defaultBranchRef
+	}
+	repository_json=
+	capture_json repository_json view_source_repository
+	printf '%s\n' "$repository_json" | jq -e --arg repository "$current_repo" \
+		'.nameWithOwner == $repository and
+		 (.sshUrl | type == "string" and length > 0) and
+		 (.defaultBranchRef.name | type == "string" and length > 0)' >/dev/null 2>&1 ||
+		die 'the source GitHub repository response has no usable default branch'
+	default_branch="$(printf '%s\n' "$repository_json" | jq -r '.defaultBranchRef.name')"
+	fetch_url="$(printf '%s\n' "$repository_json" | jq -r '.sshUrl')"
+	git -C "$source_root" check-ref-format --branch "$default_branch" >/dev/null 2>&1 ||
+		die "invalid default branch name: $default_branch"
+	validate_fetch_url "$fetch_url" "$current_repo_lower"
+	preparation_ref="refs/gh-dash-issue-prepare/$lock_identity"
+	git -C "$source_root" check-ref-format "$preparation_ref" >/dev/null 2>&1 ||
+		die 'unable to derive a valid preparation base ref'
+	git -C "$source_root" fetch \
+		--no-tags \
+		--no-write-fetch-head \
+		--no-auto-maintenance \
+		--force \
+		"$fetch_url" \
+		"+refs/heads/$default_branch:$preparation_ref" ||
+		die "unable to fetch $default_branch from $current_repo; preparation not started and no older snapshot was used"
+	branch_base_sha="$(git -C "$source_root" rev-parse --verify "${preparation_ref}^{commit}" 2>/dev/null)" ||
+		die "the fetched $default_branch commit is unavailable"
+fi
 
 load_worktree_state() {
 	local branch_lookup_status=0 listed_source_path listed_source_root
@@ -797,9 +911,11 @@ load_worktree_state
 initial_worktree_root="$listed_worktree_root"
 reusing_existing_worktree="$worktree_count"
 readonly initial_worktree_root reusing_existing_worktree
+# A new worktree cannot hold a retained agent, so the selected kind is checked before creating it.
+[ "$reusing_existing_worktree" -eq 1 ] || require_manager_manifest
 if [ "$worktree_count" -eq 0 ]; then
 	if [ "$branch_exists" -eq 0 ]; then
-		git -C "$source_root" update-ref "$issue_branch_ref" "$GH_DASH_SOURCE_SHA" '' ||
+		git -C "$source_root" update-ref "$issue_branch_ref" "$branch_base_sha" '' ||
 			worktree_conflict "unable to create issue branch $issue_branch"
 		created_issue_branch=1
 	else
@@ -890,8 +1006,8 @@ worktree_common_directory="$(git_common_directory "$worktree_root")" ||
 if [ "$created_issue_branch" -eq 1 ]; then
 	created_branch_sha="$(git -C "$source_root" rev-parse --verify "${issue_branch_ref}^{commit}" 2>/dev/null)" ||
 		die "unable to verify newly created issue branch $issue_branch"
-	[ "$(printf '%s' "$created_branch_sha" | lowercase)" = "$(printf '%s' "$GH_DASH_SOURCE_SHA" | lowercase)" ] ||
-		die "new issue branch $issue_branch does not match the captured source commit"
+	[ "$(printf '%s' "$created_branch_sha" | lowercase)" = "$(printf '%s' "$branch_base_sha" | lowercase)" ] ||
+		die "new issue branch $issue_branch does not match its intended base commit"
 fi
 
 runtime_validation_error=
@@ -994,6 +1110,7 @@ finish_conflicting_identity() {
 	finish_without_action "Agent identity is ambiguous or conflicting; prompt not sent."
 }
 
+retained_notice=
 agent_list_json=
 capture_json agent_list_json herdr agent list
 if ! json_has_type "$agent_list_json" agent_list ||
@@ -1018,7 +1135,7 @@ complete_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
 	--arg pane_id "$root_pane_id" \
 	'[.result.agents[] | select(
 		.name == $name and
-		.agent == "codex" and
+		(.agent == "claude" or .agent == "codex" or .agent == "cursor") and
 		.workspace_id == $workspace_id and
 		.tab_id == $tab_id and
 		.pane_id == $pane_id
@@ -1069,7 +1186,7 @@ else
 		--arg pane_id "$root_pane_id" \
 		'.result.agents[] | select(
 			.name == $name and
-			.agent == "codex" and
+			(.agent == "claude" or .agent == "codex" or .agent == "cursor") and
 			.workspace_id == $workspace_id and
 			.tab_id == $tab_id and
 			.pane_id == $pane_id
@@ -1089,7 +1206,98 @@ else
 	validate_runtime_pane "$agent_tab_id" "$agent_pane_id" ||
 		finish_conflicting_identity "$runtime_validation_error"
 	agent_present=1
+	# A changed setting applies to new sessions; never silently replace a retained agent.
+	if [ "$selected_agent_kind" != "$manager_kind" ]; then
+		retained_notice=" Kept the existing $(agent_label "$selected_agent_kind") agent; the $manager_label setting applies once it is closed."
+		printf 'WARNING: %s: retaining existing %s agent for %s instead of the %s setting\n' \
+			"$PROGRAM" "$selected_agent_kind" "$workspace_label" "$manager_kind" >&2
+		manager_kind="$selected_agent_kind"
+		manager_label="$(agent_label "$manager_kind")"
+	fi
 fi
+# Detection must cover the agent actually reused or launched before focusing or prompting it.
+require_manager_manifest
+
+refresh_preparation_worktree() {
+	local head_sha="$1" status_output
+
+	# Local changes would be presented as current-default-branch evidence, even at the fetched HEAD.
+	status_output="$(git -C "$worktree_root" status --porcelain --untracked-files=normal 2>/dev/null)" ||
+		die 'unable to inspect the preparation worktree state'
+	[ -n "$status_output" ] || [ "$head_sha" != "$branch_base_sha" ] || return 0
+	if [ -n "$status_output" ] ||
+		! git -C "$worktree_root" merge-base --is-ancestor "$head_sha" "$branch_base_sha" 2>/dev/null; then
+		printf 'WARNING: %s: preparation worktree %s has local work or diverged from %s\n' \
+			"$PROGRAM" "$worktree_root" "$default_branch" >&2
+		finish_without_action "Preparation worktree has local work or diverged from $default_branch; not refreshed and prompt not sent. To start fresh, remove it with herdr worktree remove --workspace $workspace_id, then delete branch $issue_branch."
+	fi
+	git -C "$worktree_root" merge --ff-only --quiet "$branch_base_sha" >&2 ||
+		die "unable to fast-forward the preparation worktree to $default_branch; existing work was preserved"
+}
+
+capture_issue_intent() {
+	local intent_directory="$state_directory/intents" issue_json intent_stage
+
+	ensure_private_directory "$intent_directory" 'issue intent directory'
+	intent_path="$intent_directory/$lock_identity.md"
+	issue_json=
+	capture_json issue_json env -u GH_REPO \
+		gh issue view "$issue_number" --repo "$selected_repo" --json number,title,body
+	printf '%s\n' "$issue_json" | jq -e --arg number "$issue_number" \
+		'(.number | tostring) == $number and (.title | type) == "string" and (.body | type) == "string"' \
+		>/dev/null 2>&1 || die 'unexpected GitHub issue response; prompt not sent'
+	# Issue prose is data: jq writes it to a private file and never shell-evaluates it.
+	intent_stage="$intent_path.$$"
+	if ! (umask 077 && printf '%s\n' "$issue_json" | jq -r --arg repository "$selected_repo" \
+		'"Issue \($repository)#\(.number): \(.title)\n\n\(.body)"' >"$intent_stage") ||
+		! mv -f -- "$intent_stage" "$intent_path"; then
+		rm -f -- "$intent_stage"
+		die 'unable to capture the issue intent outside the worktree; prompt not sent'
+	fi
+}
+
+prepare_issue_prompt() {
+	local head_sha base_description quoted_intent_path
+
+	head_sha="$(git -C "$worktree_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+		die "unable to inspect the $issue_branch worktree"
+	if [ "$issue_mode" = prepare ]; then
+		refresh_preparation_worktree "$head_sha"
+		prompt_summary="Preparation of #$issue_number at $default_branch ${branch_base_sha:0:12}."
+		prompt="Prepare issue ${selected_repo}#${issue_number} for dispatch; do not implement it. This separate preparation worktree is on branch $issue_branch at $default_branch commit $branch_base_sha, freshly fetched from $current_repo for this preparation.
+
+1. Fetch the issue, for example with gh issue view $issue_number --repo $selected_repo --comments. Inspect the relevant code, repository instructions, tests, and documentation in this worktree. Report the branch and commit you inspected. If HEAD is no longer $branch_base_sha or you cannot confirm it is the current $default_branch, say so instead of presenting it as a current $default_branch check.
+2. Verify the issue's premise, assess whether an agent could implement it as written, flag overengineering, and prefer the smallest justified scope.
+3. When useful, edit only this issue's title and body (gh issue edit $issue_number --repo $selected_repo) so it becomes an executable prompt with the relevant constraints, acceptance criteria, and validation. Do not implement it, commit, push, comment, or make any other repository or GitHub change.
+4. Make reasonable decisions from repository evidence. If an essential product decision is still unknown, report it concisely instead of inventing requirements.
+5. Finish with exactly one verdict: ready to dispatch, needs a decision, or already satisfied. Briefly explain any material edits."
+		return
+	fi
+
+	capture_issue_intent
+	if [ "$created_issue_branch" -eq 1 ]; then
+		base_description="starts from $GH_DASH_SOURCE_BRANCH at $branch_base_sha, the committed source captured by ghd"
+		prompt_summary="Implementation of #$issue_number on $issue_branch from $GH_DASH_SOURCE_BRANCH@${branch_base_sha:0:12}; No-Mistakes outcome pending."
+	else
+		base_description="is a retained branch now at $head_sha; its existing work is preserved"
+		prompt_summary="Implementation of #$issue_number on retained $issue_branch@${head_sha:0:12}; No-Mistakes outcome pending."
+	fi
+	printf 'INFO: %s: %s\n' "$PROGRAM" "$prompt_summary" >&2
+	printf -v quoted_intent_path '%q' "$intent_path"
+	prompt="Fetch issue ${selected_repo}#${issue_number} and use its body as the prompt. Implement it in this worktree on branch $issue_branch, which $base_description. That base can differ from the default-branch commit a preparation run inspected; do not assume they are the same. Follow the target repository's instructions and keep to the issue's intended scope.
+
+When the implementation is ready, deliver it through No-Mistakes unattended:
+1. Run the relevant checks, then commit only the task changes on $issue_branch. No-Mistakes needs a non-default branch and a clean, committed worktree to start a run.
+2. If no-mistakes axi reports that this repository is not initialized, run no-mistakes init (it is idempotent).
+3. The issue was captured as run intent outside this worktree. Pass it as a file and never paste issue text into shell commands; you may append your material decisions to that file. Start the run with:
+intent_file=$quoted_intent_path
+issue_number=$issue_number
+no-mistakes axi run --yes --intent-file \"\$intent_file\" --closes \"\$issue_number\"
+Omit --closes only if the change does not fully implement the issue, and say why.
+4. Drive the run as the installed no-mistakes skill and no-mistakes axi run --help describe, keeping --yes whenever you reattach with no-mistakes axi run --yes. If the bounded wait expires, inspect no-mistakes axi status and reattach to the same run; do not abort or restart it. Follow its branch_sync and recovery guidance.
+5. If No-Mistakes stops at a decision that --yes does not resolve (for example a protected-path refusal, an open review question, or a Test budget cut), do not invent an answer, bypass the gate, or enable review conversations. Keep the work and run in place, and report the precise blocker and the native next action.
+6. Never merge the PR. Finish with the actual No-Mistakes outcome and PR URL, including any skips, overrides, applied fixes, or remaining blockers. A launched run, a delivered prompt, or an AXI exit code alone does not prove checks-passed."
+}
 
 send_issue_prompt() {
 	local tab_id="$1" pane_id="$2" prompt_json prompt_status=0
@@ -1109,6 +1317,7 @@ send_issue_prompt() {
 }
 
 if [ "$agent_present" -eq 0 ]; then
+	prepare_issue_prompt
 	agent_start_json=
 	for ((agent_start_attempt = 1; agent_start_attempt <= AGENT_START_TOTAL_ATTEMPTS; agent_start_attempt++)); do
 		agent_start_status=0
@@ -1135,7 +1344,7 @@ if [ "$agent_present" -eq 0 ]; then
 	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 		finish_conflicting_identity "$manager_label started, but $runtime_validation_error"
 	send_issue_prompt "$root_tab_id" "$root_pane_id"
-	notify "Issue prompt sent. Started a new $manager_label agent for issue." "done"
+	notify "$prompt_summary Prompt sent to a new $manager_label agent." "done"
 	exit 0
 fi
 
@@ -1143,25 +1352,26 @@ agent_status="$(printf '%s\n' "$agent_document" | jq -r \
 	'if (.result.agent.agent_status | type) == "string" then .result.agent.agent_status else "__uncertain__" end')"
 case "$agent_status" in
 idle | done)
+	prepare_issue_prompt
 	send_issue_prompt "$agent_tab_id" "$agent_pane_id"
 	if ! focus_exact_agent "$agent_pane_id" "$agent_tab_id"; then
 		printf 'ERROR: %s: issue was resent, but the exact %s agent could not be focused\n' "$PROGRAM" "$manager_label" >&2
 		notify "Issue resent to existing $manager_label agent, but focus failed." request
 		exit 1
 	fi
-	notify "Issue resent to existing $manager_label agent and focused." "done"
+	notify "$prompt_summary Resent to the existing $manager_label agent and focused.$retained_notice" "done"
 	;;
 working)
 	if ! focus_exact_agent "$agent_pane_id" "$agent_tab_id"; then
 		die "issue is already running and was not resent, but the exact $manager_label agent could not be focused"
 	fi
-	notify "Issue already running; prompt not resent." request
+	notify "Issue already running; prompt not resent and worktree not refreshed.$retained_notice" request
 	;;
 blocked)
 	if ! focus_exact_agent "$agent_pane_id" "$agent_tab_id"; then
 		die "issue agent is blocked and was not resent, but the exact $manager_label agent could not be focused"
 	fi
-	notify "Issue agent is blocked; prompt not resent." request
+	notify "Issue agent is blocked; prompt not resent and worktree not refreshed.$retained_notice" request
 	;;
 *)
 	finish_uncertain_status \

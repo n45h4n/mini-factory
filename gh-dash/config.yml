@@ -16,7 +16,11 @@ keybindings:
       command: >-
         "${DOTFILES_DIR:?run through ghd}/scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh" "{{.RepoName}}" "{{.PrNumber}}"
   issues:
+    - key: i
+      name: prepare issue with the selected agent
+      command: >-
+        "${DOTFILES_DIR:?run through ghd}/scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh" "{{.RepoName}}" "{{.IssueNumber}}" prepare
     - key: I
-      name: implement issue with Codex
+      name: implement issue, then run No-Mistakes
       command: >-
         "${DOTFILES_DIR:?run through ghd}/scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh" "{{.RepoName}}" "{{.IssueNumber}}"
