@@ -396,8 +396,9 @@ repository's `.no-mistakes.yaml` commands, but its template is Go-oriented
 
 Before starting a run, the `I` agent checks the target's real PR-check
 expectations. A missing `.github/workflows` directory alone does not prove that
-no CI exists. The agent never creates or edits the target's workflows or
-`.no-mistakes.yaml` for this purpose, and never sets `no_ci`. When missing checks
+no CI exists. The agent creates or edits the target's workflows for this purpose
+only when the issue asks for it, never edits `.no-mistakes.yaml` for this
+purpose, and never sets `no_ci`, even if the issue asks. When missing checks
 are clearly established, it still delivers the PR and tells you to add
 PR-triggered CI to the default branch, or to deliberately declare `no_ci: true`
 there. If the PR still has zero checks after a bounded wait while No-Mistakes
