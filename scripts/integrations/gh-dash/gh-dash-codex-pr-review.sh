@@ -12,6 +12,7 @@ if [ "${GH_DASH_CODEX_PR_REVIEW_BACKEND:-0}" != 1 ]; then
 	exec "$dispatcher" "$@"
 fi
 detached_log_path="${GH_DASH_CODEX_PR_REVIEW_LOG_PATH:-}"
+mf_config_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/mf_config.py"
 unset GH_DASH_CODEX_PR_REVIEW_BACKEND
 unset GH_DASH_CODEX_PR_REVIEW_LOG_PATH
 
@@ -693,7 +694,7 @@ if [ -n "$detached_log_path" ]; then
 fi
 prune_inactive_diagnostic_logs
 
-for command_name in git gh herdr jq codex; do
+for command_name in git gh herdr jq codex python3; do
 	require_command "$command_name"
 done
 
@@ -1295,8 +1296,20 @@ codex_args=(
 	--config 'default_permissions="gh_dash_pr_review"'
 	--config 'permissions.gh_dash_pr_review={extends=":read-only",network={enabled=true,domains={"github.com"="allow","api.github.com"="allow","*.githubusercontent.com"="allow"}}}'
 )
+reuse_notice=
 
 if [ "$agent_present" -eq 0 ]; then
+	# Only a fresh reviewer reads the saved profile. mf-config emits nothing but
+	# --model and model/effort/Fast --config values after the fixed security options.
+	review_output="$(python3 -I -B "$mf_config_helper" launch-args pr-review codex 2>&1)" ||
+		die "unable to apply the saved PR reviewer preferences; Codex not started and prompt not sent: $review_output"
+	if [ -n "$review_output" ]; then
+		while IFS= read -r review_argument; do
+			codex_args[${#codex_args[@]}]="$review_argument"
+		done <<EOF
+$review_output
+EOF
+	fi
 	agent_start_json=
 	for ((agent_start_attempt = 1; agent_start_attempt <= AGENT_START_TOTAL_ATTEMPTS; agent_start_attempt++)); do
 		agent_start_status=0
@@ -1322,6 +1335,10 @@ if [ "$agent_present" -eq 0 ]; then
 		agent_conflict 'Codex started, but its returned identity conflicts with the expected PR review agent'
 	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 		agent_conflict "Codex started, but $runtime_validation_error"
+elif review_output="$(python3 -I -B "$mf_config_helper" agent pr-review 2>/dev/null)" &&
+	[ "${review_output#*$'\n'}" = override ]; then
+	# Herdr does not report launch options; a retained reviewer is never replaced.
+	reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer (exit it in its pane, then press I).'
 fi
 
 prompt="Review pull request ${selected_repo}#${pr_number} against its base. Keep repository access read-only: do not modify files, commit, or push.
@@ -1351,5 +1368,5 @@ agent_identity_matches \
 validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 	die "PR review prompt completed but runtime identity became uncertain: $runtime_validation_error"
 
-notify 'PR review prompt sent to the exact locally read-only Codex agent.' 'done'
+notify "PR review prompt sent to the exact locally read-only Codex agent.$reuse_notice" 'done'
 exit 0

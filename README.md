@@ -6,10 +6,11 @@ cd mini-factory
 make setup ISSUE_AGENT=codex   # or claude, or cursor
 ```
 
-`ISSUE_AGENT` selects the agent for both issue actions and is saved in
+`ISSUE_AGENT` selects the shared agent for both issue actions and is saved in
 `${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent`. Without it, the
 first setup saves `codex` and later runs keep the saved choice; rerun with a new
-value to change it. **Keep this clone**: No-Mistakes reads its configuration
+value to change it. To choose the `i` and `I` agents separately, or a model and
+effort per key, use [`mf-config`](#agent-profiles-mf-config). **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
 [No-Mistakes](#no-mistakes-configuration-and-unattended-runs)).
 
@@ -42,7 +43,8 @@ before relying on `I`; see the [CI prerequisite](#ci-prerequisite-for-each-targe
 
 The selected item must belong to the source repository captured by `ghd`; the
 existing helpers enforce that identity. Agents start with their native model
-defaults. Setup adds no model, effort, trust, or permission overrides: review
+defaults unless you save a model/effort with [`mf-config`](#agent-profiles-mf-config).
+Neither setup nor `mf-config` adds trust or permission overrides: review
 each agent's native repository trust and permission prompts yourself (see
 [Agent permissions](#agent-permissions-for-unattended-issue-runs)).
 
@@ -73,8 +75,9 @@ the required packages. Install Homebrew first using its
 [official instructions](https://brew.sh/) and apply the `brew shellenv` command
 it prints for your machine. Setup does not install Homebrew or change your shell
 startup files. It disables Homebrew's automatic update/cleanup and offers a
-targeted upgrade only when an installed required formula is unsuitable; it does
-not run a general `brew upgrade`.
+targeted upgrade only when an installed required formula is unsuitable (a Gum
+that cannot run is repaired with `brew reinstall gum`); it does not run a
+general `brew upgrade`.
 
 ## Bootstrap on native Ubuntu Server
 
@@ -90,8 +93,13 @@ sudo apt-get install --no-install-recommends git make ca-certificates
 These are unavoidable prerequisites for cloning and running `make setup`.
 Setup offers apt installation for missing tools and the
 [official GitHub CLI apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
-when GitHub CLI needs installation. It shows the packages and privileged changes
-before asking for consent. Do not use `sudo make setup`.
+when GitHub CLI needs installation. Gum (the `mf-config` editor) comes from your
+configured Ubuntu archive when it offers a `gum` package (newer releases carry it
+in universe); otherwise setup offers
+[Charm's official apt repository](https://github.com/charmbracelet/gum#installation),
+which writes `/etc/apt/keyrings/charm.asc` and `/etc/apt/sources.list.d/charm.list`.
+It shows the packages and privileged changes before asking for consent. Do not
+use `sudo make setup`.
 
 For a remote server, SSH in normally, then run setup and Herdr on the server.
 Herdr works through the terminal; a graphical desktop is unnecessary. Use a
@@ -102,10 +110,11 @@ default `ctrl+b`, then `q`, and reattach with `herdr --session my-project`.
 ## Installation and authentication
 
 Setup checks tools first and reuses suitable installations. The runtime needs
-Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Codex, Herdr,
-No-Mistakes (its stable `axi run --intent`/`--yes` interface), the selected
-issue agent, the configured No-Mistakes pipeline agent, and the standard system
-utilities used by the dispatchers.
+Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Gum, Codex, Herdr,
+No-Mistakes (its stable `axi run --intent`/`--yes` interface), the agents
+selected for issue `i` and `I`, the configured No-Mistakes pipeline agent, and
+the standard system utilities used by the dispatchers. Unused agents are not
+installed.
 **Codex is always required** because the PR `I` review route still runs Codex,
 even when Claude Code or Cursor handles issues. Python supports diagnostics and
 safe log handling; no pip packages are needed.
@@ -159,8 +168,8 @@ extension, with consent, when it is missing:
 gh extension install dlvhdr/gh-dash
 ```
 
-Agent authentication stays in each agent's CLI; setup checks the issue agent,
-the pipeline agent, and Codex (PR reviews), and offers only the missing logins:
+Agent authentication stays in each agent's CLI; setup checks the `i` and `I`
+agents, the pipeline agent, and Codex (PR reviews), and offers only the missing logins:
 
 ```sh
 codex login --device-auth
@@ -185,7 +194,7 @@ herdr integration install codex
 This changes Codex's native hook/configuration files: `herdr-agent-state.sh`,
 `hooks.json`, and hook settings in `config.toml`. The native Herdr installer owns
 this operation and preserves other settings; we do not implement a second
-config editor. When Claude Code or Cursor is the issue agent, setup also offers
+config editor. When Claude Code or Cursor handles `i` or `I`, setup also offers
 `herdr integration install claude` or `herdr integration install cursor`, which
 add Herdr's state hook to that agent's user configuration. Review any native
 decisions yourself. Check with `herdr integration status`.
@@ -200,6 +209,62 @@ captured intent under `${XDG_STATE_HOME:-$HOME/.local/state}`, and run
 the agent's own trust and permission settings, or answer its prompts while it
 works; setup does not change them. A run waiting on such a prompt shows as
 blocked in Herdr.
+
+## Agent profiles (mf-config)
+
+`mf-config` configures the three interactive gh-dash agents independently:
+
+| Profile | Harness | Knobs |
+| ------- | ------- | ----- |
+| Issues `i` preparer | Codex, Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
+| Issues `I` implementer | Codex, Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
+| PRs `I` reviewer | Codex only | model, reasoning effort, Fast |
+
+```sh
+mf-config          # Gum editor: pick one profile, choose, preview, confirm
+mf-config show     # effective values; works without a terminal (scripts, SSH)
+```
+
+Setup installs a managed `~/.local/bin/mf-config` launcher only when no other
+`mf-config` command or file exists there or on `PATH`; it never replaces one.
+`bin/mf-config` in your retained clone always works as the fallback.
+
+Choices are saved in
+`${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/agent-profiles.json` only after
+you confirm; cancelling (Esc/Ctrl-C), declining, or invalid input leaves the
+saved file unchanged. Each issue key uses, in order: its `mf-config` selection,
+then the shared `ISSUE_AGENT` from setup, then Codex. An existing installation
+with only `issue-agent` keeps using that agent for both keys. `make setup
+ISSUE_AGENT=...` changes only the shared choice and never rewrites a per-key
+selection; choose **Shared issue agent** in `mf-config` to remove one.
+`mf-config` never changes the No-Mistakes pipeline agent.
+
+Every knob offers **Native default (no override)**, which passes nothing, and a
+custom/unverified value; saved custom values are kept. Pickers read only local
+metadata, which is a convenience, not proof of account access:
+
+- **Codex**: model slugs from `${CODEX_HOME:-$HOME/.codex}/models_cache.json`
+  when present, and the chosen model's advertised reasoning levels (otherwise
+  common levels). **Fast** On/Off is offered only when the installed Codex is
+  0.154.0 or newer and the model's metadata advertises Fast; Off is the
+  default. A saved On is preserved for review if metadata later disappears.
+  Without an explicit Fast choice your native Fast setting is untouched. A
+  missing or stale cache never blocks configuration.
+- **Cursor**: model IDs from a bounded `cursor-agent --list-models`; the model
+  ID owns Cursor's variant/effort, so there is no separate effort choice.
+- **Claude Code**: native aliases (`opus`, `sonnet`, `haiku`, plus those named
+  by `claude --help`) or an exact ID, and the effort levels `claude --help`
+  lists; not every model/account supports every level.
+
+Profiles apply only when a **fresh** Herdr agent starts, translated to the
+native interactive options `--model`, Codex `--config model_reasoning_effort=...`
+and `--config service_tier=...`, and Claude Code `--effort`. A fresh launch
+refuses an option the installed CLI does not offer. The PR reviewer keeps its
+`--strict-config`, read-only permission profile, and worktree isolation; only
+its model/effort/Fast are appended. A working, blocked, or idle agent is
+reused with its original harness and options and is never restarted because
+settings differ. To apply new preferences, close it (exit the agent in its
+pane), then press the key again.
 
 ## Git transport for PR reviews and issue preparation
 
@@ -242,8 +307,9 @@ existing identity, conflict, worktree reuse, server compatibility, and
 diagnostic checks. A repeated key press reuses its worktree and agent: it never
 starts a second agent and never re-prompts an agent that is working or blocked
 (it focuses it instead). An idle or finished agent is prompted again. If you
-changed `ISSUE_AGENT` while an agent of the old kind still exists, that agent is
-kept and reused; the new choice applies once it is closed.
+changed `ISSUE_AGENT` or an `mf-config` profile while an agent still exists,
+that agent is kept and reused with its original options; the new choice applies
+once it is closed.
 
 Issue **i** fetches the repository's default branch from GitHub immediately and
 creates or reuses a separate `agent/prepare-issue-N` worktree, Herdr workspace,
@@ -421,7 +487,8 @@ never bypasses CI or marks checks passed.
 Setup copies the runtime into
 `${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/`, with a
 `.mini-factory-install` ownership marker, and installs the managed wrapper
-`~/.local/bin/ghd`. The dashboard runtime works on its own, but the clone must
+`~/.local/bin/ghd`, plus the optional `~/.local/bin/mf-config` launcher described
+above. The dashboard runtime works on its own, but the clone must
 stay where it is for the No-Mistakes configuration link above; run setup from
 the clone, never from the runtime copy. Updates replace only this project's
 marked runtime and exact managed wrapper after validating the staged bundle. An
@@ -430,11 +497,13 @@ personal files in the managed runtime.
 
 Setup also manages only the missing dependency installations you approve,
 GitHub CLI's extension installation, your explicitly requested native logins,
-the Codex directory and native Herdr integrations above, the issue-agent
-setting, and the No-Mistakes configuration link. On Ubuntu an approved
+the Codex directory and native Herdr integrations above, the shared issue-agent
+setting, and the No-Mistakes configuration link. Only `mf-config` writes
+`agent-profiles.json`. On Ubuntu an approved
 GitHub CLI installation writes
 `/etc/apt/keyrings/githubcli-archive-keyring.gpg` and
-`/etc/apt/sources.list.d/github-cli.list`.
+`/etc/apt/sources.list.d/github-cli.list`; an approved Gum installation from
+Charm's repository writes the Charm files listed above.
 It never copies the maintainer's
 credentials or personal config. Existing gh-dash, Herdr, shell and unrelated
 agent settings are preserved.
@@ -454,8 +523,9 @@ make doctor
 ```
 
 Doctor separates **installed**, **authentication/setup pending**, and **ready to
-launch from this context**. It checks the tools and versions above, the saved
-issue agent, authentication for Codex, the issue agent, and the pipeline agent,
+launch from this context**. It checks the tools and versions above (including
+Gum), the shared issue agent and each issue key's effective agent, authentication
+for Codex, the `i`/`I` agents, and the pipeline agent,
 their Herdr integrations, `acpx` when Cursor is the pipeline agent, the
 No-Mistakes configuration link, and the pipeline agent's readiness via native
 `no-mistakes doctor` (run without update checks or telemetry). Doctor checks
@@ -465,7 +535,8 @@ on native doctor, which proves only that the agent runs, so log in to that agent
 through its own CLI. Outside Herdr it
 skips runtime-context checks and explains how to enter a pane. Inside Herdr it
 checks the inherited route, active compatible server, Codex and issue-agent
-detection manifests, target repository, and Git transport. It never starts
+detection manifests, target repository, and Git transport. It notes, without
+failing, when the optional `mf-config` launcher is not on `PATH`. It never starts
 agents or pipelines, creates worktrees, sends prompts, writes PR comments, or
 marks PRs ready. It returns nonzero for required failed/pending checks.
 
@@ -505,8 +576,8 @@ Before committing changes, review the diff and run the focused checks:
 git diff --check
 make test
 # For changes to the launcher, setup/doctor, or worker shell scripts:
-bash -n bin/ghd scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
-shellcheck -x bin/ghd scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+bash -n bin/ghd bin/mf-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+shellcheck -x bin/ghd bin/mf-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
 ```
 
 Commit and push reviewed changes to this repository. Users update their clone
@@ -525,7 +596,9 @@ Installation instructions were checked against upstream documentation and native
 CLI help on 2026-10-08; the issue-agent additions against Herdr 0.9.5 help and
 Claude Code/Cursor CLI help and installers on 2026-10-30; and the stable
 No-Mistakes support against the v1.84.0 (latest stable) documentation and native
-help on 2026-11-01. Mocked macOS/Ubuntu coverage is not
+help on 2026-11-01; `mf-config` against Codex CLI 0.166.0, Claude Code 2.1.316,
+Cursor CLI 2026.10.22, Gum 2.0.2, and Herdr 0.9.5 help on 2026-11-01. Mocked
+macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those
 hosts.

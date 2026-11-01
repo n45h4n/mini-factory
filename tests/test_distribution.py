@@ -60,6 +60,12 @@ elif name == "gh":
                               "defaultBranchRef": {"name": "main"}}))
         else:
             print("friend/target")
+    elif args[:2] == ["pr", "view"]:
+        if "GH_REPO" in os.environ or args[2:5] != ["7", "--repo", "friend/target"]:
+            fail("unexpected pull request lookup")
+        head = os.environ["MOCK_PR_HEAD"]
+        print(json.dumps({"number": 7, "state": "OPEN", "headRefOid": head, "baseRefOid": head,
+                          "baseRefName": "main", "isCrossRepository": False}))
     elif args[:2] == ["issue", "view"]:
         if "GH_REPO" in os.environ or args != ["issue", "view", "8", "--repo", "friend/target", "--json", "number,title,body"]:
             fail("unexpected issue lookup")
@@ -103,9 +109,10 @@ elif name == "gh":
         fail()
 elif name == "codex":
     if args == ["--version"]:
-        print("codex-cli 0.115.0")
+        print("codex-cli " + os.environ.get("MOCK_CODEX_VERSION", "0.115.0"))
     elif args == ["--help"]:
-        print("Codex CLI: login logout --version")
+        print("Codex CLI: login logout --version" if os.environ.get("MOCK_AGENT_HELP") == "old"
+              else "Codex CLI\n  -c, --config <key=value>\n      --strict-config\n  -m, --model <MODEL>\n  login logout --version")
     elif args[:2] == ["login", "status"]:
         if os.environ.get("MOCK_CODEX_AUTH") == "pending" and not (root / "codex-authenticated").exists():
             fail("AUTH_SECRET_SENTINEL should never be displayed")
@@ -120,6 +127,17 @@ elif name == "codex":
 elif name == "claude":
     if args == ["--version"]:
         print("2.1.0 (Claude Code)")
+    elif args == ["--help"]:
+        if os.environ.get("MOCK_AGENT_HELP") == "old":
+            print("  --model <model>  Model for the current session")
+        else:
+            print("  --effort <level>                      Effort level for the current session\n"
+                  "                                        (low, medium, high, xhigh, max)\n"
+                  "  --model <model>                       Model for the current session. Provide\n"
+                  "                                        an alias for the latest model (e.g.\n"
+                  "                                        'fable', 'opus', or 'sonnet') or a\n"
+                  "                                        model's full name.\n"
+                  "  --name <name>                         Session name")
     elif args == ["auth", "status"]:
         if os.environ.get("MOCK_CLAUDE_AUTH") == "pending" and not (root / "claude-authenticated").exists():
             fail("AUTH_SECRET_SENTINEL should never be displayed")
@@ -131,6 +149,13 @@ elif name == "claude":
 elif name == "cursor-agent":
     if args == ["--version"]:
         print("2026.10.22-test")
+    elif args == ["--help"]:
+        print("  --model <model>  Model to use\n  --list-models  List available models and exit")
+    elif args == ["--list-models"]:
+        if os.environ.get("MOCK_CURSOR_MODELS") == "missing":
+            fail("Error: Authentication required.")
+        print("\x1b[1mAvailable models\x1b[0m\n\nauto - Auto\ngpt-5 - GPT-5\n"
+              "claude-opus-4-8[context=1m,effort=high] - Opus 4.8 (bracketed)")
     elif args == ["status", "--format", "json"]:
         # Native Cursor status succeeds while logged out; only the boolean distinguishes it.
         pending = os.environ.get("MOCK_CURSOR_AUTH") == "pending" and not (root / "cursor-authenticated").exists()
@@ -139,6 +164,31 @@ elif name == "cursor-agent":
         (root / "cursor-authenticated").write_text("yes")
     else:
         fail()
+elif name == "gum":
+    if args == ["--version"]:
+        if os.environ.get("MOCK_GUM") == "broken" and not (root / "gum-repaired").exists():
+            fail("gum: cannot execute")
+        print("gum version 0.17.0 (test)")
+    elif args[:1] in (["choose"], ["input"], ["confirm"]):
+        answers_path = pathlib.Path(os.environ["MOCK_GUM_ANSWERS"])
+        answers = json.loads(answers_path.read_text())
+        if not answers:
+            fail("unexpected gum prompt")
+        answer = answers.pop(0)
+        answers_path.write_text(json.dumps(answers))
+        if answer == "<cancel>":
+            sys.exit(130)
+        if args[0] == "confirm":
+            sys.exit(0 if answer == "yes" else 1)
+        print(answer)
+    else:
+        fail()
+elif name == "apt-cache":
+    if args != ["policy", "gum"]:
+        fail()
+    # Newer Ubuntu releases carry gum in universe; older archives have no candidate.
+    if os.environ.get("MOCK_APT_GUM") == "archive":
+        print("gum:\n  Installed: (none)\n  Candidate: 0.17.0-1\n  Version table:")
 elif name == "acpx":
     if args == ["--version"]:
         print("0.20.0")
@@ -232,6 +282,55 @@ elif name == "no-mistakes":
         (root / "no-mistakes-updated").write_text("yes")
     else:
         fail()
+elif name == "herdr" and os.environ.get("MOCK_PR_WORKFLOW") == "1" and (
+        args[:1] in (["worktree"], ["agent"]) or args[:3] in (["tab", "get", "pr-tab"], ["pane", "get", "pr-pane"])):
+    state_file = root / "pr-workflow.json"
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    def worktrees(source):
+        listing = subprocess.run([os.environ["REAL_GIT"], "-C", source, "worktree", "list", "--porcelain"],
+                                 check=True, capture_output=True, text=True).stdout
+        found = []
+        for block in listing.strip().split("\n\n")[1:]:
+            path = block.splitlines()[0].split(" ", 1)[1]
+            found.append({"branch": None, "path": path, "is_bare": False, "is_detached": "detached" in block,
+                          "is_prunable": False, "is_linked_worktree": True,
+                          **({"open_workspace_id": "pr-ws"} if state.get("open") == path else {})})
+        return found
+    def agent():
+        return {"name": state["alias"], "agent": "codex", "workspace_id": "pr-ws", "tab_id": "pr-tab",
+                "pane_id": "pr-pane", "agent_status": os.environ.get("MOCK_AGENT_STATUS", "idle")}
+    if args[:2] == ["worktree", "list"]:
+        print(json.dumps({"id": "test", "result": {"type": "worktree_list",
+            "source": {"source_checkout_path": args[args.index("--cwd") + 1], "source_workspace_id": "ws"},
+            "worktrees": worktrees(args[args.index("--cwd") + 1])}}))
+    elif args[:2] == ["worktree", "open"] and "--path" in args:
+        path = args[args.index("--path") + 1]
+        already_open, state["open"] = state.get("open") == path, path
+        state_file.write_text(json.dumps(state))
+        print(json.dumps({"id": "test", "result": {"type": "worktree_opened", "already_open": already_open,
+            "workspace": {"workspace_id": "pr-ws"}, "tab": {"tab_id": "pr-tab", "workspace_id": "pr-ws"},
+            "root_pane": {"pane_id": "pr-pane", "tab_id": "pr-tab", "workspace_id": "pr-ws", "foreground_cwd": path},
+            "worktree": next(item for item in worktrees(args[args.index("--cwd") + 1]) if item["path"] == path)}}))
+    elif args[:3] == ["tab", "get", "pr-tab"]:
+        envelope("tab_info", "tab", {"tab_id": "pr-tab", "workspace_id": "pr-ws"})
+    elif args[:3] == ["pane", "get", "pr-pane"]:
+        envelope("pane_info", "pane", {"pane_id": "pr-pane", "tab_id": "pr-tab", "workspace_id": "pr-ws",
+                                       "foreground_cwd": state["open"]})
+    elif args[:2] == ["agent", "list"]:
+        envelope("agent_list", "agents", [agent()] if "alias" in state else [])
+    elif args[:2] == ["agent", "get"]:
+        if state.get("alias") != args[2]:
+            print(json.dumps({"id": "test", "error": {"code": "agent_not_found", "message": "agent not found"}}))
+            sys.exit(1)
+        envelope("agent_info", "agent", agent())
+    elif args[:2] == ["agent", "start"] and args[3:8] == ["--kind", "codex", "--pane", "pr-pane", "--timeout"]:
+        state["alias"] = args[2]
+        state_file.write_text(json.dumps(state))
+        envelope("agent_started", "agent", agent())
+    elif args[:3] == ["agent", "prompt", "pr-pane"] and "alias" in state:
+        envelope("agent_prompted", "agent", agent())
+    else:
+        fail("unexpected PR review Herdr action")
 elif name == "herdr":
     issue_mode = os.environ.get("MOCK_ISSUE_WORKFLOW") == "1"
     base = pathlib.Path(os.environ.get("MOCK_WORKTREE_BASE", str(root.parent)))
@@ -333,8 +432,8 @@ elif name == "herdr":
         envelope("agent_info", "agent", issue_agent(branch))
     elif issue_mode and args[:2] == ["agent", "start"]:
         branch = session("alias", args[2])
-        if (branch is None or args[3:] != ["--kind", args[4], "--pane", sessions[branch]["pane"], "--timeout", "30000"]
-                or args[4] not in ("claude", "codex", "cursor")):
+        if (branch is None or args[3:9] != ["--kind", args[4], "--pane", sessions[branch]["pane"], "--timeout", "30000"]
+                or args[9:10] not in ([], ["--"]) or args[4] not in ("claude", "codex", "cursor")):
             fail("unexpected issue agent launch")
         issue_state[branch].update(agent_started=True, agent_status="idle", kind=args[4])
         save()
@@ -352,17 +451,24 @@ elif name == "herdr":
 elif name in ("brew", "sudo", "apt-get"):
     if name == "brew" and args == ["--version"]:
         print("Homebrew 4.6.0")
+    elif name == "brew" and args[:2] == ["list", "--versions"]:
+        if args[2] not in os.environ.get("MOCK_BREW_LISTED", "").split():
+            sys.exit(1)
+        print(args[2] + " 1.0.0")
     elif name == "sudo" and args[:1] == ["mkdir"] and all(
             value in ("mkdir", "-p", "-m", "755", "/etc/apt/keyrings", "/etc/apt/sources.list.d")
             for value in args):
         pass
-    elif "install" in args or "upgrade" in args or "update" in args:
+    elif "install" in args or "upgrade" in args or "update" in args or "reinstall" in args:
         if os.environ.get("MOCK_INSTALL_FAIL"):
             fail("simulated interrupted package installation")
-        provided = {"gh": ("gh",)}
+        if "gum" in args:
+            (root / "gum-repaired").write_text("yes")
+        provided = {"gh": ("gh",), "gum": ("gum",)}
         for command in (command for package in args for command in provided.get(package, ())):
-            shutil.copyfile(root / "mock-cli", root / command)
-            (root / command).chmod(0o755)
+            if not (root / command).exists():
+                shutil.copyfile(root / "mock-cli", root / command)
+                (root / command).chmod(0o755)
     else:
         fail()
 elif name == "git":
@@ -377,6 +483,9 @@ elif name == "git":
         if os.environ.get("MOCK_FETCH") == "fail":
             fail("mock default-branch fetch failure")
         args = [os.environ["MOCK_REMOTE"] if arg == "git@github.com:friend/target.git" else arg for arg in args]
+    elif (os.environ.get("MOCK_PR_WORKFLOW") == "1" and "worktree" in args
+          and args[args.index("worktree") + 1:args.index("worktree") + 3] == ["add", "--detach"]):
+        pass
     elif any(arg in args for arg in ("worktree", "push", "fetch", "clone", "commit", "checkout", "reset")):
         fail("unexpected Git mutation")
     os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
@@ -420,6 +529,8 @@ elif name == "curl":
         destination.write_text(script)
     elif url == "https://cli.github.com/packages/githubcli-archive-keyring.gpg":
         destination.write_bytes(b"MOCK official keyring\n")
+    elif url == "https://repo.charm.sh/apt/gpg.key":
+        destination.write_bytes(b"MOCK Charm armored key\n")
     else:
         fail("unexpected upstream URL")
 elif name == "dpkg":
@@ -451,12 +562,12 @@ class DistributionTests(unittest.TestCase):
         mock_script.write_text(MOCK)
         mock_script.chmod(0o755)
         for name in ("gh", "codex", "claude", "cursor-agent", "acpx", "no-mistakes", "herdr", "uname",
-                     "brew", "curl", "sudo", "apt-get", "git", "nohup", "ssh", "dpkg"):
+                     "brew", "curl", "sudo", "apt-get", "apt-cache", "git", "nohup", "ssh", "dpkg", "gum"):
             (self.mock / name).symlink_to(mock_script.name)
         # A controlled PATH makes genuinely missing dependencies reproducible.
         utilities = ("bash sh env make jq python3 tar mkdir cp mv rm chmod cat find readlink dirname "
                      "basename mktemp sed awk tr stat date sleep touch ln id ps cmp head cut sort uniq "
-                     "wc xargs grep install tee gzip unzip which du rmdir")
+                     "wc xargs grep install tee gzip unzip which du rmdir sha256sum shasum")
         for name in utilities.split():
             executable = sys.executable if name == "python3" else shutil.which(name, path=REAL_PATH)
             if executable and not (self.mock / name).exists():
@@ -478,16 +589,19 @@ class DistributionTests(unittest.TestCase):
         return self.run_script(self.bundle / "scripts/setup.sh", env=env)
 
     def interactive_setup(self, answer="n", **overrides):
+        # More than one prompt may be needed; every answer remains explicit.
+        return self.run_in_terminal([str(self.bundle / "scripts/setup.sh")], dict(self.env, **overrides),
+                                    ((answer + "\n") * 24).encode())
+
+    def run_in_terminal(self, argv, env, keystrokes=b""):
         master, slave = pty.openpty()
-        process = subprocess.Popen([str(self.bundle / "scripts/setup.sh")], cwd=self.root,
-                                   env=dict(self.env, **overrides), stdin=slave,
+        process = subprocess.Popen(argv, cwd=self.root, env=env, stdin=slave,
                                    stdout=slave, stderr=slave, close_fds=True)
         os.close(slave)
         output = bytearray()
         deadline = time.monotonic() + 30
         try:
-            # More than one prompt may be needed; every answer remains explicit.
-            os.write(master, ((answer + "\n") * 24).encode())
+            os.write(master, keystrokes)
             while time.monotonic() < deadline:
                 ready, _, _ = select.select([master], [], [], 0.1)
                 if ready:
@@ -505,7 +619,7 @@ class DistributionTests(unittest.TestCase):
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    self.fail("interactive setup did not finish; output: " + output.decode(errors="replace"))
+                    self.fail("terminal command did not finish; output: " + output.decode(errors="replace"))
             process.wait(timeout=5)
         finally:
             os.close(master)
@@ -599,7 +713,7 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("gh-dash-codex-issue-dispatch.sh", config)
         for forbidden in ("--factory", "diffnav", "lazygit", "tuicr", "octo", "queue", "sandbox", "$HOME/dotfiles", "repoPaths"):
             self.assertNotIn(forbidden, config)
-        for relative in ("bin/ghd", "scripts/setup.sh", "scripts/doctor.sh",
+        for relative in ("bin/ghd", "bin/mf-config", "scripts/setup.sh", "scripts/doctor.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh",
@@ -1555,6 +1669,495 @@ class DistributionTests(unittest.TestCase):
                             for call in self.calls("git")))
         self.assertFalse(self.calls("ssh"))
         self.assert_no_actions()
+
+    # mf-config: per-key agent profiles, the Gum editor, and fresh-launch options.
+
+    def profiles_file(self, profiles=None):
+        path = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/agent-profiles.json"
+        if profiles is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"version": 1, "profiles": profiles}))
+        return path
+
+    def mf_config(self, *args, **env):
+        return self.run_script(self.bundle / "bin/mf-config", *args, env=env)
+
+    def edit_profiles(self, *answers, **overrides):
+        answers_file = self.root / "gum answers.json"
+        answers_file.write_text(json.dumps(list(answers)))
+        self.log.write_text("")
+        result = self.run_in_terminal([str(self.bundle / "bin/mf-config")],
+                                      dict(self.env, MOCK_GUM_ANSWERS=str(answers_file), **overrides))
+        return result, json.loads(answers_file.read_text())
+
+    def gum_prompts(self):
+        prompts = []
+        for call in self.calls("gum"):
+            args = call["args"]
+            if args[0] == "confirm":
+                prompts.append(("confirm", args[1], None, []))
+            elif args[0] in ("choose", "input"):
+                index = 3
+                current = None
+                if args[3:4] in (["--selected"], ["--value"]):
+                    current, index = args[4], 5
+                prompts.append((args[0], args[2], current, args[index:]))
+        return prompts
+
+    def codex_cache(self, present=True):
+        directory = self.home / "codex home"
+        directory.mkdir(exist_ok=True)
+        cache = directory / "models_cache.json"
+        if present:
+            cache.write_text(json.dumps({"client_version": "0.166.0", "models": [
+                {"slug": "gpt-test-fast", "visibility": "list",
+                 "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "ultra"}],
+                 "service_tiers": [{"id": "priority", "name": "Fast"}], "additional_speed_tiers": ["fast"]},
+                {"slug": "gpt-test-standard", "visibility": "list",
+                 "supported_reasoning_levels": [{"effort": "medium"}], "service_tiers": [],
+                 "additional_speed_tiers": []},
+                {"slug": "gpt-hidden-internal", "visibility": "hide"}]}))
+        elif cache.exists():
+            cache.unlink()
+        return {"CODEX_HOME": str(directory)}
+
+    def pr_environment(self, repo, git, **overrides):
+        git("update-ref", "refs/pull/7/head", "HEAD")
+        return {"HERDR_SOCKET_PATH": str(self.home / "test.sock"), "HERDR_WORKSPACE_ID": "ws",
+                "HERDR_TAB_ID": "tab", "HERDR_PANE_ID": "pane", "MOCK_PR_WORKFLOW": "1",
+                "MOCK_REMOTE": str(repo), "MOCK_PR_HEAD": git("rev-parse", "HEAD"),
+                "GH_DASH_SOURCE_ROOT": str(repo), "GH_DASH_SOURCE_REPO": "friend/target",
+                "GH_DASH_SOURCE_BRANCH": "feature/friend", "GH_DASH_SOURCE_SHA": git("rev-parse", "HEAD"),
+                "GH_DASH_SOURCE_DIRTY": "0", "GH_DASH_CODEX_PR_REVIEW_BACKEND": "1", **overrides}
+
+    def test_mf_config_show_reports_legacy_fallback_and_precedence_without_a_terminal(self):
+        self.save_issue_agent("claude")
+        result = self.mf_config("show")
+        self.assert_success(result)
+        lines = result.stdout.splitlines()
+        self.assertIn("Issues i - preparer: Claude Code - shared issue agent (no per-role override)", lines)
+        self.assertIn("Issues I - implementer: Claude Code - shared issue agent (no per-role override)", lines)
+        self.assertIn("PRs I - reviewer (Codex only): Codex - native defaults; locally read-only permissions unchanged",
+                      lines)
+        self.assertIn("(none saved yet)", result.stdout)
+        self.assertIn("its mf-config selection, then the shared issue agent, then Codex", result.stdout)
+        for role in ("issue-prepare", "issue-implement"):
+            self.assertEqual(self.mf_config("agent", role).stdout, "claude\nshared\n")
+        self.profiles_file({"issue-implement": {"agent": "cursor", "model": "gpt-5"},
+                            "pr-review": {"agent": "codex", "effort": "high", "fast": False}})
+        result = self.mf_config("show")
+        self.assert_success(result)
+        self.assertIn("Issues i - preparer: Claude Code - shared issue agent", result.stdout)
+        self.assertIn("Issues I - implementer: Cursor - mf-config per-role selection", result.stdout)
+        self.assertIn("model: gpt-5 (Cursor's model ID owns its variant/effort)", result.stdout)
+        self.assertIn("model: native default; reasoning effort: high; Fast: off", result.stdout)
+        self.assertEqual(self.mf_config("agent", "issue-implement").stdout, "cursor\noverride\n")
+        self.assertEqual(self.mf_config("agent", "pr-review").stdout, "codex\noverride\n")
+        # Editing needs a terminal; show stays available.
+        result = self.mf_config()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mf-config show", result.stderr)
+        self.assertFalse(self.calls("gum"))
+
+    def test_mf_config_rejects_invalid_profiles_without_repairing_them(self):
+        invalid = (
+            '{"version": 1, "profiles": {"pr-review": {"agent": "claude"}}}',
+            '{"version": 1, "profiles": {"issue-prepare": {"agent": "cursor", "effort": "high"}}}',
+            '{"version": 1, "profiles": {"issue-prepare": {"agent": "codex", "model": "--yolo"}}}',
+            '{"version": 1, "profiles": {"issue-prepare": {"agent": "codex", "fast": "on"}}}',
+            '{"version": 1, "profiles": {"issue-prepare": {"agent": "codex"}, "issue-prepare": {"agent": "claude"}}}',
+            '{"version": 2, "profiles": {}}',
+            'not json',
+        )
+        path = self.profiles_file({})
+        for content in invalid:
+            with self.subTest(content=content):
+                path.write_text(content)
+                for args in (("show",), ("agent", "issue-prepare"), ("launch-args", "pr-review", "codex")):
+                    result = self.mf_config(*args)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("mf-config:", result.stderr)
+                self.assertEqual(path.read_text(), content)
+        # A worker refuses before creating anything when the preference is unreadable.
+        repo, git = self.source_repo()
+        result = self.issue_helper(**self.issue_environment(repo, git, cwd=repo))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unable to read the I agent preference", result.stderr)
+        self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start"))
+
+    def test_editor_offers_three_profiles_and_saves_only_after_confirmation(self):
+        self.save_issue_agent("claude")
+        path = self.profiles_file()
+        source = self.bundle / "no-mistakes/config.yaml"
+        pipeline = source.read_text()
+        result, remaining = self.edit_profiles("Issues i - preparer", "Claude Code", "opus", "max", "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        prompts = self.gum_prompts()
+        self.assertEqual(prompts[0][0], "choose")
+        self.assertEqual(prompts[0][3], ["Issues i - preparer", "Issues I - implementer",
+                                         "PRs I - reviewer (Codex only)"])
+        harness = prompts[1]
+        self.assertEqual(harness[3], ["Shared issue agent: Claude Code (no per-role override)", "Codex",
+                                      "Claude Code", "Cursor"])
+        self.assertEqual(harness[2], "Shared issue agent: Claude Code (no per-role override)")
+        # Claude aliases and effort levels come from claude --help; native default is first.
+        self.assertEqual(prompts[2][3], ["Native default (no override)", "fable", "opus", "sonnet", "haiku",
+                                         "Custom model ID (unverified)"])
+        self.assertEqual(prompts[3][3], ["Native default (no override)", "low", "medium", "high", "xhigh", "max",
+                                         "Custom value (unverified)"])
+        self.assertEqual(prompts[4][0], "confirm")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"version": 1, "profiles": {"issue-prepare": {"agent": "claude", "model": "opus",
+                                                                       "effort": "max"}}})
+        self.assertEqual(self.mf_config("agent", "issue-implement").stdout, "claude\nshared\n")
+        self.assertEqual(source.read_text(), pipeline, "mf-config must not touch the No-Mistakes pipeline agent")
+        self.assertIn("Existing Herdr agents keep their original harness and options", result.stdout)
+        saved = path.read_bytes()
+        # Cancellation, a declined save, and invalid input all leave the saved file unchanged.
+        for answers, status in ((("Issues I - implementer", "<cancel>"), 130),
+                                (("Issues I - implementer", "Codex", "<cancel>"), 130),
+                                (("Issues I - implementer", "Cursor", "auto", "no"), 130),
+                                (("Issues I - implementer", "Codex", "Custom model ID (unverified)", "--yolo"), 1),
+                                (("Issues I - implementer", "Codex", "Custom model ID (unverified)", "has space"), 1),
+                                (("Issues I - implementer", "Not a listed harness"), 1)):
+            with self.subTest(answers=answers):
+                result, _ = self.edit_profiles(*answers)
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assertEqual(path.read_bytes(), saved)
+                self.assertIn("unchanged" if status == 130 else "invalid", result.stdout)
+        # Selecting the shared agent removes only that key's override.
+        result, remaining = self.edit_profiles("Issues i - preparer", "Shared issue agent: Claude Code (no per-role override)",
+                                               "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(json.loads(path.read_text()), {"version": 1, "profiles": {}})
+        self.assertEqual(self.mf_config("agent", "issue-prepare").stdout, "claude\nshared\n")
+        result, remaining = self.edit_profiles("Issues i - preparer",
+                                               "Shared issue agent: Claude Code (no per-role override)")
+        self.assert_success(result)
+        self.assertIn("No change; nothing was saved.", result.stdout)
+
+    def test_codex_picker_uses_local_cache_effort_levels_and_fast_availability(self):
+        cache = self.codex_cache()
+        path = self.profiles_file()
+        new = dict(cache, MOCK_CODEX_VERSION="0.166.0")
+        result, remaining = self.edit_profiles("Issues I - implementer", "Codex", "gpt-test-fast", "ultra", "On", "yes",
+                                               **new)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        prompts = self.gum_prompts()
+        # Hidden cache entries are not offered; custom input always remains available.
+        self.assertEqual(prompts[2][3], ["Native default (no override)", "gpt-test-fast", "gpt-test-standard",
+                                         "Custom model ID (unverified)"])
+        self.assertEqual(prompts[3][3], ["Native default (no override)", "low", "high", "ultra",
+                                         "Custom value (unverified)"])
+        self.assertEqual(prompts[4][1], "Issues I - implementer: Codex Fast (separate from reasoning effort)")
+        self.assertEqual(prompts[4][2], "Off", "an explicit Fast choice defaults to Off")
+        self.assertEqual(prompts[4][3], ["Off", "On", "Native default (no override)"])
+        self.assertEqual(json.loads(path.read_text())["profiles"]["issue-implement"],
+                         {"agent": "codex", "model": "gpt-test-fast", "effort": "ultra", "fast": True})
+        # A saved On survives when metadata disappears, but only as an explicit, preselected choice.
+        self.codex_cache(present=False)
+        result, remaining = self.edit_profiles("Issues I - implementer", "Codex", "gpt-test-fast", "ultra", "Off", "yes",
+                                               **new)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        prompts = self.gum_prompts()
+        self.assertEqual(prompts[2][3], ["Native default (no override)", "gpt-test-fast", "Custom model ID (unverified)"])
+        self.assertEqual(prompts[2][2], "gpt-test-fast")
+        self.assertEqual(prompts[3][3], ["Native default (no override)", "ultra", "low", "medium", "high", "xhigh",
+                                         "Custom value (unverified)"])
+        self.assertEqual(prompts[4][2], "On")
+        self.assertIn("kept for review", result.stdout)
+        self.assertEqual(json.loads(path.read_text())["profiles"]["issue-implement"]["fast"], False)
+        # A saved Off without advertised support can stay Off or be cleared, but never become On.
+        saved = path.read_bytes()
+        result, remaining = self.edit_profiles("Issues I - implementer", "Codex", "gpt-test-fast", "ultra", "On",
+                                               **new)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(remaining, [])
+        self.assertEqual(path.read_bytes(), saved)
+        prompts = self.gum_prompts()
+        self.assertEqual(prompts[4][2], "Off")
+        self.assertEqual(prompts[4][3], ["Off", "Native default (no override)"])
+        result, remaining = self.edit_profiles("Issues I - implementer", "Codex", "gpt-test-fast", "ultra",
+                                               "Native default (no override)", "yes", **new)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(json.loads(path.read_text())["profiles"]["issue-implement"],
+                         {"agent": "codex", "model": "gpt-test-fast", "effort": "ultra"})
+        # Missing cache, custom model: no Fast choice is offered and native Fast stays untouched.
+        result, remaining = self.edit_profiles("PRs I - reviewer (Codex only)", "Custom model ID (unverified)",
+                                               "my-model-1", "high", "yes", **new)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertFalse([prompt for prompt in self.gum_prompts() if "Fast" in prompt[1]])
+        self.assertIn("No local Codex model cache", result.stdout)
+        self.assertEqual(json.loads(path.read_text())["profiles"]["pr-review"],
+                         {"agent": "codex", "model": "my-model-1", "effort": "high"})
+        # An installed Codex without Fast routing is never offered Fast, even for an advertising model.
+        self.codex_cache()
+        for answers in (("Issues i - preparer", "Codex", "gpt-test-fast", "high", "yes"),
+                        ("Issues i - preparer", "Codex", "Native default (no override)",
+                         "Native default (no override)", "yes")):
+            with self.subTest(answers=answers):
+                result, remaining = self.edit_profiles(*answers, **cache)
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertFalse([prompt for prompt in self.gum_prompts() if "Fast" in prompt[1]])
+        self.assertEqual(json.loads(path.read_text())["profiles"]["issue-prepare"], {"agent": "codex"})
+        # All-native reviewer choices remove the reviewer override.
+        result, remaining = self.edit_profiles("PRs I - reviewer (Codex only)", "Native default (no override)",
+                                               "Native default (no override)", "yes", **new)
+        self.assert_success(result)
+        self.assertNotIn("pr-review", json.loads(path.read_text())["profiles"])
+
+    def test_cursor_picker_uses_bounded_model_list_and_preserves_custom_values(self):
+        path = self.profiles_file()
+        bracketed = "claude-opus-4-8[context=1m,effort=high]"
+        result, remaining = self.edit_profiles("Issues i - preparer", "Cursor", bracketed, "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        prompts = self.gum_prompts()
+        self.assertEqual(prompts[2][3], ["Native default (no override)", "auto", "gpt-5", bracketed,
+                                         "Custom model ID (unverified)"])
+        self.assertEqual(prompts[3][0], "confirm", "Cursor has no separate effort selector")
+        self.assertEqual(json.loads(path.read_text())["profiles"]["issue-prepare"],
+                         {"agent": "cursor", "model": bracketed})
+        self.assertEqual([c["args"] for c in self.calls("cursor-agent")], [["--list-models"]])
+        # Unavailable metadata (for example logged out) keeps the saved and custom values usable.
+        saved = path.read_bytes()
+        result, remaining = self.edit_profiles("Issues i - preparer", "Cursor", "Native default (no override)", "no",
+                                               MOCK_CURSOR_MODELS="missing")
+        self.assertEqual(result.returncode, 130)
+        self.assertEqual(remaining, [])
+        self.assertEqual(path.read_bytes(), saved)
+        prompts = self.gum_prompts()
+        self.assertEqual(prompts[2][3], ["Native default (no override)", bracketed, "Custom model ID (unverified)"])
+        # Gum splits --selected on commas; the saved model ID is escaped.
+        self.assertEqual(prompts[2][2], bracketed.replace(",", "\\,"))
+        self.assertIn("model list is unavailable", result.stdout)
+
+    def test_separate_issue_profiles_reach_only_fresh_agents_with_native_options(self):
+        self.save_issue_agent("cursor")
+        self.profiles_file({"issue-prepare": {"agent": "claude", "model": "opus", "effort": "high"},
+                            "issue-implement": {"agent": "codex", "model": "gpt-test-fast",
+                                                "effort": "xhigh", "fast": False}})
+        repo, git = self.source_repo()
+        self.advance_default_branch(git, "Current default branch")
+        route = self.issue_environment(repo, git, cwd=repo, MOCK_CODEX_VERSION="0.166.0")
+        self.assert_success(self.issue_helper(**route))
+        self.assert_success(self.issue_helper("prepare", **route))
+        self.assertEqual(self.herdr_calls("agent", "start"), [
+            ["agent", "start", "target-8", "--kind", "codex", "--pane", "issue-pane", "--timeout", "30000",
+             "--", "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="xhigh"',
+             "--config", 'service_tier="default"'],
+            ["agent", "start", "target-prep-8", "--kind", "claude", "--pane", "prep-pane", "--timeout", "30000",
+             "--", "--model", "opus", "--effort", "high"]])
+        # Changing a profile while its agent exists never replaces the agent or its options.
+        self.profiles_file({"issue-prepare": {"agent": "cursor", "model": "gpt-5"},
+                            "issue-implement": {"agent": "codex", "model": "gpt-test-standard", "fast": True}})
+        for status in ("working", "blocked", "idle"):
+            with self.subTest(status=status):
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**dict(route, MOCK_AGENT_STATUS=status)))
+                self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS=status)))
+                self.assertFalse(self.herdr_calls("agent", "start"))
+                self.assertFalse([c for c in self.calls("herdr") if c["args"][:2] in (["pane", "close"], ["agent", "send-keys"])])
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "issue-pane"],
+                                                                     ["agent", "focus", "prep-pane"]])
+                implement, prepare = self.notifications()[-2:]
+                self.assertIn("Reused the existing Codex agent with its original options", implement)
+                self.assertIn("Kept the existing Claude Code agent with its original options", prepare)
+                for notification in (implement, prepare):
+                    self.assertIn("exit it in its pane", notification)
+                # Saved knobs are not even read for retained agents.
+                self.assertFalse([c for c in self.calls() if c["tool"] in ("codex", "claude", "cursor-agent")
+                                  and c["args"] == ["--help"]])
+
+    def test_launch_refuses_options_the_installed_cli_cannot_accept(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        cases = ((("issue-implement", {"agent": "claude", "effort": "max"}), {"MOCK_AGENT_HELP": "old"}, "--effort"),
+                 (("issue-implement", {"agent": "codex", "fast": True}), {}, "Codex 0.154.0 or newer"),
+                 (("issue-implement", {"agent": "cursor", "model": "auto"}), {"MOCK_AGENT_HELP": "old"}, None))
+        for (role, profile), overrides, refusal in cases:
+            with self.subTest(profile=profile):
+                self.profiles_file({role: profile})
+                self.log.write_text("")
+                result = self.issue_helper(**dict(route, **overrides))
+                if refusal is None:
+                    # Cursor's --model is still advertised by the older help fixture.
+                    self.assert_success(result)
+                    self.assertEqual(self.herdr_calls("agent", "start")[0][-3:], ["--", "--model", "auto"])
+                    continue
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(refusal, result.stderr)
+                self.assertIn("agent not started and prompt not sent", result.stderr)
+                self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+
+    def test_pr_review_applies_only_codex_model_effort_and_fast_after_security_options(self):
+        repo, git = self.source_repo()
+        route = self.pr_environment(repo, git, MOCK_CODEX_VERSION="0.166.0")
+        worker = self.bundle / "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh"
+        # Issue profiles never affect the reviewer.
+        self.profiles_file({"issue-implement": {"agent": "claude", "model": "opus"}})
+        self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
+        default_start = self.herdr_calls("agent", "start")
+        self.assertEqual(len(default_start), 1)
+        security = default_start[0][default_start[0].index("--") + 1:]
+        worktree = security[security.index("--cd") + 1]
+        self.assertEqual(security, ["--ask-for-approval", "never", "--strict-config", "--cd", worktree,
+                                    "--config", 'default_permissions="gh_dash_pr_review"',
+                                    "--config", 'permissions.gh_dash_pr_review={extends=":read-only",network={'
+                                    'enabled=true,domains={"github.com"="allow","api.github.com"="allow",'
+                                    '"*.githubusercontent.com"="allow"}}}'])
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        self.assertIn("<!-- gh-dash-codex-pr-review -->", prompt)
+        # A fresh reviewer gets only its saved model/effort/Fast, after the unchanged security options.
+        (self.mock / "pr-workflow.json").unlink()
+        git("worktree", "remove", "--force", worktree)
+        alias = default_start[0][2]
+        self.profiles_file({"pr-review": {"agent": "codex", "model": "gpt-test-fast", "effort": "high", "fast": True}})
+        self.log.write_text("")
+        self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
+        self.assertEqual(self.herdr_calls("agent", "start"), [
+            ["agent", "start", alias, "--kind", "codex", "--pane", "pr-pane", "--timeout", "30000", "--",
+             *security, "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="high"',
+             "--config", 'service_tier="fast"', "--config", "features.fast_mode=true"]])
+        self.assertIn("locally read-only Codex agent.", self.notifications()[-1])
+        # A retained reviewer is reused with its original options.
+        self.profiles_file({"pr-review": {"agent": "codex", "model": "gpt-test-standard"}})
+        self.log.write_text("")
+        self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
+        self.assertFalse(self.herdr_calls("agent", "start"))
+        self.assertEqual(len(self.herdr_calls("agent", "prompt")), 1)
+        self.assertIn("Reused the existing reviewer with its original options", self.notifications()[-1])
+
+    def test_setup_provisions_selected_harnesses_and_keeps_per_key_selections(self):
+        self.save_issue_agent("codex")
+        path = self.profiles_file({"issue-prepare": {"agent": "claude", "effort": "high"},
+                                   "issue-implement": {"agent": "claude"}})
+        saved = path.read_bytes()
+        for name in ("claude", "cursor-agent"):
+            (self.mock / name).unlink()
+        result = self.interactive_setup("y", MOCK_INTEGRATION="pending")
+        self.assert_success(result)
+        self.assertIn("Issues i preparer: claude; Issues I implementer: claude", result.stdout)
+        urls = [argument for call in self.calls("curl") for argument in call["args"] if argument.startswith("https://")]
+        self.assertIn("https://claude.ai/install.sh", urls)
+        self.assertNotIn("https://cursor.com/install", urls, "an unused harness must not be installed")
+        installs = [args for args in self.herdr_calls("integration", "install") if "--help" not in args]
+        self.assertEqual(installs, [["integration", "install", "codex"], ["integration", "install", "claude"]])
+        self.assertIn("OK: Issues i preparer: Claude Code (mf-config selection)", result.stdout)
+        self.assertEqual(path.read_bytes(), saved)
+        # ISSUE_AGENT stays the shared compatibility path; it never overwrites a per-key selection.
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        result = self.setup(ISSUE_AGENT="codex")
+        self.assert_success(result)
+        self.assertEqual(path.read_bytes(), saved)
+        self.assertEqual(self.mf_config("agent", "issue-implement").stdout, "claude\noverride\n")
+        # The shared agent still applies to a key without its own selection.
+        (self.mock / "cursor-agent").symlink_to("mock-cli")
+        self.profiles_file({"issue-prepare": {"agent": "claude"}})
+        self.assert_success(self.setup(ISSUE_AGENT="cursor"))
+        self.assertEqual(self.mf_config("agent", "issue-implement").stdout, "cursor\nshared\n")
+        self.assertEqual(self.mf_config("agent", "issue-prepare").stdout, "claude\noverride\n")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env={"MOCK_CURSOR_AUTH": "pending"})
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: Cursor authentication/setup pending", doctor.stdout)
+        self.assertIn("OK: Issues I implementer: Cursor (shared issue agent)", doctor.stdout)
+        path.write_text("{broken")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: mf-config agent profiles unreadable", doctor.stdout)
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot read the mf-config agent profiles", result.stderr)
+        self.assertEqual(path.read_text(), "{broken")
+
+    def test_managed_mf_config_launcher_never_replaces_another_command(self):
+        self.install()
+        launcher = self.wrapper.parent / "mf-config"
+        content = launcher.read_bytes()
+        self.assertIn(b"# mini-factory managed launcher v1", content)
+        self.assertTrue(content.endswith(b'/mini-factory/bin/mf-config "$@"\n'))
+        self.assert_success(self.run_script(launcher, "show"))
+        self.assert_success(self.setup())
+        self.assertEqual(launcher.read_bytes(), content)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: mf-config launcher resolves on PATH", doctor.stdout)
+        # An unrelated file at the launcher path, or another mf-config on PATH, is left alone.
+        launcher.write_text("#!/bin/sh\necho unrelated\n")
+        result = self.setup()
+        self.assert_success(result)
+        self.assertEqual(launcher.read_text(), "#!/bin/sh\necho unrelated\n")
+        self.assertIn("Run " + str(self.bundle / "bin/mf-config") + " instead.", result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("NOTE: optional mf-config launcher is not on PATH", doctor.stdout)
+        launcher.unlink()
+        other = self.mock / "mf-config"
+        other.write_text("#!/bin/sh\necho other\n")
+        other.chmod(0o755)
+        result = self.setup()
+        self.assert_success(result)
+        self.assertFalse(launcher.exists())
+        self.assertEqual(other.read_text(), "#!/bin/sh\necho other\n")
+        self.assertIn("another mf-config command is on PATH", result.stdout)
+        # The repository-local fallback still works.
+        self.assert_success(self.mf_config("show"))
+        self.assert_no_actions()
+
+    def test_gum_is_installed_or_repaired_only_with_consent_and_checked_by_doctor(self):
+        self.install()
+        doctor = self.installed / "scripts/doctor.sh"
+        (self.mock / "gum").unlink()
+        result = self.run_script(doctor)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: gum missing; run make setup", result.stdout)
+        self.assertFalse(self.calls("brew"), "doctor must stay read-only")
+        self.assertNotEqual(self.setup().returncode, 0)
+        self.assertFalse([c for c in self.calls("brew") if "install" in c["args"]])
+        self.assertNotEqual(self.interactive_setup("n").returncode, 0)
+        self.assertFalse([c for c in self.calls("brew") if "install" in c["args"]])
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertIn("brew install gum", result.stdout)
+        self.assertIn(["install", "gum"], [c["args"] for c in self.calls("brew")])
+        self.assertIn("OK: gum available", result.stdout)
+        # An installed but unrunnable Homebrew Gum is repaired with reinstall, not left broken.
+        (self.mock / "gum-repaired").unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_GUM="broken", MOCK_BREW_LISTED="gum")
+        self.assert_success(result)
+        self.assertEqual([c["args"] for c in self.calls("brew") if c["args"][:1] in (["install"], ["reinstall"])],
+                         [["reinstall", "gum"]])
+
+    def test_mocked_ubuntu_gum_from_archive_or_charm_repository(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        for source in ("archive", "charm"):
+            with self.subTest(source=source):
+                if (self.mock / "gum").exists():
+                    (self.mock / "gum").unlink()
+                self.log.write_text("")
+                result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64",
+                                                **({"MOCK_APT_GUM": "archive"} if source == "archive" else {}))
+                self.assert_success(result)
+                self.assertTrue((self.mock / "gum").exists())
+                actions = [c["args"] for c in self.calls("sudo")]
+                self.assertEqual(actions[-1], ["apt-get", "install", "-y", "--no-install-recommends", "gum"])
+                charm = [args for args in actions if "/etc/apt/sources.list.d/charm.list" in args]
+                downloads = [c["args"] for c in self.calls("curl") if "https://repo.charm.sh/apt/gpg.key" in c["args"]]
+                if source == "archive":
+                    self.assertFalse(charm or downloads)
+                else:
+                    self.assertTrue(charm and downloads)
+                    self.assertIn(["apt-get", "update"], actions)
+                self.assert_no_actions(allow_onboarding=True)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
 launcher="$bin_directory/ghd"
+config_launcher="$bin_directory/mf-config"
 parent_path="$PATH"
 install_marker='mini-factory-v1'
 agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent"
@@ -14,6 +15,9 @@ nm_source="$bundle/no-mistakes/config.yaml"
 nm_backup="$nm_config.mini-factory-backup"
 nm_template_agent='agent: codex # Initialize to the chosen pipeline agent during first setup.'
 issue_agent=''
+prepare_agent=''
+implement_agent=''
+role_agents=()
 pipeline_agent=''
 stage=''
 backup=''
@@ -157,7 +161,30 @@ select_issue_agent() {
 		printf '%s\n' "$issue_agent" >"$agent_setting.$$"
 		mv -f -- "$agent_setting.$$" "$agent_setting"
 	fi
-	notice "Issue agent for i and I: $issue_agent (saved in $agent_setting; change it with make setup ISSUE_AGENT=claude|codex|cursor)."
+	notice "Shared issue agent: $issue_agent (saved in $agent_setting; change it with make setup ISSUE_AGENT=claude|codex|cursor). A per-key mf-config selection takes precedence."
+}
+
+# mf-config resolves each issue key's harness (per-key selection, shared agent, Codex);
+# setup provisions only those harnesses and never rewrites a per-key selection.
+select_role_agents() {
+	local role output kind
+	for role in issue-prepare issue-implement; do
+		output="$(python3 -I -B "$bundle/scripts/mf_config.py" agent "$role" 2>&1)" ||
+			die "cannot read the mf-config agent profiles: $output"
+		kind="${output%%$'\n'*}"
+		case "$kind" in
+		claude | codex | cursor) ;;
+		*) die "unexpected mf-config agent for $role: $output" ;;
+		esac
+		if [ "$role" = issue-prepare ]; then
+			prepare_agent="$kind"
+		else
+			implement_agent="$kind"
+		fi
+	done
+	role_agents=("$prepare_agent")
+	[ "$implement_agent" = "$prepare_agent" ] || role_agents[1]="$implement_agent"
+	notice "Issues i preparer: $prepare_agent; Issues I implementer: $implement_agent (see mf-config show)."
 }
 
 # Only first-time linking of an unedited template follows the issue agent. Rewriting the template line
@@ -230,6 +257,11 @@ git_is_suitable() {
 	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
+# Gum provides the mf-config editor; no version floor, only a runnable command.
+gum_is_suitable() {
+	command -v gum >/dev/null 2>&1 && gum --version >/dev/null 2>&1
+}
+
 gh_is_suitable() {
 	command -v gh >/dev/null 2>&1 || return 1
 	gh --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 47))}'
@@ -238,7 +270,7 @@ gh_is_suitable() {
 install_dependencies() {
 	local command_name package proposal
 	local packages=()
-	local installs=() upgrades=()
+	local installs=() upgrades=() reinstalls=()
 	for command_name in bash awk sed grep tr mkdir rmdir rm date chmod sleep nohup stat env mktemp cp mv cat dirname uname id; do
 		command -v "$command_name" >/dev/null 2>&1 || die "required system utility missing: $command_name; repair OS prerequisites first"
 	done
@@ -251,11 +283,16 @@ install_dependencies() {
 	python_is_suitable || packages[${#packages[@]}]=python3
 	if [ "$platform" = macos ]; then
 		gh_is_suitable || packages[${#packages[@]}]=gh
+		gum_is_suitable || packages[${#packages[@]}]=gum
 		if [ "${#packages[@]}" -gt 0 ]; then
 			command -v brew >/dev/null 2>&1 || die 'Homebrew is required for missing dependencies; follow the macOS bootstrap instructions in README.md'
 			proposal='Homebrew changes for missing/unsuitable dependencies only:'
 			for package in "${packages[@]}"; do
-				if brew list --versions "$package" >/dev/null 2>&1; then
+				if [ "$package" = gum ] && brew list --versions gum >/dev/null 2>&1; then
+					# An installed but unrunnable Gum is repaired, not merely upgraded.
+					reinstalls[${#reinstalls[@]}]=gum
+					proposal="$proposal brew reinstall gum (mf-config editor);"
+				elif brew list --versions "$package" >/dev/null 2>&1; then
 					upgrades[${#upgrades[@]}]="$package"
 					proposal="$proposal brew upgrade $package;"
 				else
@@ -269,6 +306,9 @@ install_dependencies() {
 				fi
 				if [ "${#upgrades[@]}" -gt 0 ]; then
 					HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade "${upgrades[@]}"
+				fi
+				if [ "${#reinstalls[@]}" -gt 0 ]; then
+					HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew reinstall "${reinstalls[@]}"
 				fi
 			else
 				die "dependencies pending: ${packages[*]}"
@@ -293,13 +333,16 @@ install_dependencies() {
 				die 'GitHub CLI installation pending'
 			fi
 		fi
+		gum_is_suitable || install_gum_ubuntu
 	fi
 	python_is_suitable || die 'python3 still resolves to a version below 3.9; fix PATH to use the installed Python and rerun'
 	git_is_suitable || die 'git must be version 2.29 or later; fix PATH to the suitable installation and rerun'
 	gh_is_suitable || die 'gh must be version 2.47 or later; fix PATH to the suitable installation and rerun'
-	# Codex stays required for PR review; add the issue agent, then No-Mistakes.
+	gum_is_suitable || die "gum still cannot run; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
+	select_role_agents
+	# Codex stays required for PR review; add the issue keys' agents, then No-Mistakes.
 	# The pipeline agent is installed after linking, once its config is known.
-	install_tools codex herdr "$(agent_command "$issue_agent")" no-mistakes
+	install_tools codex herdr "$(agent_command "$prepare_agent")" "$(agent_command "$implement_agent")" no-mistakes
 	# Any installed release with the stable interface is reused, including a newer prerelease; only an older one is updated.
 	if ! no_mistakes_is_suitable; then
 		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
@@ -360,6 +403,41 @@ install_github_cli_ubuntu() {
 	sudo apt-get install -y --no-install-recommends gh
 }
 
+# Newer Ubuntu releases carry Gum in universe; older ones use Charm's official apt repository.
+gum_in_ubuntu_archive() {
+	local candidate
+	candidate="$(apt-cache policy gum 2>/dev/null | awk '$1 == "Candidate:" { print $2; exit }')"
+	[ -n "$candidate" ] && [ "$candidate" != '(none)' ]
+}
+
+install_gum_ubuntu() {
+	local scratch
+	local install_arguments=(apt-get install -y --no-install-recommends gum)
+	command -v sudo >/dev/null 2>&1 || die 'sudo is required to install Gum; ask the host administrator'
+	# An installed but unrunnable package is repaired by reinstalling it.
+	! command -v gum >/dev/null 2>&1 || install_arguments=(apt-get install -y --reinstall --no-install-recommends gum)
+	if gum_in_ubuntu_archive; then
+		consent "Gum provides the mf-config editor. Run sudo ${install_arguments[*]} from your configured Ubuntu archive? This changes system packages." ||
+			die 'Gum installation pending'
+		sudo "${install_arguments[@]}"
+		return
+	fi
+	consent "Gum provides the mf-config editor and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
+		die 'Gum installation pending'
+	scratch="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-gum.XXXXXX")"
+	if ! curl -fsSL https://repo.charm.sh/apt/gpg.key -o "$scratch/charm.asc"; then
+		rm -rf -- "$scratch"
+		die 'unable to download the Charm apt repository key; rerun make setup'
+	fi
+	printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/charm.asc] https://repo.charm.sh/apt/ * *' >"$scratch/charm.list"
+	sudo mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d
+	sudo install -m 644 "$scratch/charm.asc" /etc/apt/keyrings/charm.asc
+	sudo install -m 644 "$scratch/charm.list" /etc/apt/sources.list.d/charm.list
+	rm -rf -- "$scratch"
+	sudo apt-get update
+	sudo "${install_arguments[@]}"
+}
+
 install_native_tool() {
 	local tool="$1" url="$2" scratch status=0
 	[ ! -e "$bin_directory/$tool" ] && [ ! -L "$bin_directory/$tool" ] ||
@@ -392,7 +470,8 @@ install_native_tool() {
 
 install_bundle() {
 	local input source relative quoted
-	local inputs=(Makefile README.md .gitignore bin/ghd gh-dash/config.yml no-mistakes/config.yaml scripts/setup.sh scripts/doctor.sh scripts/doctor.py
+	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config gh-dash/config.yml no-mistakes/config.yaml
+		scripts/setup.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py
 		scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh
@@ -417,7 +496,7 @@ install_bundle() {
 			;;
 		esac
 	done
-	chmod 755 "$stage/bin/ghd" "$stage/scripts/setup.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
+	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/scripts/setup.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
 	"$stage/scripts/doctor.sh" --bundle "$stage" --integrity-only || die 'replacement bundle failed validation; existing installation preserved'
 	launcher_stage="$(mktemp "$bin_directory/.mini-factory-launcher.XXXXXX")"
@@ -444,6 +523,36 @@ install_bundle() {
 	backup=''
 	notice "Installed: $runtime"
 	notice "Launcher: $launcher"
+}
+
+# The optional mf-config launcher never replaces another command; the clone's bin/mf-config always works.
+install_config_launcher() {
+	local quoted expected existing staged
+	printf -v quoted '%q' "$runtime/bin/mf-config"
+	expected="$(printf '#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %s "$@"\n' "$quoted")"
+	if [ -e "$config_launcher" ] || [ -L "$config_launcher" ]; then
+		if ! { [ -f "$config_launcher" ] && [ ! -L "$config_launcher" ] && [ -O "$config_launcher" ] &&
+			[ "$(cat "$config_launcher")" = "$expected" ]; }; then
+			notice "Optional mf-config launcher skipped: $config_launcher is not managed by mini-factory and was left untouched. Run $bundle/bin/mf-config instead."
+			return 0
+		fi
+	fi
+	existing="$(command -v mf-config 2>/dev/null || true)"
+	if [ -n "$existing" ] && [ "$existing" != "$config_launcher" ]; then
+		notice "Optional mf-config launcher skipped: another mf-config command is on PATH ($existing). Run $bundle/bin/mf-config instead."
+		return 0
+	fi
+	[ ! -f "$config_launcher" ] || { notice "mf-config launcher: $config_launcher"; return 0; }
+	staged="$(mktemp "$bin_directory/.mini-factory-mf-config.XXXXXX")"
+	printf '%s\n' "$expected" >"$staged"
+	chmod 755 "$staged"
+	# Never clobber an entry that appeared since the check above.
+	if [ -e "$config_launcher" ] || [ -L "$config_launcher" ] || ! mv -- "$staged" "$config_launcher"; then
+		rm -f -- "$staged"
+		notice "Optional mf-config launcher skipped: $config_launcher appeared during setup. Run $bundle/bin/mf-config instead."
+		return 0
+	fi
+	notice "mf-config launcher: $config_launcher"
 }
 
 agent_is_authenticated() {
@@ -526,10 +635,12 @@ configure_native_tools() {
 	fi
 	# Codex reviews PRs; the issue and pipeline agents authenticate through their own CLIs.
 	login_agent codex
-	[ "$issue_agent" = codex ] || login_agent "$issue_agent"
-	case "$pipeline_agent" in
-	'' | codex | "$issue_agent") ;;
-	*) login_agent "$pipeline_agent" ;;
+	for kind in "${role_agents[@]}"; do
+		[ "$kind" = codex ] || login_agent "$kind"
+	done
+	case " codex ${role_agents[*]} " in
+	*" $pipeline_agent "*) ;;
+	*) [ -z "$pipeline_agent" ] || login_agent "$pipeline_agent" ;;
 	esac
 	ensure_acp_runner
 	codex_directory="${CODEX_HOME:-$HOME/.codex}"
@@ -538,9 +649,11 @@ configure_native_tools() {
 	*) die 'CODEX_HOME must be an absolute path before integration installation' ;;
 	esac
 	integration="$(herdr integration status 2>/dev/null || true)"
-	# Herdr detects the PR review agent (Codex) and the issue agent through native integrations.
+	# Herdr detects the PR review agent (Codex) and the issue keys' agents through native integrations.
 	kinds=(codex)
-	[ "$issue_agent" = codex ] || kinds[1]="$issue_agent"
+	for kind in "${role_agents[@]}"; do
+		[ "$kind" = codex ] || kinds[${#kinds[@]}]="$kind"
+	done
 	for kind in "${kinds[@]}"; do
 		! printf '%s\n' "$integration" | grep -q "^$kind: current " || continue
 		case "$kind" in
@@ -583,6 +696,7 @@ link_no_mistakes_config
 read_pipeline_agent
 [ -z "$pipeline_agent" ] || install_tools "$(agent_command "$pipeline_agent")"
 install_bundle
+install_config_launcher
 configure_native_tools
 case ":$parent_path:" in
 *":$bin_directory:"*) ;;

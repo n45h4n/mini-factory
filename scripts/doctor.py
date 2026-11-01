@@ -59,6 +59,34 @@ def issue_agent_setting():
     return (value if value in AGENTS else None), path
 
 
+def role_agents():
+    """Each issue key's effective harness, resolved by the bundled mf-config."""
+    helper = Path(__file__).resolve().parent / "mf_config.py"
+    agents = {}
+    for role in ("issue-prepare", "issue-implement"):
+        try:
+            result = subprocess.run([sys.executable, "-I", "-B", str(helper), "agent", role],
+                                    capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ValueError(str(error))
+        lines = result.stdout.splitlines()
+        if result.returncode or len(lines) != 2 or lines[0] not in AGENTS:
+            raise ValueError((result.stderr or result.stdout).strip() or "no result")
+        agents[role] = tuple(lines)
+    return agents
+
+
+def managed_launcher(path, target):
+    expected = output([
+        "bash", "-c", 'printf \'#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %q "$@"\n\' "$1"',
+        "mini-factory-doctor", str(target),
+    ])
+    try:
+        return not path.is_symlink() and path.read_text() == expected
+    except OSError:
+        return False
+
+
 def pipeline_agent(config):
     # Only the top-level scalar is read; native no-mistakes doctor validates the whole file.
     try:
@@ -105,8 +133,9 @@ def flag_available(text, flag):
 def integrity(bundle):
     workers = bundle / "scripts/integrations/gh-dash"
     required = [bundle / "Makefile", bundle / "README.md", bundle / "gh-dash/config.yml",
-                bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py"]
-    executables = [bundle / "bin/ghd", bundle / "scripts/setup.sh", bundle / "scripts/doctor.sh"]
+                bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py", bundle / "scripts/mf_config.py"]
+    executables = [bundle / "bin/ghd", bundle / "bin/mf-config", bundle / "scripts/setup.sh",
+                   bundle / "scripts/doctor.sh"]
     executables += [workers / name for name in (
         "gh-dash-codex-issue.sh", "gh-dash-codex-issue-dispatch.sh",
         "gh-dash-codex-pr-review.sh", "gh-dash-codex-pr-review-dispatch.sh")]
@@ -126,7 +155,8 @@ def integrity(bundle):
                 "--factory", "$HOME/dotfiles", "diffnav", "repoPaths:", "pager:",
                 "universal:", "octo", "tuicr", "lazygit", "sandbox"))):
         raise ValueError("bundle config does not contain the isolated PR I and issue i/I routes")
-    compile((bundle / "scripts/doctor.py").read_bytes(), str(bundle / "scripts/doctor.py"), "exec")
+    for script in ("scripts/doctor.py", "scripts/mf_config.py"):
+        compile((bundle / script).read_bytes(), str(bundle / script), "exec")
 
 
 def route_check(kinds):
@@ -243,15 +273,21 @@ def main():
         return int(bool(failures))
 
     issue_agent, setting = issue_agent_setting()
+    try:
+        roles, role_problem = role_agents(), None
+    except ValueError as error:
+        # Fall back to the shared choice so the remaining checks still run.
+        roles, role_problem = {}, str(error)
+    issue_kinds = list(dict.fromkeys(kind for kind, _ in roles.values())) or [issue_agent or "codex"]
     no_mistakes_config = Path(os.environ.get("NM_HOME") or str(Path.home() / ".no-mistakes")) / "config.yaml"
     pipeline = pipeline_agent(no_mistakes_config)
-    # Codex stays required for PR review even when another agent handles issues.
-    agents = list(dict.fromkeys(kind for kind in ("codex", issue_agent or "codex", pipeline) if kind in AGENTS))
+    # Codex stays required for PR review even when other agents handle issues.
+    agents = list(dict.fromkeys(kind for kind in ("codex", *issue_kinds, pipeline) if kind in AGENTS))
     commands = [AGENTS[kind][0] for kind in agents] + ["no-mistakes"] + (["acpx"] if pipeline == "cursor" else [])
-    for name in ("bash", "git", "make", "gh", "jq", "python3", "herdr", "curl", "tar",
+    for name in ("bash", "git", "make", "gh", "jq", "python3", "herdr", "curl", "tar", "gum",
                  "env", "tr", "mkdir", "rmdir", "rm", "date", "chmod", "sleep", "nohup", "stat", *commands):
         check(shutil.which(name), name + " available", name + " missing; run make setup")
-    for name in ("git", "gh", "jq", "herdr", *commands):
+    for name in ("git", "gh", "jq", "herdr", "gum", *commands):
         text = output([name, "--version"], NO_MISTAKES_ENVIRONMENT)
         check(bool(text and text.strip()), name + " version responds", name + " version check failed")
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
@@ -285,8 +321,14 @@ def main():
 
     check(authenticated(["gh", "auth", "status", "--hostname", "github.com"]),
           "GitHub authenticated", "GitHub authentication/setup pending: gh auth login --hostname github.com --web")
-    check(issue_agent is not None, "issue agent for i and I: " + str(issue_agent),
+    check(issue_agent is not None, "shared issue agent: " + str(issue_agent),
           "issue agent setting pending: make setup ISSUE_AGENT=claude|codex|cursor (" + str(setting) + ")")
+    sources = {"override": "mf-config selection", "shared": "shared issue agent", "default": "default"}
+    if check(role_problem is None, "agent profiles readable (mf-config show for details)",
+             "mf-config agent profiles unreadable (" + str(role_problem) + ")"):
+        for role, label in (("issue-prepare", "Issues i preparer"), ("issue-implement", "Issues I implementer")):
+            kind, source = roles[role]
+            print("OK: " + label + ": " + AGENTS[kind][1] + " (" + sources.get(source, source) + ")")
     for kind in agents:
         _, label, login = AGENTS[kind]
         check(agent_authenticated(kind), label + " authenticated",
@@ -296,7 +338,7 @@ def main():
         print("NOTE: No-Mistakes pipeline agent " + (pipeline or "unset/list") + " login not checked by this doctor; "
               "readiness relies on native no-mistakes doctor")
     integration = output(["herdr", "integration", "status"]) or ""
-    for kind in dict.fromkeys(("codex", issue_agent or "codex")):
+    for kind in dict.fromkeys(("codex", *issue_kinds)):
         lines = [line for line in integration.splitlines() if line.startswith(kind + ":")]
         check(len(lines) == 1 and lines[0].startswith(kind + ": current "),
               "Herdr " + AGENTS[kind][1] + " integration current",
@@ -315,17 +357,22 @@ def main():
           "No-Mistakes pipeline agent not ready (native doctor: " + detail + "); " + action)
     launcher = Path.home() / ".local/bin/ghd"
     active = shutil.which("ghd")
-    expected_wrapper = output([
-        "bash", "-c", 'printf \'#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %q "$@"\n\' "$1"',
-        "mini-factory-doctor", str(bundle / "bin/ghd"),
-    ])
     try:
-        managed = (not launcher.is_symlink() and launcher.read_text() == expected_wrapper
+        managed = (managed_launcher(launcher, bundle / "bin/ghd")
                    and (bundle / ".mini-factory-install").read_text() == "mini-factory-v1\n")
     except OSError:
         managed = False
     check(active and Path(active).resolve() == launcher.resolve() and managed,
           "managed launcher resolves on PATH", 'launcher PATH/setup pending: export PATH="$HOME/.local/bin:$PATH"; run make setup if ghd is absent')
+    # The mf-config launcher is optional: setup never replaces another mf-config command.
+    config_launcher = Path.home() / ".local/bin/mf-config"
+    active = shutil.which("mf-config")
+    if (active and Path(active).resolve() == config_launcher.resolve()
+            and managed_launcher(config_launcher, bundle / "bin/mf-config")):
+        print("OK: mf-config launcher resolves on PATH")
+    else:
+        print("NOTE: optional mf-config launcher is not on PATH (absent, or another mf-config command exists); "
+              "run bin/mf-config from your retained mini-factory clone")
     setup_pending = bool(failures) and not installation_failed
     print("Authentication/setup: " + ("pending" if setup_pending or installation_failed else "complete"))
 
@@ -333,7 +380,7 @@ def main():
         "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"
     )):
         try:
-            route_check(list(dict.fromkeys(("codex", issue_agent or "codex"))))
+            route_check(list(dict.fromkeys(("codex", *issue_kinds))))
             print("OK: inherited Herdr route, compatible server, source repository and agent detection")
         except (OSError, ValueError) as error:
             check(False, "", "runtime context: " + str(error))

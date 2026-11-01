@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROGRAM="${0##*/}"
+mf_config_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/mf_config.py"
 NOTIFICATION_TITLE="gh-dash issue"
 AGENT_START_TOTAL_ATTEMPTS=10
 AGENT_START_RETRY_INTERVAL_SECONDS=1
@@ -65,28 +66,35 @@ agent_label() {
 	esac
 }
 
-# make setup saves one shared choice for i and I; absent means the original Codex default.
+# mf-config resolves this key's harness: its per-role selection, else the shared
+# make setup choice, else the original Codex default. It owns validation.
 read_issue_agent_setting() {
-	local config_base setting_path value=
+	local output
 
-	if [ -n "${XDG_CONFIG_HOME:-}" ]; then
-		config_base="$XDG_CONFIG_HOME"
-	else
-		config_base="$HOME/.config"
-	fi
-	setting_path="$config_base/mini-factory/issue-agent"
-	selected_kind=codex
-	if [ -e "$setting_path" ] || [ -L "$setting_path" ]; then
-		[ -f "$setting_path" ] || die "issue agent setting is not a regular file: $setting_path"
-		IFS= read -r value <"$setting_path" || [ -n "$value" ] ||
-			die "unable to read the issue agent setting: $setting_path"
-		case "$value" in
-		claude | codex | cursor) selected_kind="$value" ;;
-		*) die "invalid issue agent setting in $setting_path; run make setup ISSUE_AGENT=claude|codex|cursor" ;;
-		esac
-	fi
-	manager_kind="$selected_kind"
+	output="$(python3 -I -B "$mf_config_helper" agent "$profile_role" 2>&1)" ||
+		die "unable to read the $issue_key agent preference: $output"
+	manager_kind="${output%%$'\n'*}"
+	profile_source="${output#*$'\n'}"
+	case "$manager_kind" in
+	claude | codex | cursor) ;;
+	*) die "unexpected $issue_key agent preference: $output" ;;
+	esac
 	manager_label="$(agent_label "$manager_kind")"
+}
+
+# Saved model/effort/Fast knobs are read only for a fresh agent; a retained agent keeps its own.
+read_launch_arguments() {
+	local output argument
+
+	agent_arguments=()
+	output="$(python3 -I -B "$mf_config_helper" launch-args "$profile_role" "$manager_kind" 2>&1)" ||
+		die "unable to apply the saved $manager_label launch preferences; agent not started and prompt not sent: $output"
+	[ -n "$output" ] || return 0
+	while IFS= read -r argument; do
+		agent_arguments[${#agent_arguments[@]}]="$argument"
+	done <<EOF
+$output
+EOF
 }
 
 validate_fetch_url() {
@@ -485,10 +493,12 @@ if [ "$#" -eq 3 ]; then
 	issue_mode=prepare
 	issue_key=i
 	identity_suffix=-prepare
+	profile_role=issue-prepare
 else
 	issue_mode=implement
 	issue_key=I
 	identity_suffix=
+	profile_role=issue-implement
 fi
 
 case "$selected_repo" in
@@ -1208,11 +1218,14 @@ else
 	agent_present=1
 	# A changed setting applies to new sessions; never silently replace a retained agent.
 	if [ "$selected_agent_kind" != "$manager_kind" ]; then
-		retained_notice=" Kept the existing $(agent_label "$selected_agent_kind") agent; the $manager_label setting applies once it is closed."
+		retained_notice=" Kept the existing $(agent_label "$selected_agent_kind") agent with its original options; the $manager_label setting applies once it is closed (exit it in its pane, then press $issue_key)."
 		printf 'WARNING: %s: retaining existing %s agent for %s instead of the %s setting\n' \
 			"$PROGRAM" "$selected_agent_kind" "$workspace_label" "$manager_kind" >&2
 		manager_kind="$selected_agent_kind"
 		manager_label="$(agent_label "$manager_kind")"
+	elif [ "$profile_source" = override ]; then
+		# Herdr does not report launch options, so saved mf-config knobs cannot be compared.
+		retained_notice=" Reused the existing $manager_label agent with its original options; saved mf-config preferences apply to a fresh agent (exit it in its pane, then press $issue_key)."
 	fi
 fi
 # Detection must cover the agent actually reused or launched before focusing or prompting it.
@@ -1319,13 +1332,13 @@ send_issue_prompt() {
 
 if [ "$agent_present" -eq 0 ]; then
 	prepare_issue_prompt
+	read_launch_arguments
+	agent_start_command=(herdr agent start "$agent_alias" --kind "$manager_kind" --pane "$root_pane_id" --timeout 30000)
+	[ "${#agent_arguments[@]}" -eq 0 ] || agent_start_command+=(-- "${agent_arguments[@]}")
 	agent_start_json=
 	for ((agent_start_attempt = 1; agent_start_attempt <= AGENT_START_TOTAL_ATTEMPTS; agent_start_attempt++)); do
 		agent_start_status=0
-		capture_json_response agent_start_json herdr agent start "$agent_alias" \
-			--kind "$manager_kind" \
-			--pane "$root_pane_id" \
-			--timeout 30000 9<&- || agent_start_status=$?
+		capture_json_response agent_start_json "${agent_start_command[@]}" 9<&- || agent_start_status=$?
 		[ "$agent_start_status" -ne 0 ] || break
 		[ "$agent_start_status" -ne 125 ] ||
 			die "unable to start $manager_label for issue; prompt not sent: $agent_start_json"
