@@ -1136,13 +1136,21 @@ class DistributionTests(unittest.TestCase):
                             "owner must add PR-triggered CI and get it onto the default branch",
                             "deliberately declare no_ci: true there"):
             self.assertIn(requirement, prompt)
-        # An established empty check list ends reattachment with the run preserved and the blocker reported.
+        # Zero checks end reattachment, but require diagnosis before assigning the blocker.
         stop = prompt.index("Do not reattach forever to an empty check list.")
         self.assertLess(prompt.index("reattach to the same run"), stop)
         for requirement in ("gh pr checks reports no checks", "stop reattaching, keep the run and PR in place",
-                            "report the exact native CI status and the owner's corrective action",
+                            "inspect PR mergeability and workflow trigger status before assigning the blocker",
+                            "An empty check list alone does not establish missing CI",
+                            "If a merge conflict prevented a pull_request workflow from running, report the conflict as the blocker",
+                            "follow native branch_sync/recovery guidance",
+                            "Otherwise report the observed trigger blocker",
+                            "if the cause cannot be confirmed, report it as unknown",
+                            "Report the exact native CI status, the supporting evidence, and the appropriate corrective action",
+                            "recommend the owner's corrective action from step 3 only when missing CI is independently established",
                             "Never bypass CI, mark checks passed, or set no_ci yourself"):
             self.assertIn(requirement, prompt[stop:])
+        self.assertNotIn("the missing CI is established:", prompt[stop:])
         self.assertNotIn("abort", prompt[stop:].split("\n", 1)[0])
         # The dispatcher itself never inspects, creates, or edits the target's CI configuration.
         worktree = repo.parent / "issue worktree with spaces"

@@ -403,8 +403,13 @@ are clearly established, it still delivers the PR and tells you to add
 PR-triggered CI to the default branch, or to deliberately declare `no_ci: true`
 there. If the PR still has zero checks after a bounded wait while No-Mistakes
 waits, the agent does not reattach forever. It leaves the run and PR in place
-and reports the exact CI blocker and this corrective action. After you fix the
-CI setup, continue with `no-mistakes axi status` from the worktree. This bundle
+and checks PR mergeability and workflow trigger status before assigning the
+blocker. Zero checks alone do not prove CI is missing: a merge conflict can
+prevent a `pull_request` workflow from running. The agent reports the conflict
+or other observed trigger blocker, or an unknown cause if unconfirmed, along
+with the exact native CI status and appropriate corrective action. It recommends
+adding CI only when missing CI is independently established. After resolving
+the blocker, continue with `no-mistakes axi status` from the worktree. This bundle
 never bypasses CI or marks checks passed.
 
 ## Managed files, diagnostics, and updates
