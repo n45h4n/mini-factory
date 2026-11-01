@@ -1759,6 +1759,35 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("mf-config show", result.stderr)
         self.assertFalse(self.calls("gum"))
 
+    def test_pr_profile_lookups_ignore_invalid_shared_issue_agent(self):
+        path = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
+        path.parent.mkdir(parents=True)
+        for invalid in ("invalid value", None):
+            if invalid is None:
+                path.unlink()
+                path.mkdir()
+            else:
+                path.write_text(invalid)
+            for profiles, source, arguments in (({}, "default", ""),
+                    ({"pr-review": {"agent": "codex", "model": "review-model", "effort": "high"}},
+                     "override", '--model\nreview-model\n--config\nmodel_reasoning_effort="high"\n')):
+                with self.subTest(invalid=invalid, profiles=profiles):
+                    self.profiles_file(profiles)
+                    result = self.mf_config("agent", "pr-review")
+                    self.assert_success(result)
+                    self.assertEqual(result.stdout, "codex\n" + source + "\n")
+                    result = self.mf_config("launch-args", "pr-review", "codex")
+                    self.assert_success(result)
+                    self.assertEqual(result.stdout, arguments)
+                    for role in ("issue-prepare", "issue-implement"):
+                        result = self.mf_config("agent", role)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("invalid issue agent setting", result.stderr)
+            if invalid is not None:
+                self.assertEqual(path.read_text(), invalid)
+            else:
+                self.assertTrue(path.is_dir())
+
     def test_mf_config_rejects_invalid_profiles_without_repairing_them(self):
         invalid = (
             '{"version": 1, "profiles": {"pr-review": {"agent": "claude"}}}',
@@ -2001,6 +2030,8 @@ class DistributionTests(unittest.TestCase):
         repo, git = self.source_repo()
         route = self.pr_environment(repo, git, MOCK_CODEX_VERSION="0.166.0")
         worker = self.bundle / "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh"
+        # The Codex reviewer is independent of a broken shared issue-agent setting.
+        self.save_issue_agent("invalid")
         # Issue profiles never affect the reviewer.
         self.profiles_file({"issue-implement": {"agent": "claude", "model": "opus"}})
         self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
@@ -2110,6 +2141,47 @@ class DistributionTests(unittest.TestCase):
         # The repository-local fallback still works.
         self.assert_success(self.mf_config("show"))
         self.assert_no_actions()
+
+    def test_mf_config_launcher_preserves_destination_created_during_publication(self):
+        self.install()
+        launcher = self.wrapper.parent / "mf-config"
+        real_mv = shutil.which("mv", path=REAL_PATH)
+        # Insert the collision at publication itself, after setup's existence checks.
+        shim = "#!" + sys.executable + "\n" + '''import os, pathlib, sys
+destination = pathlib.Path(os.environ["RACE_LAUNCHER"])
+args = sys.argv[1:]
+if args and args[-1] == str(destination):
+    kind = os.environ["RACE_KIND"]
+    if kind == "file":
+        destination.write_text("unrelated command\\n")
+    elif kind == "directory":
+        destination.mkdir()
+    else:
+        destination.symlink_to("unrelated-missing-target")
+executable = REAL_MV if pathlib.Path(sys.argv[0]).name == "mv" else REAL_PYTHON
+os.execv(executable, [executable, *args])
+'''.replace("REAL_MV", repr(real_mv)).replace("REAL_PYTHON", repr(sys.executable))
+        for name in ("mv", "python3"):
+            (self.mock / name).unlink()
+            (self.mock / name).write_text(shim)
+            (self.mock / name).chmod(0o755)
+        for kind in ("file", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                launcher.unlink()
+                result = self.setup(RACE_LAUNCHER=str(launcher), RACE_KIND=kind)
+                self.assert_success(result)
+                self.assertIn("mf-config appeared during setup", result.stdout)
+                if kind == "file":
+                    self.assertEqual(launcher.read_text(), "unrelated command\n")
+                elif kind == "directory":
+                    self.assertTrue(launcher.is_dir())
+                    self.assertEqual(list(launcher.iterdir()), [])
+                    launcher.rmdir()
+                    launcher.touch()
+                else:
+                    self.assertTrue(launcher.is_symlink())
+                    self.assertEqual(os.readlink(launcher), "unrelated-missing-target")
+                self.assertEqual(list(launcher.parent.glob(".mini-factory-mf-config.*")), [])
 
     def test_gum_is_installed_or_repaired_only_with_consent_and_checked_by_doctor(self):
         self.install()

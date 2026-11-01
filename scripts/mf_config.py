@@ -532,11 +532,13 @@ def main(argv):
         show(profiles, shared_agent(), path, raw is not None)
         return 0
     if len(argv) == 2 and argv[0] == "agent" and argv[1] in ROLES:
-        profile, source = effective(argv[1], load_profiles(profiles_path())[0], shared_agent())
+        shared = None if argv[1] == "pr-review" else shared_agent()
+        profile, source = effective(argv[1], load_profiles(profiles_path())[0], shared)
         print(profile["agent"] + "\n" + source)
         return 0
     if len(argv) == 3 and argv[0] == "launch-args" and argv[1] in ROLES and argv[2] in HARNESSES:
-        profile, _ = effective(argv[1], load_profiles(profiles_path())[0], shared_agent())
+        shared = None if argv[1] == "pr-review" else shared_agent()
+        profile, _ = effective(argv[1], load_profiles(profiles_path())[0], shared)
         if profile["agent"] != argv[2]:
             raise ConfigError("the " + ROLES[argv[1]] + " harness changed to " + HARNESSES[profile["agent"]]
                               + " during this launch; press the key again")

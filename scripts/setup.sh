@@ -547,11 +547,13 @@ install_config_launcher() {
 	printf '%s\n' "$expected" >"$staged"
 	chmod 755 "$staged"
 	# Never clobber an entry that appeared since the check above.
-	if [ -e "$config_launcher" ] || [ -L "$config_launcher" ] || ! mv -- "$staged" "$config_launcher"; then
+	# link(2) fails atomically for any existing destination, including directories/symlinks.
+	if ! python3 -I -B -c 'import os, sys; os.link(sys.argv[1], sys.argv[2])' "$staged" "$config_launcher" 2>/dev/null; then
 		rm -f -- "$staged"
 		notice "Optional mf-config launcher skipped: $config_launcher appeared during setup. Run $bundle/bin/mf-config instead."
 		return 0
 	fi
+	rm -f -- "$staged"
 	notice "mf-config launcher: $config_launcher"
 }
 
