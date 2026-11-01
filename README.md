@@ -401,10 +401,14 @@ only when the issue asks for it, never edits `.no-mistakes.yaml` for this
 purpose, and never sets `no_ci`, even if the issue asks. When missing checks
 are clearly established, it still delivers the PR and tells you to add
 PR-triggered CI to the default branch, or to deliberately declare `no_ci: true`
-there. If the PR still has zero checks after a bounded wait while No-Mistakes
-waits, the agent does not reattach forever. It leaves the run and PR in place
-and checks PR mergeability and workflow trigger status before assigning the
-blocker. Zero checks alone do not prove CI is missing: a merge conflict can
+there. When the agent first observes No-Mistakes waiting at CI with zero PR
+checks, it starts a separate two-minute check-registration interval; earlier
+run/reattach waits do not count. It polls native status and PR checks during
+that interval and continues the same run normally if checks appear. Only if
+that interval ends with no checks, or a blocker is independently confirmed
+earlier, does it stop reattaching. It leaves the run and PR in place and checks
+PR mergeability and workflow trigger status before assigning the blocker.
+Zero checks alone do not prove CI is missing: a merge conflict can
 prevent a `pull_request` workflow from running. The agent reports the conflict
 or other observed trigger blocker, or an unknown cause if unconfirmed, along
 with the exact native CI status and appropriate corrective action. It recommends

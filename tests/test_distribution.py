@@ -1136,10 +1136,16 @@ class DistributionTests(unittest.TestCase):
                             "owner must add PR-triggered CI and get it onto the default branch",
                             "deliberately declare no_ci: true there"):
             self.assertIn(requirement, prompt)
-        # Zero checks end reattachment, but require diagnosis before assigning the blocker.
+        # Allow CI its own registration interval, independent of earlier run waits.
         stop = prompt.index("Do not reattach forever to an empty check list.")
         self.assertLess(prompt.index("reattach to the same run"), stop)
-        for requirement in ("gh pr checks reports no checks", "stop reattaching, keep the run and PR in place",
+        for requirement in ("When you first observe that the CI step is waiting and gh pr checks reports no checks",
+                            "start a separate two-minute check-registration interval",
+                            "time spent in earlier run/reattach waits does not count",
+                            "During that interval, poll native status and PR checks at bounded intervals",
+                            "If checks appear, continue driving the same run normally",
+                            "Only if the full two-minute interval ends with no checks, or a blocker is independently confirmed earlier",
+                            "stop reattaching, keep the run and PR in place",
                             "inspect PR mergeability and workflow trigger status before assigning the blocker",
                             "An empty check list alone does not establish missing CI",
                             "If a merge conflict prevented a pull_request workflow from running, report the conflict as the blocker",
@@ -1150,6 +1156,7 @@ class DistributionTests(unittest.TestCase):
                             "recommend the owner's corrective action from step 3 only when missing CI is independently established",
                             "Never bypass CI, mark checks passed, or set no_ci yourself"):
             self.assertIn(requirement, prompt[stop:])
+        self.assertNotIn("If a bounded wait expires while the CI step is still waiting", prompt[stop:])
         self.assertNotIn("the missing CI is established:", prompt[stop:])
         self.assertNotIn("abort", prompt[stop:].split("\n", 1)[0])
         # The dispatcher itself never inspects, creates, or edits the target's CI configuration.
