@@ -34,7 +34,6 @@ AGENTS = {
     "codex": ("codex", "Codex", "codex login --device-auth"),
     "cursor": ("cursor-agent", "Cursor", "cursor-agent login"),
 }
-NO_MISTAKES_MINIMUM = (1, 105, 0)
 # Diagnostics stay side-effect free: no background update check or telemetry event.
 NO_MISTAKES_ENVIRONMENT = dict(os.environ, NO_MISTAKES_NO_UPDATE_CHECK="1", NO_MISTAKES_TELEMETRY="0")
 
@@ -84,9 +83,23 @@ def config_link_problem(link, bundle):
 
 def native_pipeline_status():
     text = output(["no-mistakes", "doctor"], NO_MISTAKES_ENVIRONMENT) or ""
-    lines = [line.strip() for line in text.splitlines() if "gate validation" in line]
-    ready = len(lines) == 1 and "\u2713" in lines[0] and "some checks failed" not in text
-    return ready, (lines[0] if lines else "no gate validation result")
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if "gate validation" in line]
+    if not starts:
+        return False, "no gate validation result"
+    # A config load error continues on the following lines (one per rejected field).
+    detail = [lines[starts[0]].strip()]
+    for line in lines[starts[0] + 1:]:
+        if not line.strip() or line.strip()[:1] in ("\u2713", "\u2717", "\u2013"):
+            break
+        detail.append(line.strip())
+    ready = len(starts) == 1 and "\u2713" in detail[0] and "some checks failed" not in text
+    return ready, " ".join(detail)
+
+
+def flag_available(text, flag):
+    # An exact flag, so --intent-file alone does not satisfy --intent.
+    return re.search(re.escape(flag) + r"(?![\w-])", text) is not None
 
 
 def integrity(bundle):
@@ -241,10 +254,11 @@ def main():
     for name in ("git", "gh", "jq", "herdr", *commands):
         text = output([name, "--version"], NO_MISTAKES_ENVIRONMENT)
         check(bool(text and text.strip()), name + " version responds", name + " version check failed")
-    match = re.search(r"version v?(\d+)\.(\d+)\.(\d+)", output(["no-mistakes", "--version"]) or "")
-    check(match and tuple(map(int, match.groups())) >= NO_MISTAKES_MINIMUM,
-          "No-Mistakes meets the tested v1.105.0 release",
-          "No-Mistakes >= v1.105.0 required; run make setup (native no-mistakes update --beta)")
+    # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
+    help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
+    check(all(flag_available(help_text, flag) for flag in ("--intent", "--yes")),
+          "No-Mistakes unattended AXI run (--intent, --yes) available",
+          "No-Mistakes axi run --intent/--yes capability missing; run make setup (offers the native stable no-mistakes update)")
     git_version = output(["git", "--version"]) or ""
     match = re.search(r"git version (\d+)\.(\d+)", git_version)
     check(match and tuple(map(int, match.groups())) >= (2, 29),
@@ -260,7 +274,6 @@ def main():
         (["herdr", "agent", "start", "--help"], ("--kind", "--pane", "--timeout"), "Herdr agent start"),
         (["herdr", "agent", "prompt", "--help"], ("--wait", "--timeout"), "Herdr agent prompt"),
         (["herdr", "integration", "install", "--help"], tuple(agents), "Herdr agent integration installer"),
-        (["no-mistakes", "axi", "run", "--help"], ("--yes", "--intent-file", "--closes"), "No-Mistakes unattended AXI run"),
         (["gh", "dash", "--help"], ("--config",), "gh-dash extension"),
     ):
         text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
@@ -292,8 +305,14 @@ def main():
     check(problem is None, "No-Mistakes config links to your clone: " + str(no_mistakes_config),
           "No-Mistakes config link pending (" + str(problem) + "); rerun make setup from your clone")
     ready, detail = native_pipeline_status()
+    action = "run no-mistakes doctor"
+    if not ready and "load config" in detail:
+        # Customizations are the user's: explain the rejected fields, never strip them.
+        action = ("the installed No-Mistakes cannot load " + str(no_mistakes_config) + "; setup never rewrites it. "
+                  "Edit the reported fields in your clone's no-mistakes/config.yaml yourself (stable releases reject "
+                  "prerelease-only settings such as ci.review_bot_comments), or use a release that supports them")
     check(ready, "No-Mistakes pipeline agent ready (native doctor: " + detail + ")",
-          "No-Mistakes pipeline agent not ready (native doctor: " + detail + "); run no-mistakes doctor")
+          "No-Mistakes pipeline agent not ready (native doctor: " + detail + "); " + action)
     launcher = Path.home() / ".local/bin/ghd"
     active = shutil.which("ghd")
     expected_wrapper = output([

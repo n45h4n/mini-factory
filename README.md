@@ -34,6 +34,12 @@ ghd
 | Issues | `I` | Implement the issue with the selected agent, commit it, and run No-Mistakes unattended (`--yes`) to an open PR. Never merges. |
 | PRs | `I` | Review the PR with **Codex** (unchanged; see [What the workflows do](#what-the-workflows-do)). |
 
+**Each target repository needs PR checks.** No-Mistakes reports a finished run
+only when the PR has registered checks (GitHub Actions or external CI), or when
+the owner deliberately declared `no_ci: true` in the repository's trusted
+default-branch `.no-mistakes.yaml`. Set this up on the target's default branch
+before relying on `I`; see the [CI prerequisite](#ci-prerequisite-for-each-target-repository).
+
 The selected item must belong to the source repository captured by `ghd`; the
 existing helpers enforce that identity. Agents start with their native model
 defaults. Setup adds no model, effort, trust, or permission overrides: review
@@ -97,8 +103,9 @@ default `ctrl+b`, then `q`, and reattach with `herdr --session my-project`.
 
 Setup checks tools first and reuses suitable installations. The runtime needs
 Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Codex, Herdr,
-No-Mistakes v1.105.0+, the selected issue agent, the configured No-Mistakes
-pipeline agent, and the standard system utilities used by the dispatchers.
+No-Mistakes (its stable `axi run --intent`/`--yes` interface), the selected
+issue agent, the configured No-Mistakes pipeline agent, and the standard system
+utilities used by the dispatchers.
 **Codex is always required** because the PR `I` review route still runs Codex,
 even when Claude Code or Cursor handles issues. Python supports diagnostics and
 safe log handling; no pip packages are needed.
@@ -257,14 +264,24 @@ branch starts at the commit `ghd` captured (below), which can be older than the
 starting branch and SHA, or the retained branch's current SHA. The helper
 captures the issue title and body into a private file outside the worktree, and
 the prompt asks the agent to implement and commit the change, run
-`no-mistakes init` if the repository is not initialized, and start:
+`no-mistakes init` if the repository is not initialized, check the target's
+real PR-check expectations (see the
+[CI prerequisite](#ci-prerequisite-for-each-target-repository)), and start:
 
 ```sh
-no-mistakes axi run --yes --intent-file "$intent_file" --closes "$issue_number"
+no-mistakes axi run --yes --intent "$(cat -- "$intent_file")"
 ```
 
-It then drives that run with the installed No-Mistakes skill and reports the
-actual outcome and PR URL. A dispatch notification only means the prompt was
+The full issue title and body are untrusted data: the quoted command
+substitution passes the file's contents as one argument, including multiline
+text, and its output is never run as shell code. Only trailing newlines are
+dropped. These are the stable CLI's documented flags. Stable No-Mistakes has
+no `--intent-file` or `--closes`, so **closing the issue is not automated**:
+Mini-Factory passes no closing metadata, and the agent reports this rather than
+adding any. After merging, check the issue and close it yourself if needed.
+
+The agent then drives that run with the installed No-Mistakes skill and reports
+the actual outcome and PR URL. A dispatch notification only means the prompt was
 delivered; see [No-Mistakes](#no-mistakes-configuration-and-unattended-runs) for
 outcomes and blockers.
 
@@ -294,17 +311,20 @@ bundled config and refuses config override flags; ordinary flags such as
 
 ## No-Mistakes configuration and unattended runs
 
-This distribution is tested with **No-Mistakes v1.105.0**, a prerelease. The
-stable channel (v1.84.0 when this was written) lacks the bot settings below, so
-a plain stable/latest install is not enough. Setup installs No-Mistakes with its
-native script if it is missing and, when the installed version is older than
-v1.105.0, offers its native updater `no-mistakes update --beta` (newest
-prerelease; it restarts the daemon and refuses while runs are active). Both run
-before the config link is created, because the installer restarts the daemon
-and older releases reject the bot fields; the default `config.yaml` that a
-fresh install writes is then kept as the backup described below. Doctor checks
-the version and the `axi run` flags used here. Newer releases are
-accepted when they pass those checks.
+A **stable No-Mistakes release is enough**; no beta is needed. This
+distribution targets the stable `no-mistakes axi run --intent ... --yes`
+interface (latest stable v1.84.0 when this was written). Setup installs
+No-Mistakes with its native script (stable channel) if it is missing. It reuses
+any installed release whose `axi run --help` offers `--intent` and `--yes`,
+including a newer prerelease you installed deliberately, so it never downgrades
+one. Only when those flags are missing does setup offer the native stable
+updater `no-mistakes update`, with your consent. That updater restarts the
+daemon and refuses while pipeline runs are active; setup never passes `--beta`
+or `--force`, and it reports the refusal instead of interrupting your runs. Both
+run before the config link is created, because they restart the daemon; the
+default `config.yaml` that a fresh install writes is then kept as the backup
+described below. Doctor checks the same `axi run` capability, not a version
+number.
 
 The real configuration is the tracked file **`no-mistakes/config.yaml` in this
 clone**. Setup links `${NM_HOME:-$HOME/.no-mistakes}/config.yaml` to that file's
@@ -321,17 +341,20 @@ agent: codex # Initialize to the chosen pipeline agent during first setup.
 auto_fix:
   review: 3
   ci: 3
-ci:
-  review_bot_comments: always
-  release_after_checks_pass: true
 ```
 
+This default uses only fields from the stable
+[global config reference](https://github.com/kunchenguid/no-mistakes/blob/v1.84.0/docs/src/content/docs/reference/global-config.md).
 `agent` is No-Mistakes' own pipeline agent, independent of `ISSUE_AGENT`. When
 setup first creates the link and that line is unedited, it sets it to the issue
 agent you chose; after that, setup never rewrites the file, including when you
-change `ISSUE_AGENT`. Edit the file in the clone to change any native setting
-(see the [global config reference](https://github.com/kunchenguid/no-mistakes/blob/v1.105.0/docs/src/content/docs/reference/global-config.md));
-`no-mistakes doctor` validates it. Your edits are local changes in the clone, so
+change `ISSUE_AGENT`. Edit the file in the clone to change any native setting;
+`no-mistakes doctor` validates it. No-Mistakes rejects fields it does not know.
+Earlier versions of this file had the prerelease-only
+`ci.review_bot_comments` and `ci.release_after_checks_pass`. If your clone still
+has them, or any other field your installed release does not support, setup
+leaves the file unchanged and doctor shows the rejected fields. Remove them
+yourself, or keep using a release that supports them. Your edits are local changes in the clone, so
 `git pull --ff-only` keeps them unless an update changes the same file, in which
 case Git stops and you merge them yourself. Keep the clone in place: if you
 move it, rerun `make setup` from the new location to relink, and deleting it
@@ -351,27 +374,37 @@ command it suggests (for example `no-mistakes axi respond`, or reattaching with
 failure: the agent checks `axi status` and reattaches to the same run. Nothing
 is merged automatically. A successful run ends at `checks-passed` (or a
 qualified `passed-with-skips` / `passed-with-override`, which the agent must
-report as such) with the PR open for your review, and with
-`release_after_checks_pass: true` the run then stops monitoring it.
+report as such) with the PR open for your review. The agent stops there; the
+No-Mistakes daemon may keep monitoring the open PR natively.
 
-**CI prerequisite.** `checks-passed` requires registered CI checks on the PR.
-A repository intentionally operated without CI can declare `no_ci: true` in
-`.no-mistakes.yaml` on its trusted default branch; only the repository owner
-should make that choice. Otherwise an empty check list stays waiting. This
-bundle never adds that declaration or uses it to get past missing or failing
-checks.
+### CI prerequisite for each target repository
 
-**Review bots.** No-Mistakes' native bot support reads unresolved bot review
-comments (`review_bot_comments: always`). CodeRabbit users can additionally
-require a completed CodeRabbit review by adding this to the target repository's
-trusted default-branch `.no-mistakes.yaml`:
+`checks-passed` requires registered CI checks on the PR. A generic empty check
+list is not ready, so a repository without PR checks leaves the run waiting.
+Setup and doctor check only this installation, not each target repository's CI.
+Each target repository therefore needs one of these on its **default branch**:
 
-```yaml
-ci:
-  required_reviews: [coderabbit]
-```
+- a PR-triggered GitHub Actions workflow (for example `on: pull_request`);
+- external CI that reports checks on its pull requests;
+- an intentional `no_ci: true` in the trusted default-branch `.no-mistakes.yaml`,
+  chosen only by the repository owner.
 
-This bundle does not require any bot globally.
+Mini-Factory's own CI does not provide CI to any other repository. No-Mistakes'
+native `no-mistakes ci-workflow` writes `.github/workflows/ci.yml` from the
+repository's `.no-mistakes.yaml` commands, but its template is Go-oriented
+(`actions/setup-go`); other stacks need a suitable workflow of their own.
+
+Before starting a run, the `I` agent checks the target's real PR-check
+expectations. A missing `.github/workflows` directory alone does not prove that
+no CI exists. The agent never creates or edits the target's workflows or
+`.no-mistakes.yaml` for this purpose, and never sets `no_ci`. When missing checks
+are clearly established, it still delivers the PR and tells you to add
+PR-triggered CI to the default branch, or to deliberately declare `no_ci: true`
+there. If the PR still has zero checks after a bounded wait while No-Mistakes
+waits, the agent does not reattach forever. It leaves the run and PR in place
+and reports the exact CI blocker and this corrective action. After you fix the
+CI setup, continue with `no-mistakes axi status` from the worktree. This bundle
+never bypasses CI or marks checks passed.
 
 ## Managed files, diagnostics, and updates
 
@@ -440,12 +473,13 @@ To update from your retained clone:
 ```sh
 git pull --ff-only
 make setup
-no-mistakes update --beta   # optional: newer No-Mistakes prerelease, natively
+no-mistakes update   # optional: latest stable No-Mistakes, natively; refuses while runs are active
 ```
 
 `make help` lists the four standalone targets. `make test` uses disposable homes
 and Git repositories with mocked external tools; it needs Bash, Git, Make, jq,
-and Python 3.9+. It does not install packages or authenticate/run agents.
+and Python 3.9+. It does not install packages or authenticate/run agents, and it
+needs no live No-Mistakes daemon, network installer, GitHub write, or real PR.
 
 ## Maintainer: development
 
@@ -469,10 +503,19 @@ Commit and push reviewed changes to this repository. Users update their clone
 with `git pull --ff-only`, then run `make setup` to refresh the installed copy.
 There is no background updater or automatic cross-repository sync.
 
+Mini-Factory's own CI, `.github/workflows/ci.yml`, runs `make test` on an Ubuntu
+runner for every pull request and push to `main`, with read-only repository
+permissions. That gives No-Mistakes a real PR check to observe here. The
+workflow file alone does not prove CI works: GitHub Actions must be enabled for
+the repository and the check must actually appear on the PR. It does not apply
+to target repositories (see the
+[CI prerequisite](#ci-prerequisite-for-each-target-repository)).
+
 Installation instructions were checked against upstream documentation and native
-CLI help on 2026-10-08; the issue-agent and No-Mistakes additions against Herdr
-0.9.5 help, Claude Code/Cursor CLI help and installers, and the No-Mistakes
-v1.105.0 documentation on 2026-10-30. Mocked macOS/Ubuntu coverage is not
+CLI help on 2026-10-08; the issue-agent additions against Herdr 0.9.5 help and
+Claude Code/Cursor CLI help and installers on 2026-10-30; and the stable
+No-Mistakes support against the v1.84.0 (latest stable) documentation and native
+help on 2026-11-01. Mocked macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those
 hosts.
@@ -489,7 +532,7 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    `i`: the preparation agent reports the `main` branch/commit it inspected and
    one verdict, and edits only the issue's title/body.
 3. Press `I`: the implementation agent commits on `agent/issue-N`, starts
-   `no-mistakes axi run --yes`, and drives it.
+   `no-mistakes axi run --yes --intent ...` with the captured issue, and drives it.
 4. Confirm the agent's final report gives the actual No-Mistakes outcome and the
    open PR URL, including any skips, overrides, or blockers, and that the PR was
    not merged.
