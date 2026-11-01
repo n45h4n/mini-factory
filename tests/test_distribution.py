@@ -31,7 +31,7 @@ ISSUE_BODY = ("Body with \"quotes\", $(touch interpolated-marker), `touch backti
               "Unicode \u2014 stays data.\n")
 
 MOCK = r'''#!PYTHON
-import json, os, pathlib, shutil, subprocess, sys
+import json, os, pathlib, re, shutil, subprocess, sys
 ISSUE_BODY = ISSUE_BODY_LITERAL
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -165,29 +165,70 @@ elif name == "npm":
     else:
         fail()
 elif name == "no-mistakes":
-    version = "v1.105.0" if (root / "no-mistakes-updated").exists() else os.environ.get("MOCK_NM_VERSION", "v1.105.0")
+    # The default models the latest stable release (v1.84.0); a stable update installs it.
+    version = "v1.84.0" if (root / "no-mistakes-updated").exists() else os.environ.get("MOCK_NM_VERSION", "v1.84.0")
+    numeric = tuple(map(int, version[1:].split(".")))
+    config = pathlib.Path(os.environ.get("NM_HOME", os.path.expanduser("~/.no-mistakes"))) / "config.yaml"
+    # Like the native strict (KnownFields) loader, reject any key outside the installed release's schema;
+    # the ci bot fields exist only from prerelease v1.105.0.
+    schema = {
+        "": {"agent", "acpx_path", "forgejo_axi_path", "acp_registry_overrides", "agent_path_override",
+             "agent_config", "agent_args_override", "ci_timeout", "step_quiet_warning", "agent_timeout",
+             "review_agent_timeout", "test_agent_timeout", "daemon_connect_timeout", "branch_sync_remote_timeout",
+             "gate_reconcile_interval", "gate_reconcile_timeout", "log_level", "session_reuse", "worktree_roots",
+             "forge_profiles", "auto_fix", "ci", "rebase", "commit", "intent", "test", "providers"},
+        "auto_fix": {"rebase", "review", "test", "document", "lint", "ci"},
+        "ci": {"rerun_transient", "revalidate_repairs"}
+              | ({"review_bot_comments", "release_after_checks_pass"} if numeric >= (1, 105, 0) else set()),
+    }
+    types = {"": "config.GlobalRaw", "auto_fix": "config.AutoFixRaw", "ci": "config.CIRaw"}
+    rejected, section = [], ""
+    for number, line in enumerate(config.read_text().splitlines() if config.exists() else [], 1):
+        key = re.match(r"( *)([A-Za-z_][\w-]*):", line)
+        if not key:
+            continue
+        if not key.group(1):
+            section = key.group(2)
+        scope = "" if not key.group(1) else section
+        if scope in schema and key.group(2) not in schema[scope]:
+            rejected.append((number, key.group(2), types[scope]))
     if args == ["--version"]:
         print("no-mistakes version " + version + " (test) 2026-10-01T00:00:00Z")
     elif args == ["daemon", "restart"]:
-        # Native startup writes a default config when missing; releases before
-        # v1.105.0 strictly reject the tracked config's newer bot fields.
-        config = pathlib.Path(os.environ.get("NM_HOME", os.path.expanduser("~/.no-mistakes"))) / "config.yaml"
-        if tuple(map(int, version[1:].split("."))) < (1, 105, 0) and config.exists() \
-                and "review_bot_comments" in config.read_text():
-            fail("load config: field review_bot_comments not found")
+        # Native startup writes a default config when missing.
+        if rejected:
+            fail("load config: field " + rejected[0][1] + " not found")
         if not config.exists() and not config.is_symlink():
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text("agent: auto\n")
     elif args == ["axi", "run", "--help"]:
-        print("--intent --intent-file --yes --closes --wait")
+        if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
+            fail("capability probes must not send telemetry or check for updates")
+        if numeric < (1, 50, 0):
+            # An older fixture without the stable interface; its --intent-file alone must not count.
+            print("      --intent-file string   file containing the run intent\n      --wait duration")
+        elif numeric < (1, 105, 0):
+            print("      --intent string   what the user set out to accomplish\n"
+                  "  -y, --yes   auto-resolve eligible gates\n      --wait duration")
+        else:
+            print("      --intent string\n      --intent-file string\n  -y, --yes\n      --closes int\n      --wait duration")
     elif args == ["doctor"]:
         if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
             fail("doctor diagnostics must not send telemetry or check for updates")
-        if os.environ.get("MOCK_NM_DOCTOR") == "fail":
+        if rejected:
+            print("  \u2717 gate validation  unavailable: load config (parse global config: yaml: unmarshal errors:\n"
+                  + "\n".join("  line " + str(number) + ": field " + field + " not found in type " + kind
+                              for number, field, kind in rejected)
+                  + ")\n\n  some checks failed")
+        elif os.environ.get("MOCK_NM_DOCTOR") == "fail":
             print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
         else:
             print("  \u2713 gate validation  codex is runnable")
-    elif args == ["update", "--beta"]:
+    elif args == ["update"]:
+        # The native updater refuses to restart the daemon while runs are active (without --force).
+        if os.environ.get("MOCK_NM_ACTIVE_RUNS"):
+            print("refusing to update while 1 pipeline run is active: 01TEST running agent/issue-8", file=sys.stderr)
+            sys.exit(1)
         (root / "no-mistakes-updated").write_text("yes")
     else:
         fail()
@@ -888,7 +929,15 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(prompts[0][:3] + prompts[0][4:], ["agent", "prompt", "issue-pane",
             "--wait", "--until", "working", "--timeout", "30000"])
         prompt = prompts[0][3]
-        self.assertTrue(prompt.startswith("Fetch issue friend/target#8 and use its body as the prompt."))
+        # The captured issue text controls implementation; a later fetch is context only.
+        quoted_intent = re.search(r"^intent_file=(.+)$", prompt, re.MULTILINE).group(1)
+        self.assertTrue(prompt.startswith("Use the title and body of issue friend/target#8 captured in the private file "
+                                          + quoted_intent + " as the implementation prompt;"))
+        for rule in ("that captured text is authoritative for the implementation scope",
+                     "a later issue revision must not change the implementation scope",
+                     "report the difference instead of implementing it"):
+            self.assertIn(rule, prompt)
+        self.assertNotIn("use its body as the prompt", prompt)
         # The captured base stays visible and is not presented as the preparation commit.
         self.assertIn("starts from feature/friend at " + captured, prompt)
         (worktree / "source.txt").write_text("existing issue edits\n")
@@ -979,7 +1028,9 @@ class DistributionTests(unittest.TestCase):
                 self.assertEqual(git("rev-parse", "agent/issue-8"), captured)
                 self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
                 self.assertNotEqual(captured, main)
-                self.assertIn('no-mistakes axi run --yes --intent-file "$intent_file" --closes "$issue_number"', implement)
+                self.assertIn('no-mistakes axi run --yes --intent "$(cat -- "$intent_file")"', implement)
+                for unsupported in ("--intent-file", "--closes"):
+                    self.assertNotIn(unsupported, implement)
                 self.assertIn("starts from feature/friend at " + captured, implement)
                 self.assertTrue(prepare.startswith("Prepare issue friend/target#8 for dispatch; do not implement it."))
                 self.assertIn("main commit " + main, prepare)
@@ -1048,17 +1099,82 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(subprocess.run([REAL_GIT, "-C", str(worktree), "status", "--porcelain"],
                                         capture_output=True, text=True, check=True).stdout, "")
         self.assertFalse(list(self.root.rglob("*-marker")), "issue prose was evaluated as shell source")
-        # Executing the prompt's start command must pass the captured file and closing issue as data.
-        command = prompt.split("Start the run with:\n", 1)[1].split("\nOmit --closes", 1)[0]
-        invoked = subprocess.run(["bash", "-c", 'no-mistakes() { printf "%s\\n" "$@"; }\n' + command],
-                                 capture_output=True, text=True, check=True).stdout.splitlines()
-        self.assertEqual(invoked, ["axi", "run", "--yes", "--intent-file", str(intent), "--closes", "8"])
+        # Executing the prompt's start command passes the full captured issue as one --intent argument.
+        command = prompt.split("Start the run with exactly:\n", 1)[1].split("\nStable No-Mistakes", 1)[0]
+        self.assertEqual(command.splitlines()[1], 'no-mistakes axi run --yes --intent "$(cat -- "$intent_file")"')
+        capture = self.root / "argv capture"
+        capture.mkdir()
+        (capture / "no-mistakes").write_text("#!" + sys.executable + "\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        (capture / "no-mistakes").chmod(0o755)
+        scratch = self.root / "shell scratch"
+        scratch.mkdir()
+        for shell in ("bash", "sh"):
+            with self.subTest(shell=shell):
+                completed = subprocess.run([shell, "-c", command], cwd=scratch, capture_output=True, text=True,
+                                           env={"PATH": str(capture) + os.pathsep + REAL_PATH}, check=True)
+                invoked = json.loads(completed.stdout)
+                # Command substitution drops only trailing newlines; the multiline title/body stay intact.
+                self.assertEqual(invoked, ["axi", "run", "--yes", "--intent", content.rstrip("\n")])
+                self.assertIn(ISSUE_BODY.rstrip("\n"), invoked[-1])
+                self.assertEqual(list(scratch.iterdir()), [])
+        self.assertFalse(list(self.root.rglob("*-marker")), "issue prose was executed by the start command")
+        # Stable No-Mistakes has no closing flag; nothing invents closing metadata.
+        for unsupported in ("--intent-file", "--closes", "Closes #", "Fixes #"):
+            self.assertNotIn(unsupported, prompt)
+        self.assertIn("closing issue #8 is not automated", prompt)
         for requirement in ("clean, committed worktree", "reattach to the same run", "keeping --yes",
-                            "Never merge the PR", "does not prove checks-passed"):
+                            "Never merge the PR", "does not prove checks-passed", "replace it with a summary"):
             self.assertIn(requirement, prompt)
         # Dispatch reports only a launch; the agent reports the actual No-Mistakes outcome.
         self.assertIn("No-Mistakes outcome pending", self.notifications()[-1])
         self.assertNotIn("passed", self.notifications()[-1])
+
+    def test_implementation_handoff_checks_target_ci_and_stops_on_an_empty_check_list(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        self.assert_success(self.issue_helper(**route))
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        # The target's real PR-check expectations are checked before the run starts.
+        self.assertLess(prompt.index("real PR-check expectations"), prompt.index("Start the run with exactly:"))
+        for requirement in ("PR-triggered workflows on its default branch", "external CI that reports checks",
+                            "no_ci: true in its trusted default-branch .no-mistakes.yaml",
+                            "A missing .github/workflows directory alone does not prove there is no CI",
+                            "Do not create or change this repository's CI workflows for this purpose unless the issue asks",
+                            "never change its .no-mistakes.yaml for this purpose or set no_ci, even if the issue asks",
+                            "owner must add PR-triggered CI and get it onto the default branch",
+                            "deliberately declare no_ci: true there"):
+            self.assertIn(requirement, prompt)
+        # Allow CI its own registration interval, independent of earlier run waits.
+        stop = prompt.index("Do not reattach forever to an empty check list.")
+        self.assertLess(prompt.index("reattach to the same run"), stop)
+        for requirement in ("When you first observe that the CI step is waiting and gh pr checks reports no checks",
+                            "start a separate two-minute check-registration interval",
+                            "time spent in earlier run/reattach waits does not count",
+                            "During that interval, poll native status and PR checks at bounded intervals",
+                            "If checks appear, continue driving the same run normally",
+                            "Only if the full two-minute interval ends with no checks, or a blocker is independently confirmed earlier",
+                            "stop reattaching, keep the run and PR in place",
+                            "inspect PR mergeability and workflow trigger status before assigning the blocker",
+                            "An empty check list alone does not establish missing CI",
+                            "If a merge conflict prevented a pull_request workflow from running, report the conflict as the blocker",
+                            "follow native branch_sync/recovery guidance",
+                            "Otherwise report the observed trigger blocker",
+                            "if the cause cannot be confirmed, report it as unknown",
+                            "Report the exact native CI status, the supporting evidence, and the appropriate corrective action",
+                            "recommend the owner's corrective action from step 3 only when missing CI is independently established",
+                            "Never bypass CI, mark checks passed, or set no_ci yourself"):
+            self.assertIn(requirement, prompt[stop:])
+        self.assertNotIn("If a bounded wait expires while the CI step is still waiting", prompt[stop:])
+        self.assertNotIn("the missing CI is established:", prompt[stop:])
+        self.assertNotIn("abort", prompt[stop:].split("\n", 1)[0])
+        # The dispatcher itself never inspects, creates, or edits the target's CI configuration.
+        worktree = repo.parent / "issue worktree with spaces"
+        for checkout in (repo, worktree):
+            self.assertFalse((checkout / ".github").exists())
+            self.assertFalse((checkout / ".no-mistakes.yaml").exists())
+        self.assertEqual(subprocess.run([REAL_GIT, "-C", str(worktree), "status", "--porcelain"],
+                                        capture_output=True, text=True, check=True).stdout, "")
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] in (["pr", "checks"], ["workflow", "run"])])
 
     def test_setting_change_keeps_retained_agent_without_duplicate_prompts(self):
         repo, git = self.source_repo()
@@ -1176,25 +1292,88 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse(self.calls("npm"))
         self.assert_no_actions(allow_onboarding=True)
 
-    def test_old_no_mistakes_requires_consented_native_beta_update(self):
-        result = self.setup(MOCK_NM_VERSION="v1.84.0")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("v1.105.0", result.stdout + result.stderr)
-        self.assertFalse([c for c in self.calls("no-mistakes") if c["args"][:1] == ["update"]])
-        self.assert_success(self.interactive_setup("y", MOCK_NM_VERSION="v1.84.0"))
-        self.assertIn(["update", "--beta"], [c["args"] for c in self.calls("no-mistakes")])
+    def no_mistakes_updates(self):
+        return [c["args"] for c in self.calls("no-mistakes") if c["args"][:1] == ["update"]]
 
-    def test_fresh_stable_no_mistakes_is_updated_before_config_is_linked(self):
-        (self.mock / "no-mistakes").unlink()
+    def test_no_mistakes_without_stable_interface_requires_consented_native_stable_update(self):
+        result = self.setup(MOCK_NM_VERSION="v1.40.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("axi run --intent and --yes", result.stdout + result.stderr)
+        self.assertNotEqual(self.interactive_setup("n", MOCK_NM_VERSION="v1.40.0").returncode, 0)
+        self.assertFalse(self.no_mistakes_updates())
+        self.assertFalse(self.installed.exists())
+        doctor = self.run_script(self.bundle / "scripts/doctor.sh", env={"MOCK_NM_VERSION": "v1.40.0"})
+        self.assertIn("FAIL: No-Mistakes axi run --intent/--yes capability missing", doctor.stdout)
+        self.assertFalse(self.no_mistakes_updates(), "doctor must stay read-only")
+        result = self.interactive_setup("y", MOCK_NM_VERSION="v1.40.0")
+        self.assert_success(result)
+        self.assertIn("no-mistakes update", result.stdout)
+        # The stable channel only: never a prerelease or a forced restart.
+        self.assertEqual(self.no_mistakes_updates(), [["update"]])
+        self.assertIn("OK: No-Mistakes unattended AXI run (--intent, --yes) available", result.stdout)
+
+    def test_stable_update_refusal_for_active_runs_is_reported_without_forcing(self):
         link = self.home / ".no-mistakes/config.yaml"
-        result = self.interactive_setup("y", MOCK_NM_VERSION="v1.84.0")
+        result = self.interactive_setup("y", MOCK_NM_VERSION="v1.40.0", MOCK_NM_ACTIVE_RUNS="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("refusing to update while 1 pipeline run is active", result.stdout)
+        self.assertIn("wait for active runs to finish", result.stdout)
+        self.assertEqual(self.no_mistakes_updates(), [["update"]])
+        self.assertFalse(link.exists() or link.is_symlink())
+        self.assertFalse(self.installed.exists())
+
+    def test_newer_prerelease_no_mistakes_is_reused_without_update(self):
+        self.assert_success(self.interactive_setup("y", MOCK_NM_VERSION="v1.107.0"))
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        result = self.run_script(self.installed / "scripts/doctor.sh", env={"MOCK_NM_VERSION": "v1.107.0"})
+        self.assert_success(result)
+        self.assertIn("OK: No-Mistakes unattended AXI run (--intent, --yes) available", result.stdout)
+        self.assertFalse(self.no_mistakes_updates())
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_fresh_stable_no_mistakes_install_links_the_stable_default_config(self):
+        (self.mock / "no-mistakes").unlink()
+        source = self.bundle / "no-mistakes/config.yaml"
+        link = self.home / ".no-mistakes/config.yaml"
+        result = self.interactive_setup("y")
         self.assert_success(result)
         commands = [c["args"] for c in self.calls("no-mistakes")]
-        self.assertLess(commands.index(["daemon", "restart"]), commands.index(["update", "--beta"]))
-        self.assertEqual(os.readlink(link), str(self.bundle / "no-mistakes/config.yaml"))
+        self.assertIn(["daemon", "restart"], commands)
+        self.assertFalse(self.no_mistakes_updates())
+        self.assertEqual(os.readlink(link), str(source))
+        self.assertEqual(source.read_text(), "agent: codex # Initialized from the issue agent during first setup.\n"
+                                             "auto_fix:\n  review: 3\n  ci: 3\n")
+        # The stable loader accepts the linked default; native doctor reports it ready.
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
         # The native default written by the first daemon start is preserved, not overwritten.
         self.assertEqual(link.with_name("config.yaml.mini-factory-backup").read_text(), "agent: auto\n")
         self.assert_no_actions(allow_onboarding=True)
+
+    def test_customized_prerelease_config_is_explained_and_never_rewritten(self):
+        source = self.bundle / "no-mistakes/config.yaml"
+        customized = ("agent: codex # my choice\nauto_fix:\n  review: 1\n  ci: 3\nci:\n"
+                      "  review_bot_comments: always\n  release_after_checks_pass: true\nlog_level: debug\n")
+        source.write_text(customized)
+        link = self.home / ".no-mistakes/config.yaml"
+        link.parent.mkdir()
+        link.symlink_to(source)
+        unrelated = link.with_name("notes.txt")
+        unrelated.write_text("keep me\n")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(source.read_text(), customized)
+        self.assertEqual(os.readlink(link), str(source))
+        self.assertEqual(unrelated.read_text(), "keep me\n")
+        self.assertFalse(link.with_name("config.yaml.mini-factory-backup").exists())
+        for explanation in ("field review_bot_comments not found", "field release_after_checks_pass not found",
+                            "setup never rewrites it", "Edit the reported fields in your clone's no-mistakes/config.yaml"):
+            self.assertIn(explanation, result.stdout)
+        self.assertFalse(self.no_mistakes_updates())
+        # A deliberately installed prerelease that supports the fields keeps the customization valid.
+        self.assert_success(self.setup(MOCK_NM_VERSION="v1.105.0"))
+        self.assertEqual(source.read_text(), customized)
+        self.assertFalse(self.no_mistakes_updates())
+        self.assert_no_actions()
 
     def test_cursor_pipeline_installs_user_owned_acpx_for_system_node(self):
         (self.mock / "acpx").unlink()

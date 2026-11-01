@@ -12,8 +12,6 @@ nm_home="${NM_HOME:-$HOME/.no-mistakes}"
 nm_config="$nm_home/config.yaml"
 nm_source="$bundle/no-mistakes/config.yaml"
 nm_backup="$nm_config.mini-factory-backup"
-# Tested release: v1.105.0 (prerelease). Stable v1.84.0 lacks the bot settings in no-mistakes/config.yaml.
-nm_minimum='1.105.0'
 nm_template_agent='agent: codex # Initialize to the chosen pipeline agent during first setup.'
 issue_agent=''
 pipeline_agent=''
@@ -302,13 +300,14 @@ install_dependencies() {
 	# Codex stays required for PR review; add the issue agent, then No-Mistakes.
 	# The pipeline agent is installed after linking, once its config is known.
 	install_tools codex herdr "$(agent_command "$issue_agent")" no-mistakes
+	# Any installed release with the stable interface is reused, including a newer prerelease; only an older one is updated.
 	if ! no_mistakes_is_suitable; then
-		if consent "No-Mistakes is older than the tested v$nm_minimum; stable releases before it lack the bot settings in $nm_source. Run its native updater, no-mistakes update --beta? It installs the newest prerelease and restarts the daemon, and refuses while runs are active."; then
-			no-mistakes update --beta || die 'no-mistakes update --beta failed; resolve its reported blocker and rerun make setup'
+		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
+			no-mistakes update || die 'no-mistakes update did not complete; resolve its reported blocker (for example wait for active runs to finish) and rerun make setup'
 		else
-			die "No-Mistakes v$nm_minimum or newer is required"
+			die 'No-Mistakes with axi run --intent and --yes is required; rerun make setup to update it natively'
 		fi
-		no_mistakes_is_suitable || die "No-Mistakes is still older than v$nm_minimum; fix PATH or update it natively and rerun"
+		no_mistakes_is_suitable || die 'No-Mistakes still lacks axi run --intent and --yes; fix PATH or update it natively and rerun'
 	fi
 }
 
@@ -333,11 +332,15 @@ install_tools() {
 	done
 }
 
+# A capability check, not a version floor: stable releases document axi run --intent and --yes.
 no_mistakes_is_suitable() {
-	no-mistakes --version 2>/dev/null | awk -v minimum="$nm_minimum" 'NR == 1 {
-		version = $3; sub(/^v/, "", version); split(version, v, "."); split(minimum, m, ".")
-		exit !(v[1] > m[1] || (v[1] == m[1] && (v[2] > m[2] || (v[2] == m[2] && v[3] + 0 >= m[3] + 0))))
-	}'
+	local help flag pattern
+	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 no-mistakes axi run --help 2>/dev/null)" || return 1
+	for flag in --intent --yes; do
+		# An exact flag: --intent-file alone is not the stable interface.
+		pattern="${flag}([^[:alnum:]_-]|\$)"
+		[[ "$help" =~ $pattern ]] || return 1
+	done
 }
 
 install_github_cli_ubuntu() {
@@ -573,8 +576,8 @@ detect_platform
 check_destinations
 check_source_clone
 select_issue_agent
-# A compatible No-Mistakes must be in place first: its installer restarts the
-# daemon, and older releases reject the linked config's newer fields.
+# A compatible No-Mistakes must be in place first: its installer and updater
+# restart the daemon before the config link is created.
 install_dependencies
 link_no_mistakes_config
 read_pipeline_agent
