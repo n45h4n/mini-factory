@@ -929,7 +929,15 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(prompts[0][:3] + prompts[0][4:], ["agent", "prompt", "issue-pane",
             "--wait", "--until", "working", "--timeout", "30000"])
         prompt = prompts[0][3]
-        self.assertTrue(prompt.startswith("Fetch issue friend/target#8 and use its body as the prompt."))
+        # The captured issue text controls implementation; a later fetch is context only.
+        quoted_intent = re.search(r"^intent_file=(.+)$", prompt, re.MULTILINE).group(1)
+        self.assertTrue(prompt.startswith("Use the title and body of issue friend/target#8 captured in the private file "
+                                          + quoted_intent + " as the implementation prompt;"))
+        for rule in ("that captured text is authoritative for the implementation scope",
+                     "a later issue revision must not change the implementation scope",
+                     "report the difference instead of implementing it"):
+            self.assertIn(rule, prompt)
+        self.assertNotIn("use its body as the prompt", prompt)
         # The captured base stays visible and is not presented as the preparation commit.
         self.assertIn("starts from feature/friend at " + captured, prompt)
         (worktree / "source.txt").write_text("existing issue edits\n")
