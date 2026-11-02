@@ -233,8 +233,8 @@ elif name == "no-mistakes":
              "agent_config", "agent_args_override", "ci_timeout", "step_quiet_warning", "agent_timeout",
              "review_agent_timeout", "test_agent_timeout", "daemon_connect_timeout", "branch_sync_remote_timeout",
              "gate_reconcile_interval", "gate_reconcile_timeout", "log_level", "session_reuse", "worktree_roots",
-             "forge_profiles", "auto_fix", "ci", "rebase", "commit", "intent", "test", "providers"},
-        "auto_fix": {"rebase", "review", "test", "document", "lint", "ci"},
+             "forge_profiles", "auto_fix", "ci", "rebase", "commit", "intent", "test", "providers", "review_agents"},
+        "auto_fix": {"rebase", "review", "test", "document", "lint", "ci", "babysit"},
         "ci": {"rerun_transient", "revalidate_repairs"}
               | ({"review_bot_comments", "release_after_checks_pass"} if numeric >= (1, 105, 0) else set()),
     }
@@ -276,6 +276,11 @@ elif name == "no-mistakes":
             print("  \u2717 gate validation  unavailable: load config (parse global config: yaml: unmarshal errors:\n"
                   + "\n".join("  line " + str(number) + ": field " + field + " not found in type " + kind
                               for number, field, kind in rejected)
+                  + ")\n\n  some checks failed")
+        elif os.environ.get("MOCK_NM_REJECT") and re.search(os.environ["MOCK_NM_REJECT"], config.read_text()):
+            # A native load rejection that nm-config's own checks cannot predict.
+            rejection = re.search(os.environ["MOCK_NM_REJECT"], config.read_text()).group()
+            print("  \u2717 gate validation  unavailable: load config (mock rejection: " + rejection
                   + ")\n\n  some checks failed")
         elif os.environ.get("MOCK_NM_DOCTOR") == "fail":
             print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
@@ -552,6 +557,17 @@ else:
     "import json, os, pathlib, re, shutil, subprocess, sys",
 )
 
+# nm-config menu entries, as offered by Gum.
+NM_MENU = {"agent": "Pipeline agent (agent)", "agent_config": "Harness model/effort defaults (agent_config)",
+           "reviewer": "Reviewer (review_agents.reviewer)", "fixer": "Fixer (review_agents.fixer)",
+           "reviewer_after_round": "Later-round reviewer (review_agents.reviewer_after_round)",
+           "fixer_after_round": "Later-round fixer (review_agents.fixer_after_round)",
+           "auto_fix": "Auto-fix attempts (auto_fix)", "session_reuse": "Fixer session reuse (session_reuse)",
+           "save": "Review and save changes", "quit": "Quit without saving"}
+INHERIT_CODEX = "Inherit agent_config.codex (clear)"
+STABLE_DEFAULT = ("agent: codex # Initialized from the issue agent during first setup.\n"
+                  "auto_fix:\n  review: 3\n  ci: 3\n")
+
 
 class DistributionTests(unittest.TestCase):
     def setUp(self):
@@ -720,7 +736,7 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("gh-dash-codex-issue-dispatch.sh", config)
         for forbidden in ("--factory", "diffnav", "lazygit", "tuicr", "octo", "queue", "sandbox", "$HOME/dotfiles", "repoPaths"):
             self.assertNotIn(forbidden, config)
-        for relative in ("bin/ghd", "bin/mf-config", "scripts/setup.sh", "scripts/doctor.sh",
+        for relative in ("bin/ghd", "bin/mf-config", "bin/nm-config", "scripts/setup.sh", "scripts/doctor.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh",
@@ -2253,6 +2269,736 @@ os.execv(executable, [executable, *args])
         self.assertIn(["apt-get", "update"], actions)
         self.assertEqual(actions[-1], ["apt-get", "install", "-y", "--reinstall", "--no-install-recommends", "gum"])
         self.assert_no_actions(allow_onboarding=True)
+
+
+    # nm-config: the No-Mistakes global config editor for the clone file linked from NM_HOME.
+
+    def nm_link(self, content=None):
+        """Link NM_HOME/config.yaml to the clone's tracked config, as make setup does."""
+        source = self.bundle / "no-mistakes/config.yaml"
+        if content is not None:
+            source.write_text(content)
+        link = self.home / ".no-mistakes/config.yaml"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(source)
+        return source
+
+    def nm_config(self, *args, **env):
+        return self.run_script(self.bundle / "bin/nm-config", *args, env=env)
+
+    def edit_nm(self, *answers, tool=None, **overrides):
+        answers_file = self.root / "gum answers.json"
+        answers_file.write_text(json.dumps(list(answers)))
+        self.log.write_text("")
+        result = self.run_in_terminal([str(tool or self.bundle / "bin/nm-config")],
+                                      dict(self.env, MOCK_GUM_ANSWERS=str(answers_file), **overrides))
+        return result, json.loads(answers_file.read_text())
+
+    def prompt(self, header_start):
+        return next(prompt for prompt in self.gum_prompts() if prompt[1].startswith(header_start))
+
+    def test_nm_config_show_reports_defaults_roles_and_native_precedence_without_a_terminal(self):
+        source = self.nm_link(STABLE_DEFAULT)
+        result = self.nm_config("show")
+        self.assert_success(result)
+        lines = result.stdout.splitlines()
+        self.assertIn("No-Mistakes global config: " + str(self.home / ".no-mistakes/config.yaml") + " -> "
+                      + str(source), lines)
+        self.assertIn("Pipeline agent (agent): codex", lines)
+        self.assertIn("  Reviewer: no override - uses the pipeline agent (codex) with its agent_config", lines)
+        self.assertIn("  Fixer: no override - uses the pipeline agent (codex) with its agent_config", lines)
+        self.assertIn("  Later-round reviewer: none - every round uses the reviewer", lines)
+        self.assertIn("  review: 3", lines)
+        self.assertIn("  test: unset - native default (3 in v1.84.0)", lines)
+        self.assertIn("Fixer session reuse (session_reuse): unset - native default (true in v1.84.0)", lines)
+        self.assertIn("nm-config does not read target repositories.", result.stdout)
+        self.assertIn("Test, CI, and every other step", result.stdout)
+        configured = ("agent: [codex, claude] # fallback order\n"
+                      "agent_config:\n  codex:\n    model: gpt-5.4\n    effort: low\n"
+                      "agent_args_override:\n  codex:\n    - -m\n    - o3\n    - -c\n    - service_tier=\"priority\"\n"
+                      "review_agents:\n  reviewer:\n    agent: codex\n    effort: high\n"
+                      "  fixer:\n    agent: claude\n    model: opus\n    effort: max\n"
+                      "  fixer_after_round:\n    agent: codex\n    after_round: 2\n"
+                      "auto_fix:\n  review: 4\n  ci: 2\n")
+        source.write_text(configured)
+        result = self.nm_config("show")
+        self.assert_success(result)
+        lines = result.stdout.splitlines()
+        pin = " - overridden: agent_args_override.codex pins -m o3"
+        self.assertIn("Pipeline agent (agent): ordered fallback list codex, claude (first available entry runs)", lines)
+        self.assertIn("  Codex: model: gpt-5.4" + pin + "; effort: low", lines)
+        self.assertIn("  Reviewer: Codex - model: gpt-5.4 (agent_config)" + pin + "; effort: high", lines)
+        self.assertIn("  Fixer: Claude Code - model: opus; effort: max", lines)
+        self.assertIn("  Later-round fixer: Codex - model: gpt-5.4 (agent_config)" + pin + "; effort: low (agent_config); "
+                      "from round 3 (after_round: 2; rounds 1-2 use the fixer)", lines)
+        self.assertIn('  codex: -m o3 -c service_tier="priority" - pins model', lines)
+        self.assertIn("  review: 4", lines)
+        self.assertEqual(source.read_text(), configured)
+        # Native inheritance: empty role knobs inherit agent_config, and cursor shares acp:cursor's profile.
+        source.write_text("agent: codex\n"
+                          "agent_config:\n  codex:\n    model: gpt-5.4\n    effort: low\n"
+                          "  cursor:\n    model: \"\"\n  acp:cursor:\n    model: gpt-5\n"
+                          "review_agents:\n  reviewer:\n    agent: codex\n    model: \"\"\n    effort: \"\"\n"
+                          "  fixer:\n    agent: cursor\n")
+        result = self.nm_config("show")
+        self.assert_success(result)
+        lines = result.stdout.splitlines()
+        self.assertIn("  Reviewer: Codex - model: gpt-5.4 (agent_config); effort: low (agent_config)", lines)
+        self.assertIn("  Fixer: Cursor - model: gpt-5 (agent_config.acp:cursor); effort: not settable (acpx takes a "
+                      "model only)", lines)
+        self.assertFalse(self.calls("gum"))
+        self.assertFalse(self.calls("no-mistakes"), "show stays read-only and needs no native command")
+        # Editing needs a terminal; show stays available.
+        result = self.nm_config()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("nm-config show", result.stderr)
+        self.assertFalse(self.calls("gum"))
+
+    def test_nm_config_show_treats_yaml_nulls_as_native_defaults(self):
+        for value in ("", "~", "null", "Null", "NULL"):
+            with self.subTest(value=value):
+                config = ("agent: " + value + "\n"
+                          "auto_fix:\n" + "".join("  " + step + ": " + value + "\n"
+                                                   for step in ("rebase", "review", "test", "lint", "ci"))
+                          + "session_reuse: " + value + "\n"
+                          "review_agents:\n"
+                          "  reviewer_after_round:\n    agent: codex\n    after_round: " + value + "\n"
+                          "  fixer_after_round:\n    agent: claude\n    after_round: " + value + "\n")
+                source = self.nm_link(config)
+                result = self.nm_config("show")
+                self.assert_success(result)
+                lines = result.stdout.splitlines()
+                self.assertIn("Pipeline agent (agent): unset - native default auto", lines)
+                for step, default in (("rebase", 3), ("review", 0), ("test", 3), ("lint", 3), ("ci", 3)):
+                    self.assertIn("  " + step + ": unset - native default (" + str(default) + " in v1.84.0)", lines)
+                self.assertIn("Fixer session reuse (session_reuse): unset - native default (true in v1.84.0)", lines)
+                for role, harness in (("reviewer", "Codex"), ("fixer", "Claude Code")):
+                    self.assertIn("  Later-round " + role + ": " + harness
+                                  + " - model: native default; effort: native default; from round 2"
+                                  + " (after_round: 1; rounds 1-1 use the " + role + ")", lines)
+                self.assertNotIn("None", result.stdout)
+                self.assertEqual(source.read_bytes(), config.encode())
+        source = self.nm_link("agent: codex\nauto_fix:\n  review: 0\nsession_reuse: false\n")
+        result = self.nm_config("show")
+        self.assert_success(result)
+        self.assertIn("  review: 0", result.stdout.splitlines())
+        self.assertIn("Fixer session reuse (session_reuse): false", result.stdout.splitlines())
+        self.assertFalse(self.calls("gum"))
+        self.assertFalse(self.calls("no-mistakes"))
+
+    def test_nm_config_show_resolves_null_ci_to_legacy_babysit(self):
+        values = (None, "", "~", "null", "Null", "NULL", "0", "2")
+        for ci in values:
+            for babysit in values:
+                with self.subTest(ci=ci, babysit=babysit):
+                    config = "agent: codex\nauto_fix:\n  review: 1\n"
+                    for key, value in (("ci", ci), ("babysit", babysit)):
+                        if value is not None:
+                            config += "  " + key + ": " + value + "\n"
+                    source = self.nm_link(config)
+                    result = self.nm_config("show")
+                    self.assert_success(result)
+                    if ci in ("0", "2"):
+                        expected = ci
+                    elif babysit in ("0", "2"):
+                        expected = babysit + " (legacy auto_fix.babysit)"
+                    else:
+                        expected = "unset - native default (3 in v1.84.0)"
+                    self.assertIn("  ci: " + expected, result.stdout.splitlines())
+                    self.assertEqual(source.read_bytes(), config.encode())
+        self.assertFalse(self.calls("gum"))
+        self.assertFalse(self.calls("no-mistakes"))
+
+    def test_nm_config_null_numeric_settings_prefill_as_blank(self):
+        for value in ("", "~", "null", "Null", "NULL"):
+            with self.subTest(value=value):
+                config = ("agent: codex\nauto_fix:\n"
+                          + "".join("  " + step + ": " + value + "\n"
+                                    for step in ("rebase", "review", "test", "lint", "ci"))
+                          + "review_agents:\n"
+                          "  reviewer_after_round:\n    agent: codex\n    after_round: " + value + "\n"
+                          "  fixer_after_round:\n    agent: codex\n    after_round: " + value + "\n")
+                source = self.nm_link(config)
+                result, remaining = self.edit_nm(
+                    NM_MENU["auto_fix"], "", "", "", "", "",
+                    NM_MENU["reviewer_after_round"], "Codex", INHERIT_CODEX, INHERIT_CODEX, "",
+                    NM_MENU["fixer_after_round"], "Codex", INHERIT_CODEX, INHERIT_CODEX, "",
+                    NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                for step in ("rebase", "review", "test", "lint", "ci"):
+                    self.assertEqual(self.prompt("auto_fix." + step + ":")[2], "")
+                for role in ("reviewer_after_round", "fixer_after_round"):
+                    self.assertEqual(self.prompt("review_agents." + role + ": after_round")[2], "")
+                self.assertEqual(source.read_text(), "agent: codex\nreview_agents:\n"
+                                 "  reviewer_after_round:\n    agent: codex\n"
+                                 "  fixer_after_round:\n    agent: codex\n")
+
+    def test_nm_config_edits_explicit_ci_budget_without_changing_legacy_babysit(self):
+        for ci in ("0", "2", "null"):
+            with self.subTest(ci=ci):
+                config = "agent: codex\nauto_fix:\n  ci: " + ci + " # explicit budget\n  babysit: 5\n"
+                source = self.nm_link(config)
+                if ci == "null":
+                    result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", NM_MENU["save"])
+                    self.assert_success(result)
+                    self.assertEqual(source.read_text(), config)
+                    self.assertIn("auto_fix.babysit (legacy ci) is set", result.stdout)
+                    self.assertFalse([prompt for prompt in self.gum_prompts() if prompt[1].startswith("auto_fix.ci:")])
+                else:
+                    result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "4",
+                                                     NM_MENU["save"], "yes")
+                    self.assert_success(result)
+                    self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
+                    self.assertEqual(self.prompt("auto_fix.ci:")[2], ci)
+                    self.assertNotIn("rename it to ci", result.stdout)
+                    self.assertEqual(source.read_text(), config.replace("ci: " + ci, "ci: 4"))
+                self.assertEqual(remaining, [])
+
+    def test_nm_config_edits_ci_budget_when_ci_and_legacy_babysit_are_null(self):
+        for value in ("", "~", "null"):
+            with self.subTest(value=value):
+                config = "agent: codex\nauto_fix:\n  ci: " + value + "\n  babysit: " + value + "\n"
+                source = self.nm_link(config)
+                result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "4",
+                                                 NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
+                self.assertNotIn("rename it to ci", result.stdout)
+                self.assertEqual(self.prompt("auto_fix.ci:")[2], "")
+                self.assertEqual(source.read_text(), config.replace("ci: " + value, "ci: 4", 1))
+
+    def test_nm_config_ci_prompt_says_clearing_ci_exposes_legacy_babysit(self):
+        for babysit, blank in (("5", "blank = clear ci; legacy auto_fix.babysit then applies"),
+                               ("~", "blank = native default 3")):
+            with self.subTest(babysit=babysit):
+                config = "agent: codex\nauto_fix:\n  ci: 0\n  babysit: " + babysit + "\n"
+                source = self.nm_link(config)
+                result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "", NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertIn(blank, self.prompt("auto_fix.ci:")[1])
+                # Only the explicit ci is cleared; babysit is kept, so it becomes the effective CI budget.
+                self.assertEqual(source.read_text(), "agent: codex\nauto_fix:\n  babysit: " + babysit + "\n")
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  ci: unset - native default (3 in v1.84.0)", show.stdout.splitlines())
+        source.write_text("agent: codex\nauto_fix:\n  babysit: 5\n")
+        show = self.nm_config("show")
+        self.assertIn("  ci: 5 (legacy auto_fix.babysit)", show.stdout.splitlines())
+
+    def test_nm_config_recovery_requires_the_same_native_rejection(self):
+        source = self.nm_link(STABLE_DEFAULT)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "3", NM_MENU["save"],
+                                         MOCK_NM_REJECT="review: [23]")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(remaining, [])
+        self.assertIn("rejects the edited config", result.stdout)
+        self.assertIn("mock rejection: review: 2", result.stdout)
+        self.assertFalse([prompt for prompt in self.gum_prompts() if prompt[0] == "confirm"])
+        self.assertEqual(source.read_text(), STABLE_DEFAULT)
+        # The same pre-existing rejection permits a targeted recovery edit.
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "3", NM_MENU["save"], "yes",
+                                         MOCK_NM_REJECT="agent: codex")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("already rejected this config before the edit", result.stdout)
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 3", "review: 2"))
+        # Inserting an earlier setting moves line numbers in an unchanged native schema rejection.
+        config = STABLE_DEFAULT + "ci:\n  review_bot_comments: always\n"
+        source.write_text(config)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "1", "3", "", "", "3", NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("already rejected this config before the edit", result.stdout)
+        self.assertEqual(source.read_text(), config.replace("  ci: 3\n", "  ci: 3\n  rebase: 1\n"))
+        self.assert_no_actions()
+
+    def test_nm_config_edits_review_roles_and_budgets_and_preserves_unrelated_yaml(self):
+        customized = ("agent: codex # my pipeline choice\n"
+                      "auto_fix:\n  review: 1 # keep reviews short\n  ci: 3\n  document: 2\n"
+                      "# personal note\n"
+                      "log_level: debug\n"
+                      "ci:\n  review_bot_comments: always\n  release_after_checks_pass: true\n"
+                      "agent_args_override:\n  claude:\n  - --permission-mode\n  - acceptEdits\n")
+        source = self.nm_link(customized)
+        source.chmod(0o640)
+        # A deliberately installed prerelease accepts its ci fields; nm-config neither removes nor adds them.
+        newer = dict(self.codex_cache(), MOCK_NM_VERSION="v1.105.0")
+        result, remaining = self.edit_nm(
+            NM_MENU["reviewer"], "Codex", "gpt-test-fast", "high",
+            NM_MENU["fixer"], "Claude Code", "opus", "max",
+            NM_MENU["fixer_after_round"], "Codex", INHERIT_CODEX, "low", "2",
+            NM_MENU["auto_fix"], "", "2", "4", "", "1",
+            NM_MENU["save"], "yes", **newer)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        edited = ("agent: codex # my pipeline choice\n"
+                  "auto_fix:\n  review: 2 # keep reviews short\n  ci: 1\n  document: 2\n  test: 4\n"
+                  "# personal note\n"
+                  "log_level: debug\n"
+                  "ci:\n  review_bot_comments: always\n  release_after_checks_pass: true\n"
+                  "agent_args_override:\n  claude:\n  - --permission-mode\n  - acceptEdits\n"
+                  "review_agents:\n"
+                  "  reviewer:\n    agent: codex\n    model: gpt-test-fast\n    effort: high\n"
+                  "  fixer:\n    agent: claude\n    model: opus\n    effort: max\n"
+                  "  fixer_after_round:\n    agent: codex\n    effort: low\n    after_round: 2\n")
+        self.assertEqual(source.read_text(), edited)
+        self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o640)
+        self.assertEqual(os.readlink(self.home / ".no-mistakes/config.yaml"), str(source))
+        # Stable adapter levels, not each CLI's wider menu; local model metadata and inheritance stay visible.
+        self.assertEqual(self.prompt("review_agents.reviewer: Codex model")[3],
+                         [INHERIT_CODEX, "gpt-test-fast", "gpt-test-standard", "Custom model ID (unverified)"])
+        self.assertEqual(self.prompt("review_agents.reviewer: Codex effort")[3],
+                         [INHERIT_CODEX, "minimal", "low", "medium", "high"])
+        self.assertEqual(self.prompt("review_agents.fixer: Claude Code effort")[3],
+                         ["Inherit agent_config.claude (clear)", "low", "medium", "high", "xhigh", "max"])
+        self.assertEqual(self.prompt("review_agents.fixer: Claude Code model")[3][:5],
+                         ["Inherit agent_config.claude (clear)", "fable", "opus", "sonnet", "haiku"])
+        self.assertEqual(self.prompt("auto_fix.review")[2], "1", "the current budget is prefilled")
+        self.assertIn("Rounds 1-2 use the fixer; from round 3 the later-round fixer applies.", result.stdout)
+        self.assertIn("+  test: 4", result.stdout)
+        self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
+        # The native check ran in a disposable NM_HOME, never against the live configuration directory.
+        doctors = [call for call in self.calls("no-mistakes") if call["args"] == ["doctor"]]
+        self.assertTrue(doctors)
+        for call in doctors:
+            self.assertNotEqual(Path(call["cwd"]), self.home / ".no-mistakes")
+            self.assertFalse(Path(call["cwd"]).exists())
+        self.assert_no_actions()
+        show = self.nm_config("show", MOCK_NM_VERSION="v1.105.0")
+        self.assert_success(show)
+        self.assertIn("  Reviewer: Codex - model: gpt-test-fast; effort: high", show.stdout)
+        self.assertIn("  Fixer: Claude Code - model: opus; effort: max", show.stdout)
+        self.assertIn("  Later-round fixer: Codex - model: native default; effort: low; from round 3", show.stdout)
+        # Clearing the overrides and choosing Cursor (model only) keeps everything else.
+        result, remaining = self.edit_nm(
+            NM_MENU["fixer_after_round"], "No later-round override (clear)",
+            NM_MENU["reviewer"], "Inherit the pipeline agent (clear override)",
+            NM_MENU["agent_config"], "Cursor", "gpt-5",
+            NM_MENU["save"], "yes", **newer)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("Cursor runs through acpx, which takes a model only", result.stdout)
+        self.assertEqual(source.read_text(), edited.replace(
+            "  reviewer:\n    agent: codex\n    model: gpt-test-fast\n    effort: high\n", "").replace(
+            "  fixer_after_round:\n    agent: codex\n    effort: low\n    after_round: 2\n", "")
+            + "agent_config:\n  cursor:\n    model: gpt-5\n")
+        # Under the stable release the prerelease fields already fail natively; that is reported separately and
+        # does not block an otherwise valid edit, and the fields are kept.
+        before = source.read_text()
+        result, remaining = self.edit_nm(NM_MENU["session_reuse"], "false", NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertIn("already rejected this config before the edit", result.stdout)
+        self.assertEqual(source.read_text(), before + "session_reuse: false\n")
+
+    def test_nm_config_cancel_invalid_input_and_native_rejection_leave_the_config_unchanged(self):
+        source = self.nm_link(STABLE_DEFAULT)
+        saved = source.read_bytes()
+        for answers, status, message in (
+                (("<cancel>",), 130, "unchanged"),
+                ((NM_MENU["reviewer"], "Codex", "<cancel>"), 130, "unchanged"),
+                ((NM_MENU["auto_fix"], "1", "2", "3", "4", "5", "<cancel>"), 130, "unchanged"),
+                ((NM_MENU["auto_fix"], "", "2", "", "", "", NM_MENU["save"], "no"), 130, "unchanged"),
+                ((NM_MENU["auto_fix"], "", "2", "", "", "", NM_MENU["quit"]), 0, "is unchanged"),
+                ((NM_MENU["auto_fix"], "", "-1"), 1, "invalid auto_fix.review"),
+                ((NM_MENU["auto_fix"], "", "two"), 1, "invalid auto_fix.review"),
+                ((NM_MENU["fixer_after_round"], "Codex", INHERIT_CODEX, INHERIT_CODEX, "0"), 1, "invalid after_round"),
+                ((NM_MENU["reviewer"], "Codex", "Custom model ID (unverified)", "has space"), 1, "invalid model ID"),
+                ((NM_MENU["reviewer"], "Not a listed harness"), 1, "invalid selection"),
+                ((NM_MENU["save"],), 0, "No change; nothing was saved.")):
+            with self.subTest(answers=answers):
+                result, remaining = self.edit_nm(*answers)
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assertEqual(remaining, [])
+                self.assertIn(message, result.stdout)
+                self.assertEqual(source.read_bytes(), saved)
+        # A native load rejection of the candidate is refused before any confirmation.
+        result, remaining = self.edit_nm(NM_MENU["fixer_after_round"], "Codex", INHERIT_CODEX, INHERIT_CODEX, "2",
+                                         NM_MENU["save"], MOCK_NM_REJECT="after_round: 2")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(remaining, [])
+        self.assertIn("the installed No-Mistakes rejects the edited config", result.stdout)
+        self.assertIn("nothing was saved", result.stdout)
+        self.assertFalse([prompt for prompt in self.gum_prompts() if prompt[0] == "confirm"])
+        self.assertEqual(source.read_bytes(), saved)
+        # Unrelated native readiness failures are reported separately and never block a valid edit.
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "3", NM_MENU["save"], "yes",
+                                         MOCK_NM_DOCTOR="fail")
+        self.assert_success(result)
+        self.assertIn("environment readiness, not blocking this save", result.stdout)
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 3", "review: 2"))
+        self.assertEqual(list(source.parent.glob(".config.yaml.nm-config.*")), [])
+        self.assert_no_actions()
+
+    def test_nm_config_refuses_non_scalar_agent_config_knobs_without_rewriting_them(self):
+        for knobs, problem in (
+                ("    model:\n      name: gpt-5.4\n    effort: high\n",
+                 "agent_config.codex.model must be one value, not a mapping; fix it in YAML (line 4)"),
+                ("    model: gpt-5.4\n    effort:\n      - high\n",
+                 "agent_config.codex.effort must be one value, not a list; fix it in YAML (line 5)"),
+                ("    effort: [high, low]\n",
+                 "agent_config.codex.effort must be one value, not a list; fix it in YAML (line 4)")):
+            with self.subTest(knobs=knobs):
+                config = "agent: codex\nagent_config:\n  codex:\n" + knobs + "auto_fix:\n  review: 3\n"
+                source = self.nm_link(config)
+                show = self.nm_config("show")
+                self.assert_success(show)
+                line = next(line for line in show.stdout.splitlines() if line.startswith("  Codex: "))
+                self.assertIn("agent_config unreadable (" + problem + ")", line)
+                self.assertNotIn("native default", line)
+                result, remaining = self.edit_nm(NM_MENU["agent_config"], "Codex", NM_MENU["save"])
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertIn("nm-config cannot safely edit Harness model/effort defaults (agent_config): " + problem,
+                              result.stdout)
+                self.assertIn("No change; nothing was saved.", result.stdout)
+                self.assertEqual(source.read_text(), config)
+        # Empty and null scalars remain native defaults.
+        self.nm_link("agent: codex\nagent_config:\n  codex:\n    model:\n    effort: ~\n")
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  Codex: model: native default; effort: native default", show.stdout.splitlines())
+
+    def test_nm_config_show_reports_unreadable_agent_config_before_not_settable(self):
+        for harness, shown, settable in (
+                ("rovodev", "Rovo Dev", "model/effort: not settable by No-Mistakes (use its native CLI defaults)"),
+                ("antigravity", "Antigravity", "model/effort: not settable by No-Mistakes (use its native CLI defaults)"),
+                ("cursor", "Cursor", "model: gpt-5; effort: not settable (acpx takes a model only)")):
+            with self.subTest(harness=harness):
+                problem = ("agent_config." + harness + ".effort must be one value, not a list; fix it in YAML "
+                           "(line 5)")
+                self.nm_link("agent: codex\nagent_config:\n  " + harness + ":\n    model: gpt-5\n"
+                             "    effort: [high]\n")
+                show = self.nm_config("show")
+                self.assert_success(show)
+                line = next(line for line in show.stdout.splitlines() if line.startswith("  " + shown + ": "))
+                self.assertIn("agent_config unreadable (" + problem + ")", line)
+                self.assertNotIn("not settable", line)
+                # A valid configuration keeps the special-harness response.
+                self.nm_link("agent: codex\nagent_config:\n  " + harness + ":\n    model: gpt-5\n")
+                show = self.nm_config("show")
+                self.assert_success(show)
+                self.assertIn("  " + shown + ": " + settable, show.stdout.splitlines())
+
+    def test_nm_config_refuses_unsafe_yaml_per_edit_without_rewriting_it(self):
+        config = ("agent: [codex, claude]\n"
+                  "agent_config:\n  codex: &shared\n    model: gpt-5.4\n"
+                  "review_agents: {reviewer: {agent: codex}}\n"
+                  "auto_fix:\n  review: 3\n")
+        source = self.nm_link(config)
+        result, remaining = self.edit_nm(NM_MENU["agent"], NM_MENU["reviewer"], NM_MENU["agent_config"], "Codex",
+                                         NM_MENU["auto_fix"], "", "2", "", "", "", NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("agent is an ordered fallback list (codex, claude); nm-config keeps it.", result.stdout)
+        self.assertIn("nm-config cannot safely edit Reviewer (review_agents.reviewer): unsupported YAML form", result.stdout)
+        self.assertIn("nm-config cannot safely edit Harness model/effort defaults (agent_config)", result.stdout)
+        self.assertIn("yourself for this setting", result.stdout)
+        # Only the safe, targeted edit was applied; the refused forms are untouched.
+        self.assertEqual(source.read_text(), config.replace("review: 3", "review: 2"))
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  Reviewer: cannot display safely (unsupported YAML form", show.stdout)
+        # A top-level merge can supply any setting, so every edit is refused rather than shadowing it.
+        merged = "<<: &defaults\n  auto_fix:\n    review: 5\n    test: 8\nagent: codex\n"
+        source.write_text(merged)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], NM_MENU["agent"], NM_MENU["session_reuse"],
+                                         NM_MENU["save"])
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("nm-config cannot safely edit Auto-fix attempts (auto_fix): a top-level merge key (<<) (line 1)",
+                      result.stdout)
+        self.assertIn("No change; nothing was saved.", result.stdout)
+        self.assertEqual(source.read_text(), merged)
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  cannot display safely (a top-level merge key (<<) (line 1)); see the YAML", show.stdout)
+        self.assertNotIn("test: unset", show.stdout)
+        # A file whose structure nm-config cannot read is never edited; both modes explain why.
+        for content in ("agent: codex\r\nauto_fix:\r\n  review: 3\r\n", "---\nagent: codex\n---\nagent: pi\n",
+                        "%YAML 1.2\n---\nagent: codex\n", "agent: codex\nagent: claude\n",
+                        "auto_fix:\n\treview: 3\n"):
+            with self.subTest(content=content):
+                source.write_bytes(content.encode())
+                result = self.nm_config("show")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("cannot safely read", result.stderr)
+                result, _ = self.edit_nm()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("nothing was changed", result.stdout)
+                self.assertFalse(self.calls("gum"))
+                self.assertEqual(source.read_bytes(), content.encode())
+
+    def test_nm_config_keeps_a_leading_document_start_marker(self):
+        config = "# globals\n--- # start\nagent: codex\nauto_fix:\n  review: 3\n"
+        source = self.nm_link(config)
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("Pipeline agent (agent): codex", show.stdout)
+        self.assertIn("  review: 3", show.stdout)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "", NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(source.read_text(), config.replace("review: 3", "review: 2"))
+
+    def test_nm_config_show_explains_lists_and_mappings_where_one_value_belongs(self):
+        config = ("agent:\n  name: codex\n"
+                  "review_agents:\n  reviewer:\n    agent: [codex, claude]\n"
+                  "  fixer_after_round:\n    agent: claude\n    after_round:\n      n: 2\n"
+                  "auto_fix:\n  review:\n    max: 2\n  test: 4\n"
+                  "session_reuse: [true]\n")
+        source = self.nm_link(config)
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertNotIn("None", show.stdout)
+        for expected in (
+                "Pipeline agent (agent): cannot display safely (agent must be one value, not a mapping; fix it in "
+                "YAML (line 1)); see the YAML",
+                "  Reviewer: cannot display safely (review_agents.reviewer.agent must be one value, not a list; fix "
+                "it in YAML (line 5)); see the YAML",
+                "  Later-round fixer: cannot display safely (review_agents.fixer_after_round.after_round must be "
+                "one value, not a mapping; fix it in YAML (line 8)); see the YAML",
+                "  review: cannot display safely (auto_fix.review must be one value, not a mapping; fix it in YAML "
+                "(line 11)); see the YAML",
+                "  test: 4",
+                "Fixer session reuse (session_reuse): cannot display safely (session_reuse must be one value, not a "
+                "list; fix it in YAML (line 14)); see the YAML"):
+            self.assertIn(expected, show.stdout)
+        # The editor opens with the same explanation, and refusing the unsafe edit leaves the file untouched.
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "4", "", "", NM_MENU["quit"])
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("  Reviewer: cannot display safely", result.stdout)
+        self.assertIn("nm-config cannot safely edit Auto-fix attempts (auto_fix): auto_fix.review holds a mapping or "
+                      "list", result.stdout)
+        self.assertEqual(self.prompt("auto_fix.review: max automatic fix attempts")[2], "")
+        self.assertEqual(source.read_text(), config)
+
+    def test_nm_config_follows_acp_alias_profiles_and_combined_codex_pins(self):
+        # cursor and acp:cursor share one native profile: prefill and clear the entry that applies.
+        alias_only = "agent: cursor\nagent_config:\n  acp:cursor:\n    model: gpt-5\nlog_level: debug\n"
+        source = self.nm_link(alias_only)
+        result, remaining = self.edit_nm(NM_MENU["agent_config"], "Cursor", "Native default (clear override)",
+                                         NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(self.prompt("agent_config.acp:cursor: Cursor model")[2], "gpt-5")
+        self.assertEqual(source.read_text(), "agent: cursor\nlog_level: debug\n")
+        dual = "agent: cursor\nagent_config:\n  cursor:\n    model: a-model\n  acp:cursor:\n    model: b-model\n"
+        for answers, expected in (
+                (("Native default (clear override)",), "agent: cursor\n"),
+                (("Custom model ID (unverified)", "c-model"), dual.replace("a-model", "c-model"))):
+            with self.subTest(answers=answers):
+                source.write_text(dual)
+                result, remaining = self.edit_nm(NM_MENU["agent_config"], "Cursor", *answers, NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertEqual(self.prompt("agent_config.cursor: Cursor model")[2], "a-model")
+                self.assertEqual(source.read_text(), expected)
+        # Combined -c/--config tokens pin codex knobs natively, as the stable adapter recognizes them.
+        pinned = ("agent: codex\nagent_config:\n  codex:\n    model: gpt-5.4\n    effort: high\n"
+                  "agent_args_override:\n  codex:\n    - '-c model_reasoning_effort=\"low\"'\n"
+                  "    - --config=model=o3\n    - -c\n    - service_tier=\"priority\"\n")
+        source.write_text(pinned)
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  Codex: model: gpt-5.4 - overridden: agent_args_override.codex pins --config=model=o3; effort: "
+                      "high - overridden: agent_args_override.codex pins -c model_reasoning_effort=\"low\"",
+                      show.stdout.splitlines())
+        self.assertIn("  codex: -c model_reasoning_effort=\"low\" --config=model=o3 -c service_tier=\"priority\" - pins "
+                      "effort and model", show.stdout.splitlines())
+        result, remaining = self.edit_nm(NM_MENU["agent_config"], "Codex", "Native default (clear override)", "medium",
+                                         NM_MENU["quit"], **self.codex_cache())
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("Note: agent_args_override.codex pins effort (-c model_reasoning_effort=\"low\")", result.stdout)
+        self.assertEqual(source.read_text(), pinned)
+
+    def test_nm_config_offers_native_harnesses_beyond_the_issue_agents(self):
+        # No-Mistakes harnesses are independent of mf-config's issue agents (Codex, Claude Code, Cursor).
+        source = self.nm_link(STABLE_DEFAULT + "agent_args_override:\n  pi:\n    - --thinking=low\n")
+        custom = "Custom model ID (unverified)"
+        result, remaining = self.edit_nm(
+            NM_MENU["agent"], "pi",
+            NM_MENU["agent_config"], "Pi", custom, "anthropic/claude-opus-4-8", "max",
+            NM_MENU["reviewer"], "Copilot", custom, "gpt-5", "xhigh",
+            NM_MENU["fixer"], "OpenCode", custom, "openai/gpt-5", "high",
+            NM_MENU["fixer_after_round"], "Rovo Dev", "",
+            NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(self.prompt("Pipeline agent")[3],
+                         ["auto", "codex", "claude", "grok", "opencode", "pi", "copilot", "rovodev", "antigravity",
+                          "cursor", "devin"])
+        self.assertNotIn("Rovo Dev", self.prompt("agent_config: harness")[3])
+        self.assertEqual(self.prompt("review_agents.reviewer: Copilot effort")[3],
+                         ["Inherit agent_config.copilot (clear)", "minimal", "low", "medium", "high", "xhigh", "max"])
+        self.assertIn("Note: agent_args_override.pi pins effort (--thinking=low)", result.stdout)
+        self.assertIn("No-Mistakes cannot set a model or effort for Rovo Dev", result.stdout)
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("agent: codex", "agent: pi")
+                         + "agent_args_override:\n  pi:\n    - --thinking=low\n"
+                         + "agent_config:\n  pi:\n    model: anthropic/claude-opus-4-8\n    effort: max\n"
+                         + "review_agents:\n  reviewer:\n    agent: copilot\n    model: gpt-5\n    effort: xhigh\n"
+                         + "  fixer:\n    agent: opencode\n    model: openai/gpt-5\n    effort: high\n"
+                         + "  fixer_after_round:\n    agent: rovodev\n")
+        show = self.nm_config("show")
+        self.assert_success(show)
+        lines = show.stdout.splitlines()
+        self.assertIn("  Pi: model: anthropic/claude-opus-4-8; effort: max - overridden: agent_args_override.pi pins "
+                      "--thinking=low", lines)
+        self.assertIn("  Reviewer: Copilot - model: gpt-5; effort: xhigh", lines)
+        self.assertIn("  Later-round fixer: Rovo Dev - model/effort: not settable by No-Mistakes (use its native CLI "
+                      "defaults); from round 2 (after_round: 1; rounds 1-1 use the fixer)", lines)
+        # OpenCode needs provider/model natively; a bare name is refused before anything is saved.
+        before = source.read_text()
+        result, remaining = self.edit_nm(NM_MENU["fixer"], "OpenCode", custom, "gpt-5")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(remaining, [])
+        self.assertIn("provider/model form", result.stdout)
+        self.assertEqual(source.read_text(), before)
+
+    def test_nm_config_edits_only_the_live_link_to_this_clone(self):
+        source = self.bundle / "no-mistakes/config.yaml"
+        default = source.read_bytes()
+        link = self.home / ".no-mistakes/config.yaml"
+
+        def refused(expected, tool=None):
+            for mode in ("show", "edit"):
+                result = (self.run_script(tool or self.bundle / "bin/nm-config", "show") if mode == "show"
+                          else self.edit_nm(tool=tool)[0])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(expected, result.stdout + result.stderr)
+                self.assertFalse(self.calls("gum"))
+            self.assertEqual(source.read_bytes(), default)
+
+        refused("does not exist; run make setup from your retained mini-factory clone")
+        link.parent.mkdir()
+        link.write_text("agent: codex\n")
+        refused("is not linked to a mini-factory clone")
+        self.assertEqual(link.read_text(), "agent: codex\n")
+        link.unlink()
+        # A dotfiles-owned or other unrelated config is never edited, even with the same file name.
+        dotfiles = self.root / "dotfiles/no-mistakes/config.yaml"
+        dotfiles.parent.mkdir(parents=True)
+        dotfiles.write_text("agent: claude\n")
+        link.symlink_to(dotfiles)
+        refused("not in a mini-factory clone with nm-config")
+        self.assertEqual(dotfiles.read_text(), "agent: claude\n")
+        link.unlink()
+        link.symlink_to(self.root / "moved clone/no-mistakes/config.yaml")
+        refused("missing or not a regular file; was the clone moved or deleted?")
+        link.unlink()
+        link.symlink_to("relative/no-mistakes/config.yaml")
+        refused("not to a mini-factory clone's no-mistakes/config.yaml")
+        link.unlink()
+        # The installed runtime copy is never the edited source of truth.
+        shutil.copytree(self.bundle, self.installed)
+        (self.installed / ".mini-factory-install").write_text("mini-factory-v1\n")
+        runtime_copy = (self.installed / "no-mistakes/config.yaml").read_bytes()
+        link.symlink_to(self.installed / "no-mistakes/config.yaml")
+        refused("links into the installed runtime copy")
+        self.assertEqual((self.installed / "no-mistakes/config.yaml").read_bytes(), runtime_copy)
+        link.unlink()
+        # From another clone, nm-config names the clone that owns the live link.
+        other = self.root / "other clone"
+        shutil.copytree(self.bundle, other)
+        link.symlink_to(other / "no-mistakes/config.yaml")
+        refused("Run " + str(other / "bin/nm-config") + " instead")
+        self.assert_success(self.run_script(other / "bin/nm-config", "show"))
+        link.unlink()
+        # NM_HOME selects the live link; the default location is then ignored.
+        custom = self.root / "custom nm home"
+        custom.mkdir()
+        (custom / "config.yaml").symlink_to(source)
+        result = self.nm_config("show", NM_HOME=str(custom))
+        self.assert_success(result)
+        self.assertIn(str(custom / "config.yaml") + " -> " + str(source), result.stdout)
+        result = self.nm_config("show", NM_HOME="relative")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("NM_HOME must be an absolute path", result.stderr)
+
+    def test_doctor_checks_config_target_clone_files(self):
+        self.install()
+        link = self.home / ".no-mistakes/config.yaml"
+        unrelated = self.root / "dotfiles/no-mistakes/config.yaml"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("agent: codex\n")
+        link.unlink()
+        link.symlink_to(unrelated)
+
+        def refused():
+            result = self.run_script(self.installed / "scripts/doctor.sh")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("target is not in a mini-factory clone with nm-config", result.stdout)
+            self.assertNotIn("OK: No-Mistakes config links to your clone", result.stdout)
+            self.assertEqual(unrelated.read_text(), "agent: codex\n")
+
+        refused()
+        clone = unrelated.parent.parent
+        for relative in ("bin/nm-config", "scripts/nm_config.py"):
+            helper = clone / relative
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.symlink_to(self.bundle / relative)
+            refused()
+            helper.unlink()
+            helper.write_bytes((self.bundle / relative).read_bytes())
+        # Both regular helper files pass the same clone-file check used by nm-config.
+        result = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(result)
+        self.assertIn("OK: No-Mistakes config links to your clone", result.stdout)
+
+    def test_managed_nm_config_launcher_edits_the_clone_and_never_replaces_another_command(self):
+        self.install()
+        launcher = self.wrapper.parent / "nm-config"
+        content = launcher.read_bytes()
+        self.assertIn(b"# mini-factory managed launcher v1", content)
+        self.assertTrue(content.endswith(b'/mini-factory/bin/nm-config "$@"\n'))
+        source = self.bundle / "no-mistakes/config.yaml"
+        runtime_copy = (self.installed / "no-mistakes/config.yaml").read_bytes()
+        # The fresh stable default stays valid and is edited in the clone, never in the runtime copy.
+        self.assertEqual(source.read_text(), STABLE_DEFAULT)
+        self.assert_success(self.run_script(launcher, "show"))
+        # Gum prefills each current budget; the mock returns the final field text, so "3" keeps ci.
+        result, remaining = self.edit_nm(NM_MENU["agent"], "claude", NM_MENU["auto_fix"], "", "2", "", "", "3",
+                                         NM_MENU["save"], "yes", tool=launcher)
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("agent: codex", "agent: claude")
+                         .replace("review: 3", "review: 2"))
+        self.assertEqual((self.installed / "no-mistakes/config.yaml").read_bytes(), runtime_copy)
+        self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
+        self.assertIn("rerun it after saving if Claude Code is new on this machine", result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: nm-config launcher resolves on PATH", doctor.stdout)
+        self.assert_success(self.setup())
+        self.assertEqual(launcher.read_bytes(), content)
+        # An unrelated (for example dotfiles-owned) nm-config file or command is left alone.
+        launcher.write_text("#!/bin/sh\necho dotfiles nm-config\n")
+        result = self.setup()
+        self.assert_success(result)
+        self.assertEqual(launcher.read_text(), "#!/bin/sh\necho dotfiles nm-config\n")
+        self.assertIn("Run " + str(self.bundle / "bin/nm-config") + " instead.", result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("NOTE: optional nm-config launcher is not on PATH", doctor.stdout)
+        launcher.unlink()
+        other = self.mock / "nm-config"
+        other.write_text("#!/bin/sh\necho other\n")
+        other.chmod(0o755)
+        result = self.setup()
+        self.assert_success(result)
+        self.assertFalse(launcher.exists())
+        self.assertEqual(other.read_text(), "#!/bin/sh\necho other\n")
+        self.assertIn("another nm-config command is on PATH", result.stdout)
+        self.assertIn("mf-config launcher: " + str(self.wrapper.parent / "mf-config"), result.stdout)
+        # The repository-local command still works.
+        self.assert_success(self.nm_config("show"))
+        self.assert_no_actions()
 
 
 if __name__ == "__main__":

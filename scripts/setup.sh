@@ -5,7 +5,6 @@ bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
 launcher="$bin_directory/ghd"
-config_launcher="$bin_directory/mf-config"
 parent_path="$PATH"
 install_marker='mini-factory-v1'
 agent_setting="${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent"
@@ -257,7 +256,7 @@ git_is_suitable() {
 	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
-# Gum provides the mf-config editor; no version floor, only a runnable command.
+# Gum provides the mf-config and nm-config editors; no version floor, only a runnable command.
 gum_is_suitable() {
 	command -v gum >/dev/null 2>&1 && gum --version >/dev/null 2>&1
 }
@@ -291,7 +290,7 @@ install_dependencies() {
 				if [ "$package" = gum ] && brew list --versions gum >/dev/null 2>&1; then
 					# An installed but unrunnable Gum is repaired, not merely upgraded.
 					reinstalls[${#reinstalls[@]}]=gum
-					proposal="$proposal brew reinstall gum (mf-config editor);"
+					proposal="$proposal brew reinstall gum (mf-config/nm-config editors);"
 				elif brew list --versions "$package" >/dev/null 2>&1; then
 					upgrades[${#upgrades[@]}]="$package"
 					proposal="$proposal brew upgrade $package;"
@@ -417,12 +416,12 @@ install_gum_ubuntu() {
 	# An installed but unrunnable package is repaired by reinstalling it.
 	! command -v gum >/dev/null 2>&1 || install_arguments=(apt-get install -y --reinstall --no-install-recommends gum)
 	if gum_in_ubuntu_archive; then
-		consent "Gum provides the mf-config editor. Run sudo ${install_arguments[*]} from your configured Ubuntu archive? This changes system packages." ||
+		consent "Gum provides the mf-config and nm-config editors. Run sudo ${install_arguments[*]} from your configured Ubuntu archive? This changes system packages." ||
 			die 'Gum installation pending'
 		sudo "${install_arguments[@]}"
 		return
 	fi
-	consent "Gum provides the mf-config editor and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
+	consent "Gum provides the mf-config and nm-config editors and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
 		die 'Gum installation pending'
 	scratch="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-gum.XXXXXX")"
 	if ! curl -fsSL https://repo.charm.sh/apt/gpg.key -o "$scratch/charm.asc"; then
@@ -470,8 +469,8 @@ install_native_tool() {
 
 install_bundle() {
 	local input source relative quoted
-	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config gh-dash/config.yml no-mistakes/config.yaml
-		scripts/setup.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py
+	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config bin/nm-config gh-dash/config.yml no-mistakes/config.yaml
+		scripts/setup.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py scripts/nm_config.py
 		scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh
@@ -496,7 +495,7 @@ install_bundle() {
 			;;
 		esac
 	done
-	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/scripts/setup.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
+	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
 	"$stage/scripts/doctor.sh" --bundle "$stage" --integrity-only || die 'replacement bundle failed validation; existing installation preserved'
 	launcher_stage="$(mktemp "$bin_directory/.mini-factory-launcher.XXXXXX")"
@@ -525,36 +524,38 @@ install_bundle() {
 	notice "Launcher: $launcher"
 }
 
-# The optional mf-config launcher never replaces another command; the clone's bin/mf-config always works.
-install_config_launcher() {
-	local quoted expected existing staged
-	printf -v quoted '%q' "$runtime/bin/mf-config"
+# The optional mf-config and nm-config launchers never replace another command (for example a
+# dotfiles-owned one); the clone's bin/mf-config and bin/nm-config always work.
+install_optional_launcher() {
+	local name="$1" quoted expected existing staged
+	local path="$bin_directory/$name"
+	printf -v quoted '%q' "$runtime/bin/$name"
 	expected="$(printf '#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %s "$@"\n' "$quoted")"
-	if [ -e "$config_launcher" ] || [ -L "$config_launcher" ]; then
-		if ! { [ -f "$config_launcher" ] && [ ! -L "$config_launcher" ] && [ -O "$config_launcher" ] &&
-			[ "$(cat "$config_launcher")" = "$expected" ]; }; then
-			notice "Optional mf-config launcher skipped: $config_launcher is not managed by mini-factory and was left untouched. Run $bundle/bin/mf-config instead."
+	if [ -e "$path" ] || [ -L "$path" ]; then
+		if ! { [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] &&
+			[ "$(cat "$path")" = "$expected" ]; }; then
+			notice "Optional $name launcher skipped: $path is not managed by mini-factory and was left untouched. Run $bundle/bin/$name instead."
 			return 0
 		fi
 	fi
-	existing="$(command -v mf-config 2>/dev/null || true)"
-	if [ -n "$existing" ] && [ "$existing" != "$config_launcher" ]; then
-		notice "Optional mf-config launcher skipped: another mf-config command is on PATH ($existing). Run $bundle/bin/mf-config instead."
+	existing="$(command -v "$name" 2>/dev/null || true)"
+	if [ -n "$existing" ] && [ "$existing" != "$path" ]; then
+		notice "Optional $name launcher skipped: another $name command is on PATH ($existing). Run $bundle/bin/$name instead."
 		return 0
 	fi
-	[ ! -f "$config_launcher" ] || { notice "mf-config launcher: $config_launcher"; return 0; }
-	staged="$(mktemp "$bin_directory/.mini-factory-mf-config.XXXXXX")"
+	[ ! -f "$path" ] || { notice "$name launcher: $path"; return 0; }
+	staged="$(mktemp "$bin_directory/.mini-factory-$name.XXXXXX")"
 	printf '%s\n' "$expected" >"$staged"
 	chmod 755 "$staged"
 	# Never clobber an entry that appeared since the check above.
 	# link(2) fails atomically for any existing destination, including directories/symlinks.
-	if ! python3 -I -B -c 'import os, sys; os.link(sys.argv[1], sys.argv[2])' "$staged" "$config_launcher" 2>/dev/null; then
+	if ! python3 -I -B -c 'import os, sys; os.link(sys.argv[1], sys.argv[2])' "$staged" "$path" 2>/dev/null; then
 		rm -f -- "$staged"
-		notice "Optional mf-config launcher skipped: $config_launcher appeared during setup. Run $bundle/bin/mf-config instead."
+		notice "Optional $name launcher skipped: $path appeared during setup. Run $bundle/bin/$name instead."
 		return 0
 	fi
 	rm -f -- "$staged"
-	notice "mf-config launcher: $config_launcher"
+	notice "$name launcher: $path"
 }
 
 agent_is_authenticated() {
@@ -698,7 +699,8 @@ link_no_mistakes_config
 read_pipeline_agent
 [ -z "$pipeline_agent" ] || install_tools "$(agent_command "$pipeline_agent")"
 install_bundle
-install_config_launcher
+install_optional_launcher mf-config
+install_optional_launcher nm-config
 configure_native_tools
 case ":$parent_path:" in
 *":$bin_directory:"*) ;;

@@ -106,6 +106,10 @@ def config_link_problem(link, bundle):
         return "link target is missing; was the clone moved or deleted? " + str(target)
     if bundle.resolve() in target.resolve().parents:
         return "links into the installed runtime copy instead of your clone"
+    clone = target.parent.parent
+    if not all((clone / name).is_file() and not (clone / name).is_symlink()
+               for name in ("bin/nm-config", "scripts/nm_config.py")):
+        return "target is not in a mini-factory clone with nm-config: " + str(target)
     return None
 
 
@@ -133,8 +137,9 @@ def flag_available(text, flag):
 def integrity(bundle):
     workers = bundle / "scripts/integrations/gh-dash"
     required = [bundle / "Makefile", bundle / "README.md", bundle / "gh-dash/config.yml",
-                bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py", bundle / "scripts/mf_config.py"]
-    executables = [bundle / "bin/ghd", bundle / "bin/mf-config", bundle / "scripts/setup.sh",
+                bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py", bundle / "scripts/mf_config.py",
+                bundle / "scripts/nm_config.py"]
+    executables = [bundle / "bin/ghd", bundle / "bin/mf-config", bundle / "bin/nm-config", bundle / "scripts/setup.sh",
                    bundle / "scripts/doctor.sh"]
     executables += [workers / name for name in (
         "gh-dash-codex-issue.sh", "gh-dash-codex-issue-dispatch.sh",
@@ -155,7 +160,7 @@ def integrity(bundle):
                 "--factory", "$HOME/dotfiles", "diffnav", "repoPaths:", "pager:",
                 "universal:", "octo", "tuicr", "lazygit", "sandbox"))):
         raise ValueError("bundle config does not contain the isolated PR I and issue i/I routes")
-    for script in ("scripts/doctor.py", "scripts/mf_config.py"):
+    for script in ("scripts/doctor.py", "scripts/mf_config.py", "scripts/nm_config.py"):
         compile((bundle / script).read_bytes(), str(bundle / script), "exec")
 
 
@@ -364,15 +369,16 @@ def main():
         managed = False
     check(active and Path(active).resolve() == launcher.resolve() and managed,
           "managed launcher resolves on PATH", 'launcher PATH/setup pending: export PATH="$HOME/.local/bin:$PATH"; run make setup if ghd is absent')
-    # The mf-config launcher is optional: setup never replaces another mf-config command.
-    config_launcher = Path.home() / ".local/bin/mf-config"
-    active = shutil.which("mf-config")
-    if (active and Path(active).resolve() == config_launcher.resolve()
-            and managed_launcher(config_launcher, bundle / "bin/mf-config")):
-        print("OK: mf-config launcher resolves on PATH")
-    else:
-        print("NOTE: optional mf-config launcher is not on PATH (absent, or another mf-config command exists); "
-              "run bin/mf-config from your retained mini-factory clone")
+    # The mf-config and nm-config launchers are optional: setup never replaces another command of that name.
+    for name in ("mf-config", "nm-config"):
+        config_launcher = Path.home() / ".local/bin" / name
+        active = shutil.which(name)
+        if (active and Path(active).resolve() == config_launcher.resolve()
+                and managed_launcher(config_launcher, bundle / "bin" / name)):
+            print("OK: " + name + " launcher resolves on PATH")
+        else:
+            print("NOTE: optional " + name + " launcher is not on PATH (absent, or another " + name + " command "
+                  "exists); run bin/" + name + " from your retained mini-factory clone")
     setup_pending = bool(failures) and not installation_failed
     print("Authentication/setup: " + ("pending" if setup_pending or installation_failed else "complete"))
 

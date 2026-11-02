@@ -12,7 +12,8 @@ first setup saves `codex` and later runs keep the saved choice; rerun with a new
 value to change it. To choose the `i` and `I` agents separately, or a model and
 effort per key, use [`mf-config`](#agent-profiles-mf-config). **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
-[No-Mistakes](#no-mistakes-configuration-and-unattended-runs)).
+[No-Mistakes](#no-mistakes-configuration-and-unattended-runs); edit it with
+[`nm-config`](#no-mistakes-global-defaults-nm-config)).
 
 Complete the native login/integration steps offered by setup. If setup reports a
 PATH action, run `export PATH="$HOME/.local/bin:$PATH"` in your current shell.
@@ -93,7 +94,7 @@ sudo apt-get install --no-install-recommends git make ca-certificates
 These are unavoidable prerequisites for cloning and running `make setup`.
 Setup offers apt installation for missing tools and the
 [official GitHub CLI apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
-when GitHub CLI needs installation. Gum (the `mf-config` editor) comes from your
+when GitHub CLI needs installation. Gum (the `mf-config`/`nm-config` editor) comes from your
 configured Ubuntu archive when it offers a `gum` package (newer releases carry it
 in universe); otherwise setup offers
 [Charm's official apt repository](https://github.com/charmbracelet/gum#installation),
@@ -237,7 +238,8 @@ then the shared `ISSUE_AGENT` from setup, then Codex. An existing installation
 with only `issue-agent` keeps using that agent for both keys. `make setup
 ISSUE_AGENT=...` changes only the shared choice and never rewrites a per-key
 selection; choose **Shared issue agent** in `mf-config` to remove one.
-`mf-config` never changes the No-Mistakes pipeline agent.
+`mf-config` never changes the No-Mistakes pipeline agent; use
+[`nm-config`](#no-mistakes-global-defaults-nm-config) for that.
 
 Every knob offers **Native default (no override)**, which passes nothing, and a
 custom/unverified value; saved custom values are kept. Pickers read only local
@@ -414,7 +416,8 @@ This default uses only fields from the stable
 `agent` is No-Mistakes' own pipeline agent, independent of `ISSUE_AGENT`. When
 setup first creates the link and that line is unedited, it sets it to the issue
 agent you chose; after that, setup never rewrites the file, including when you
-change `ISSUE_AGENT`. Edit the file in the clone to change any native setting;
+change `ISSUE_AGENT`. Edit the file in the clone, or use
+[`nm-config`](#no-mistakes-global-defaults-nm-config), to change any native setting;
 `no-mistakes doctor` validates it. No-Mistakes rejects fields it does not know.
 Earlier versions of this file had the prerelease-only
 `ci.review_bot_comments` and `ci.release_after_checks_pass`. If your clone still
@@ -425,6 +428,76 @@ yourself, or keep using a release that supports them. Your edits are local chang
 case Git stops and you merge them yourself. Keep the clone in place: if you
 move it, rerun `make setup` from the new location to relink, and deleting it
 leaves No-Mistakes without its configuration.
+
+### No-Mistakes global defaults (nm-config)
+
+`nm-config` edits the useful stable settings in that linked clone file:
+
+```sh
+nm-config          # Gum menu: change settings, review the diff, confirm once
+nm-config show     # configured global defaults; works without a terminal (scripts, SSH)
+```
+
+For example, Codex reviews, Claude Code fixes, Codex takes over fixing from
+round 3, and the Review and CI fix budgets are adjusted:
+
+```yaml
+agent: codex # Initialized from the issue agent during first setup.
+auto_fix:
+  review: 2
+  ci: 2
+review_agents:
+  reviewer:
+    agent: codex
+    effort: high
+  fixer:
+    agent: claude
+    model: opus
+    effort: max
+  fixer_after_round:
+    agent: codex
+    after_round: 2
+```
+
+- **Settings:** `agent` (`auto` or a native harness: `codex`, `claude`,
+  `grok`, `opencode`, `pi`, `copilot`, `rovodev`, `antigravity`, `cursor`,
+  `devin`; an existing fallback list or `acp:<target>` is shown and kept, so
+  edit those in YAML), `agent_config` model/effort per harness,
+  `review_agents.reviewer`/`fixer` and their `*_after_round` overrides,
+  `auto_fix` (`rebase`, `review`, `test`, `lint`, `ci`), and `session_reuse`.
+  Each choice can be cleared back to the native default or inheritance.
+  Efforts are the stable adapter's levels (Codex `minimal`-`high`, Claude Code
+  `low`-`max`, Pi/Copilot `minimal`-`max`; Grok and OpenCode support depends on
+  the model/provider); Cursor and Devin take a model only, OpenCode needs
+  `provider/model`, and Rovo Dev/Antigravity take neither. Model pickers use
+  mf-config's local metadata for Codex, Claude Code, and Cursor; custom IDs are
+  unverified.
+- **One native Review phase:** reviewer and fixer serve only its repeated
+  review/fix rounds; Test, CI, and every other step use `agent`. `after_round: N`
+  keeps rounds 1 to N on the base role and uses the override from round N+1.
+  `auto_fix` values are maximum automatic fix attempts, not guaranteed passes.
+  They are global defaults: a target repository's trusted `.no-mistakes.yaml`
+  may override per-step budgets (`show` cannot know it). Saved choices apply to
+  runs started afterwards, not to active runs.
+- **Precedence:** `agent_args_override` is kept and its native arguments win
+  over overlapping `agent_config` and role knobs (for example a Codex `-m`
+  pins the model); `show` and the editor point this out.
+- **Safety:** nm-config edits only the clone file linked from
+  `${NM_HOME:-$HOME/.no-mistakes}/config.yaml`. It refuses a missing or broken
+  link, a regular file, a link to an unrelated file (such as a dotfiles config),
+  the runtime copy, or another clone, and names the fix. Edits are small line
+  changes; comments, unknown and prerelease fields stay. A YAML form it cannot
+  change safely (flow mappings, anchors, block scalars, ...) is refused for
+  that setting; tabs, CRLF line endings, directives, or document markers other
+  than one leading `---` make it refuse the whole file. Edit those by hand. Nothing is written until you confirm the
+  diff. Cancelling, invalid input, or a native load rejection changes nothing.
+  Before saving, the installed No-Mistakes loads the candidate in a disposable
+  `NM_HOME`; unrelated daemon, login, or agent readiness problems are reported
+  without blocking the edit.
+- Setup installs a managed `~/.local/bin/nm-config` only when no other
+  `nm-config` exists (for example from dotfiles); otherwise run `bin/nm-config`
+  from this clone. Setup provisions only the pipeline and issue agents, so
+  install and log in to any other review-role harness natively.
 
 **Unattended means `--yes`.** `no-mistakes axi run --yes` resolves ordinary
 gates natively: it selects the findings for a fix round, accepts the result, and
@@ -487,7 +560,7 @@ never bypasses CI or marks checks passed.
 Setup copies the runtime into
 `${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/`, with a
 `.mini-factory-install` ownership marker, and installs the managed wrapper
-`~/.local/bin/ghd`, plus the optional `~/.local/bin/mf-config` launcher described
+`~/.local/bin/ghd`, plus the optional `~/.local/bin/mf-config` and `nm-config` launchers described
 above. The dashboard runtime works on its own, but the clone must
 stay where it is for the No-Mistakes configuration link above; run setup from
 the clone, never from the runtime copy. Updates replace only this project's
@@ -536,7 +609,7 @@ through its own CLI. Outside Herdr it
 skips runtime-context checks and explains how to enter a pane. Inside Herdr it
 checks the inherited route, active compatible server, Codex and issue-agent
 detection manifests, target repository, and Git transport. It notes, without
-failing, when the optional `mf-config` launcher is not on `PATH`. It never starts
+failing, when the optional `mf-config` or `nm-config` launcher is not on `PATH`. It never starts
 agents or pipelines, creates worktrees, sends prompts, writes PR comments, or
 marks PRs ready. It returns nonzero for required failed/pending checks.
 
@@ -576,8 +649,8 @@ Before committing changes, review the diff and run the focused checks:
 git diff --check
 make test
 # For changes to the launcher, setup/doctor, or worker shell scripts:
-bash -n bin/ghd bin/mf-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
-shellcheck -x bin/ghd bin/mf-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+bash -n bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
 ```
 
 Commit and push reviewed changes to this repository. Users update their clone
@@ -597,7 +670,9 @@ CLI help on 2026-10-08; the issue-agent additions against Herdr 0.9.5 help and
 Claude Code/Cursor CLI help and installers on 2026-10-30; and the stable
 No-Mistakes support against the v1.84.0 (latest stable) documentation and native
 help on 2026-11-01; `mf-config` against Codex CLI 0.166.0, Claude Code 2.1.316,
-Cursor CLI 2026.10.22, Gum 2.0.2, and Herdr 0.9.5 help on 2026-11-01. Mocked
+Cursor CLI 2026.10.22, Gum 2.0.2, and Herdr 0.9.5 help on 2026-11-01; and
+`nm-config` against the No-Mistakes v1.84.0 global config reference and its
+native config loader (`no-mistakes doctor`) on 2026-11-01. Mocked
 macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those
