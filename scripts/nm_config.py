@@ -560,12 +560,13 @@ def knob_text(document, harness, role=None):
     found, problem = safe(profile, document, harness)
     key, defaults = found or (None, None)
     pins, pin_problem = safe(pinned, document, harness)
+    unreadable = "agent_config unreadable (" + problem + ")" if problem else None
     if harness in ("rovodev", "antigravity"):
-        return "model/effort: not settable by No-Mistakes (use its native CLI defaults)"
+        return "model/effort: " + (unreadable or "not settable by No-Mistakes (use its native CLI defaults)")
     parts = []
     for knob in ("model", "effort"):
         if (harness in ACP_ALIASES or harness.startswith("acp:")) and knob == "effort":
-            parts.append("effort: not settable (acpx takes a model only)")
+            parts.append("effort: " + (unreadable or "not settable (acpx takes a model only)"))
             continue
         if role and filled(role.get(knob)):
             text = str(role[knob].value).strip()
@@ -573,7 +574,7 @@ def knob_text(document, harness, role=None):
             text = str(defaults[knob].value).strip() + (" (agent_config." + key + ")" if key != harness
                                                         else " (agent_config)" if role is not None else "")
         else:
-            text = "native default" if defaults is not None else "agent_config unreadable (" + problem + ")"
+            text = "native default" if defaults is not None else unreadable
         if pins and knob in pins:
             text += " - overridden: agent_args_override." + harness + " pins " + pins[knob]
         parts.append(knob + ": " + text)

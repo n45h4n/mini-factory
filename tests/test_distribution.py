@@ -2663,6 +2663,27 @@ os.execv(executable, [executable, *args])
         self.assert_success(show)
         self.assertIn("  Codex: model: native default; effort: native default", show.stdout.splitlines())
 
+    def test_nm_config_show_reports_unreadable_agent_config_before_not_settable(self):
+        for harness, shown, settable in (
+                ("rovodev", "Rovo Dev", "model/effort: not settable by No-Mistakes (use its native CLI defaults)"),
+                ("antigravity", "Antigravity", "model/effort: not settable by No-Mistakes (use its native CLI defaults)"),
+                ("cursor", "Cursor", "model: gpt-5; effort: not settable (acpx takes a model only)")):
+            with self.subTest(harness=harness):
+                problem = ("agent_config." + harness + ".effort must be one value, not a list; fix it in YAML "
+                           "(line 5)")
+                self.nm_link("agent: codex\nagent_config:\n  " + harness + ":\n    model: gpt-5\n"
+                             "    effort: [high]\n")
+                show = self.nm_config("show")
+                self.assert_success(show)
+                line = next(line for line in show.stdout.splitlines() if line.startswith("  " + shown + ": "))
+                self.assertIn("agent_config unreadable (" + problem + ")", line)
+                self.assertNotIn("not settable", line)
+                # A valid configuration keeps the special-harness response.
+                self.nm_link("agent: codex\nagent_config:\n  " + harness + ":\n    model: gpt-5\n")
+                show = self.nm_config("show")
+                self.assert_success(show)
+                self.assertIn("  " + shown + ": " + settable, show.stdout.splitlines())
+
     def test_nm_config_refuses_unsafe_yaml_per_edit_without_rewriting_it(self):
         config = ("agent: [codex, claude]\n"
                   "agent_config:\n  codex: &shared\n    model: gpt-5.4\n"
