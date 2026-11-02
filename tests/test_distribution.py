@@ -2354,6 +2354,38 @@ os.execv(executable, [executable, *args])
         self.assertIn("nm-config show", result.stderr)
         self.assertFalse(self.calls("gum"))
 
+    def test_nm_config_show_treats_yaml_nulls_as_native_defaults(self):
+        for value in ("", "~", "null", "Null", "NULL"):
+            with self.subTest(value=value):
+                config = ("agent: " + value + "\n"
+                          "auto_fix:\n" + "".join("  " + step + ": " + value + "\n"
+                                                   for step in ("rebase", "review", "test", "lint", "ci"))
+                          + "session_reuse: " + value + "\n"
+                          "review_agents:\n"
+                          "  reviewer_after_round:\n    agent: codex\n    after_round: " + value + "\n"
+                          "  fixer_after_round:\n    agent: claude\n    after_round: " + value + "\n")
+                source = self.nm_link(config)
+                result = self.nm_config("show")
+                self.assert_success(result)
+                lines = result.stdout.splitlines()
+                self.assertIn("Pipeline agent (agent): unset - native default auto", lines)
+                for step, default in (("rebase", 3), ("review", 0), ("test", 3), ("lint", 3), ("ci", 3)):
+                    self.assertIn("  " + step + ": unset - native default (" + str(default) + " in v1.84.0)", lines)
+                self.assertIn("Fixer session reuse (session_reuse): unset - native default (true in v1.84.0)", lines)
+                for role, harness in (("reviewer", "Codex"), ("fixer", "Claude Code")):
+                    self.assertIn("  Later-round " + role + ": " + harness
+                                  + " - model: native default; effort: native default; from round 2"
+                                  + " (after_round: 1; rounds 1-1 use the " + role + ")", lines)
+                self.assertNotIn("None", result.stdout)
+                self.assertEqual(source.read_bytes(), config.encode())
+        source = self.nm_link("agent: codex\nauto_fix:\n  review: 0\nsession_reuse: false\n")
+        result = self.nm_config("show")
+        self.assert_success(result)
+        self.assertIn("  review: 0", result.stdout.splitlines())
+        self.assertIn("Fixer session reuse (session_reuse): false", result.stdout.splitlines())
+        self.assertFalse(self.calls("gum"))
+        self.assertFalse(self.calls("no-mistakes"))
+
     def test_nm_config_edits_review_roles_and_budgets_and_preserves_unrelated_yaml(self):
         customized = ("agent: codex # my pipeline choice\n"
                       "auto_fix:\n  review: 1 # keep reviews short\n  ci: 3\n  document: 2\n"

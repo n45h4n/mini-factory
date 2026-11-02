@@ -579,9 +579,14 @@ def knob_text(document, harness, role=None):
     return "; ".join(parts)
 
 
+def is_null(node):
+    """An absent setting or a YAML null, including both empty and explicit null scalars."""
+    return node is None or (node.kind in ("null", "scalar") and node.value is None)
+
+
 def pipeline_text(document):
     node = document.get(("agent",))
-    if node is None:
+    if is_null(node):
         return "unset - native default auto"
     if node.kind == "list":
         return "ordered fallback list " + ", ".join(map(str, node.value)) + " (first available entry runs)"
@@ -602,7 +607,8 @@ def role_text(document, role, pipeline):
         return "no agent set (No-Mistakes requires one; fix it in YAML)"
     text = label(harness) + " - " + knob_text(document, harness, children)
     if base != role:
-        after = values.get("after_round", 1)
+        after = values.get("after_round")
+        after = 1 if after is None else after
         text += ("; from round " + str(after + 1) + " (after_round: " + str(after) + "; rounds 1-" + str(after)
                  + " use the " + base + ")") if type(after) is int else "; after_round: " + str(after)
     return text
@@ -638,12 +644,12 @@ def show(link, target, document):
         legacy = step == "ci" and step not in children and "babysit" in children
         key = "babysit" if legacy else step
         line("  " + step + ": ", lambda: ("unset - native default (" + str(default) + " in v1.84.0)")
-             if key not in children else str(scalar(children[key], ("auto_fix", key)))
+             if is_null(children.get(key)) else str(scalar(children[key], ("auto_fix", key)))
              + (" (legacy auto_fix.babysit)" if legacy else ""))
     if problem:
         print("  cannot display safely (" + problem + "); see the YAML")
     line("Fixer session reuse (session_reuse): ",
-         lambda: "unset - native default (true in v1.84.0)" if document.get(("session_reuse",)) is None
+         lambda: "unset - native default (true in v1.84.0)" if is_null(document.get(("session_reuse",)))
          else str(scalar(document.get(("session_reuse",)), ("session_reuse",))).lower())
     overrides, problem = safe(mapping, document, ("agent_args_override",))
     if overrides or problem:
