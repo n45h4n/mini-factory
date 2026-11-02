@@ -234,7 +234,7 @@ elif name == "no-mistakes":
              "review_agent_timeout", "test_agent_timeout", "daemon_connect_timeout", "branch_sync_remote_timeout",
              "gate_reconcile_interval", "gate_reconcile_timeout", "log_level", "session_reuse", "worktree_roots",
              "forge_profiles", "auto_fix", "ci", "rebase", "commit", "intent", "test", "providers", "review_agents"},
-        "auto_fix": {"rebase", "review", "test", "document", "lint", "ci"},
+        "auto_fix": {"rebase", "review", "test", "document", "lint", "ci", "babysit"},
         "ci": {"rerun_transient", "revalidate_repairs"}
               | ({"review_bot_comments", "release_after_checks_pass"} if numeric >= (1, 105, 0) else set()),
     }
@@ -2451,10 +2451,25 @@ os.execv(executable, [executable, *args])
                     result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "4",
                                                      NM_MENU["save"], "yes")
                     self.assert_success(result)
+                    self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
                     self.assertEqual(self.prompt("auto_fix.ci:")[2], ci)
                     self.assertNotIn("rename it to ci", result.stdout)
                     self.assertEqual(source.read_text(), config.replace("ci: " + ci, "ci: 4"))
                 self.assertEqual(remaining, [])
+
+    def test_nm_config_edits_ci_budget_when_ci_and_legacy_babysit_are_null(self):
+        for value in ("", "~", "null"):
+            with self.subTest(value=value):
+                config = "agent: codex\nauto_fix:\n  ci: " + value + "\n  babysit: " + value + "\n"
+                source = self.nm_link(config)
+                result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "4",
+                                                 NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
+                self.assertNotIn("rename it to ci", result.stdout)
+                self.assertEqual(self.prompt("auto_fix.ci:")[2], "")
+                self.assertEqual(source.read_text(), config.replace("ci: " + value, "ci: 4", 1))
 
     def test_nm_config_recovery_requires_the_same_native_rejection(self):
         source = self.nm_link(STABLE_DEFAULT)

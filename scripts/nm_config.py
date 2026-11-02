@@ -834,7 +834,7 @@ def edit_auto_fix(text, target):
     current = mapping(document, ("auto_fix",))
     knobs = {}
     for step, default in AUTO_FIX.items():
-        if step == "ci" and is_null(current.get("ci")) and "babysit" in current:
+        if step == "ci" and is_null(current.get("ci")) and not is_null(current.get("babysit")):
             print("auto_fix.babysit (legacy ci) is set; rename it to ci in " + str(target) + " to edit it here.")
             continue
         node = current.get(step)
