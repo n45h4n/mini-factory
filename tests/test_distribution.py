@@ -277,9 +277,11 @@ elif name == "no-mistakes":
                   + "\n".join("  line " + str(number) + ": field " + field + " not found in type " + kind
                               for number, field, kind in rejected)
                   + ")\n\n  some checks failed")
-        elif os.environ.get("MOCK_NM_REJECT") and os.environ["MOCK_NM_REJECT"] in config.read_text():
+        elif os.environ.get("MOCK_NM_REJECT") and re.search(os.environ["MOCK_NM_REJECT"], config.read_text()):
             # A native load rejection that nm-config's own checks cannot predict.
-            print("  \u2717 gate validation  unavailable: load config (mock rejection)\n\n  some checks failed")
+            rejection = re.search(os.environ["MOCK_NM_REJECT"], config.read_text()).group()
+            print("  \u2717 gate validation  unavailable: load config (mock rejection: " + rejection
+                  + ")\n\n  some checks failed")
         elif os.environ.get("MOCK_NM_DOCTOR") == "fail":
             print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
         else:
@@ -2409,6 +2411,78 @@ os.execv(executable, [executable, *args])
         self.assertFalse(self.calls("gum"))
         self.assertFalse(self.calls("no-mistakes"))
 
+    def test_nm_config_null_numeric_settings_prefill_as_blank(self):
+        for value in ("", "~", "null", "Null", "NULL"):
+            with self.subTest(value=value):
+                config = ("agent: codex\nauto_fix:\n"
+                          + "".join("  " + step + ": " + value + "\n"
+                                    for step in ("rebase", "review", "test", "lint", "ci"))
+                          + "review_agents:\n"
+                          "  reviewer_after_round:\n    agent: codex\n    after_round: " + value + "\n"
+                          "  fixer_after_round:\n    agent: codex\n    after_round: " + value + "\n")
+                source = self.nm_link(config)
+                result, remaining = self.edit_nm(
+                    NM_MENU["auto_fix"], "", "", "", "", "",
+                    NM_MENU["reviewer_after_round"], "Codex", INHERIT_CODEX, INHERIT_CODEX, "",
+                    NM_MENU["fixer_after_round"], "Codex", INHERIT_CODEX, INHERIT_CODEX, "",
+                    NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                for step in ("rebase", "review", "test", "lint", "ci"):
+                    self.assertEqual(self.prompt("auto_fix." + step + ":")[2], "")
+                for role in ("reviewer_after_round", "fixer_after_round"):
+                    self.assertEqual(self.prompt("review_agents." + role + ": after_round")[2], "")
+                self.assertEqual(source.read_text(), "agent: codex\nreview_agents:\n"
+                                 "  reviewer_after_round:\n    agent: codex\n"
+                                 "  fixer_after_round:\n    agent: codex\n")
+
+    def test_nm_config_edits_explicit_ci_budget_without_changing_legacy_babysit(self):
+        for ci in ("0", "2", "null"):
+            with self.subTest(ci=ci):
+                config = "agent: codex\nauto_fix:\n  ci: " + ci + " # explicit budget\n  babysit: 5\n"
+                source = self.nm_link(config)
+                if ci == "null":
+                    result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", NM_MENU["save"])
+                    self.assert_success(result)
+                    self.assertEqual(source.read_text(), config)
+                    self.assertIn("auto_fix.babysit (legacy ci) is set", result.stdout)
+                    self.assertFalse([prompt for prompt in self.gum_prompts() if prompt[1].startswith("auto_fix.ci:")])
+                else:
+                    result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "4",
+                                                     NM_MENU["save"], "yes")
+                    self.assert_success(result)
+                    self.assertEqual(self.prompt("auto_fix.ci:")[2], ci)
+                    self.assertNotIn("rename it to ci", result.stdout)
+                    self.assertEqual(source.read_text(), config.replace("ci: " + ci, "ci: 4"))
+                self.assertEqual(remaining, [])
+
+    def test_nm_config_recovery_requires_the_same_native_rejection(self):
+        source = self.nm_link(STABLE_DEFAULT)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "3", NM_MENU["save"],
+                                         MOCK_NM_REJECT="review: [23]")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(remaining, [])
+        self.assertIn("rejects the edited config", result.stdout)
+        self.assertIn("mock rejection: review: 2", result.stdout)
+        self.assertFalse([prompt for prompt in self.gum_prompts() if prompt[0] == "confirm"])
+        self.assertEqual(source.read_text(), STABLE_DEFAULT)
+        # The same pre-existing rejection permits a targeted recovery edit.
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "3", NM_MENU["save"], "yes",
+                                         MOCK_NM_REJECT="agent: codex")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("already rejected this config before the edit", result.stdout)
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 3", "review: 2"))
+        # Inserting an earlier setting moves line numbers in an unchanged native schema rejection.
+        config = STABLE_DEFAULT + "ci:\n  review_bot_comments: always\n"
+        source.write_text(config)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "1", "3", "", "", "3", NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("already rejected this config before the edit", result.stdout)
+        self.assertEqual(source.read_text(), config.replace("  ci: 3\n", "  ci: 3\n  rebase: 1\n"))
+        self.assert_no_actions()
+
     def test_nm_config_edits_review_roles_and_budgets_and_preserves_unrelated_yaml(self):
         customized = ("agent: codex # my pipeline choice\n"
                       "auto_fix:\n  review: 1 # keep reviews short\n  ci: 3\n  document: 2\n"
@@ -2762,6 +2836,36 @@ os.execv(executable, [executable, *args])
         result = self.nm_config("show", NM_HOME="relative")
         self.assertEqual(result.returncode, 1)
         self.assertIn("NM_HOME must be an absolute path", result.stderr)
+
+    def test_doctor_checks_config_target_clone_files(self):
+        self.install()
+        link = self.home / ".no-mistakes/config.yaml"
+        unrelated = self.root / "dotfiles/no-mistakes/config.yaml"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("agent: codex\n")
+        link.unlink()
+        link.symlink_to(unrelated)
+
+        def refused():
+            result = self.run_script(self.installed / "scripts/doctor.sh")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("target is not in a mini-factory clone with nm-config", result.stdout)
+            self.assertNotIn("OK: No-Mistakes config links to your clone", result.stdout)
+            self.assertEqual(unrelated.read_text(), "agent: codex\n")
+
+        refused()
+        clone = unrelated.parent.parent
+        for relative in ("bin/nm-config", "scripts/nm_config.py"):
+            helper = clone / relative
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.symlink_to(self.bundle / relative)
+            refused()
+            helper.unlink()
+            helper.write_bytes((self.bundle / relative).read_bytes())
+        # Both regular helper files pass the same clone-file check used by nm-config.
+        result = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(result)
+        self.assertIn("OK: No-Mistakes config links to your clone", result.stdout)
 
     def test_managed_nm_config_launcher_edits_the_clone_and_never_replaces_another_command(self):
         self.install()

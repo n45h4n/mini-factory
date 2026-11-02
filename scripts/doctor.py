@@ -106,6 +106,10 @@ def config_link_problem(link, bundle):
         return "link target is missing; was the clone moved or deleted? " + str(target)
     if bundle.resolve() in target.resolve().parents:
         return "links into the installed runtime copy instead of your clone"
+    clone = target.parent.parent
+    if not all((clone / name).is_file() and not (clone / name).is_symlink()
+               for name in ("bin/nm-config", "scripts/nm_config.py")):
+        return "target is not in a mini-factory clone with nm-config: " + str(target)
     return None
 
 

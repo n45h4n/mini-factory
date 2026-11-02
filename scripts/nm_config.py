@@ -816,7 +816,7 @@ def edit_role(text, target, role):
         node = current.get("after_round")
         answer = mf.gum("input", dotted(path) + ": after_round - base-role rounds before the switch (1 or more; "
                         "blank = native default 1)",
-                        current="" if node is None or node.kind != "scalar" else str(node.value)).strip()
+                        current="" if is_null(node) or node.kind != "scalar" else str(node.value)).strip()
         if answer and not re.fullmatch(r"[1-9][0-9]{0,3}", answer):
             raise ConfigError("invalid after_round " + repr(answer) + ": use a whole number from 1 to 9999, or "
                               "leave it blank for the native default 1")
@@ -834,13 +834,13 @@ def edit_auto_fix(text, target):
     current = mapping(document, ("auto_fix",))
     knobs = {}
     for step, default in AUTO_FIX.items():
-        if step == "ci" and "babysit" in current:
+        if step == "ci" and is_null(current.get("ci")) and "babysit" in current:
             print("auto_fix.babysit (legacy ci) is set; rename it to ci in " + str(target) + " to edit it here.")
             continue
         node = current.get(step)
         answer = mf.gum("input", "auto_fix." + step + ": max automatic fix attempts (0 disables; blank = native "
                         "default " + str(default) + ")",
-                        current="" if node is None or node.kind != "scalar" else str(node.value)).strip()
+                        current="" if is_null(node) or node.kind != "scalar" else str(node.value)).strip()
         if answer and not re.fullmatch(r"0|[1-9][0-9]{0,3}", answer):
             raise ConfigError("invalid auto_fix." + step + " " + repr(answer) + ": use a whole number from 0 to "
                               "9999, or leave it blank for the native default")
@@ -897,11 +897,16 @@ def validate_natively(original, candidate):
         print("Native check: the installed No-Mistakes loads the edited config.")
         if not detail.startswith("✓"):
             print("Native doctor also reported (environment readiness, not blocking this save): " + detail)
-    elif native_load(original)[0] is False:
-        print("Note: the installed No-Mistakes already rejected this config before the edit (" + detail + "). The "
-              "edit passed nm-config's checks; fix the reported fields in YAML yourself (make doctor shows them).")
     else:
-        raise ConfigError("the installed No-Mistakes rejects the edited config (" + detail + "); nothing was saved")
+        original_loaded, original_detail = native_load(original)
+        # Targeted edits can move an existing YAML error to another line. Compare the full diagnostic
+        # apart from those locations, so a different native rejection cannot use the recovery exception.
+        identity = lambda message: re.sub(r"\bline [0-9]+:", "line:", message)
+        if original_loaded is False and identity(detail) == identity(original_detail):
+            print("Note: the installed No-Mistakes already rejected this config before the edit (" + detail + "). The "
+                  "edit passed nm-config's checks; fix the reported fields in YAML yourself (make doctor shows them).")
+        else:
+            raise ConfigError("the installed No-Mistakes rejects the edited config (" + detail + "); nothing was saved")
 
 
 def save(link, target, before, text):
