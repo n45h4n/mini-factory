@@ -487,8 +487,9 @@ review_agents:
   link, a regular file, a link to an unrelated file (such as a dotfiles config),
   the runtime copy, or another clone, and names the fix. Edits are small line
   changes; comments, unknown and prerelease fields stay. A YAML form it cannot
-  change safely (flow mappings, anchors, block scalars, tabs, ...) is refused
-  for that setting; edit it by hand. Nothing is written until you confirm the
+  change safely (flow mappings, anchors, block scalars, ...) is refused for
+  that setting; tabs, CRLF line endings, directives, or document markers other
+  than one leading `---` make it refuse the whole file. Edit those by hand. Nothing is written until you confirm the
   diff. Cancelling, invalid input, or a native load rejection changes nothing.
   Before saving, the installed No-Mistakes loads the candidate in a disposable
   `NM_HOME`; unrelated daemon, login, or agent readiness problems are reported
