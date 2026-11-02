@@ -404,10 +404,10 @@ install_github_cli_ubuntu() {
 }
 
 # Newer Ubuntu releases carry Gum in universe; older ones use Charm's official apt repository.
+# madison lists only repository-provided versions, unlike policy's Candidate, which can be
+# an installed-only version whose repository was removed.
 gum_in_ubuntu_archive() {
-	local candidate
-	candidate="$(apt-cache policy gum 2>/dev/null | awk '$1 == "Candidate:" { print $2; exit }')"
-	[ -n "$candidate" ] && [ "$candidate" != '(none)' ]
+	[ -n "$(apt-cache madison gum 2>/dev/null)" ]
 }
 
 install_gum_ubuntu() {

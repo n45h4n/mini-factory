@@ -184,11 +184,18 @@ elif name == "gum":
     else:
         fail()
 elif name == "apt-cache":
-    if args != ["policy", "gum"]:
+    archive = os.environ.get("MOCK_APT_GUM") == "archive"
+    installed = (root / "gum").exists()
+    # Newer Ubuntu releases carry gum in universe; older archives list no repository version.
+    if args == ["madison", "gum"]:
+        if archive:
+            print("       gum |   0.17.0-1 | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
+    elif args == ["policy", "gum"]:
+        # Like APT, policy's Candidate may be an installed-only version whose repository was removed.
+        print("gum:\n  Installed: " + ("0.17.0-1" if installed else "(none)") + "\n  Candidate: "
+              + ("0.17.0-1" if archive or installed else "(none)") + "\n  Version table:")
+    else:
         fail()
-    # Newer Ubuntu releases carry gum in universe; older archives have no candidate.
-    if os.environ.get("MOCK_APT_GUM") == "archive":
-        print("gum:\n  Installed: (none)\n  Candidate: 0.17.0-1\n  Version table:")
 elif name == "acpx":
     if args == ["--version"]:
         print("0.20.0")
@@ -2230,6 +2237,22 @@ os.execv(executable, [executable, *args])
                     self.assertTrue(charm and downloads)
                     self.assertIn(["apt-get", "update"], actions)
                 self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_installed_only_gum_is_repaired_from_charm_repository(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        # A broken gum whose repository was removed has no archive version to reinstall from.
+        if (self.mock / "gum-repaired").exists():
+            (self.mock / "gum-repaired").unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64", MOCK_GUM="broken")
+        self.assert_success(result)
+        self.assertIn("is not in your configured Ubuntu archive", result.stdout)
+        actions = [c["args"] for c in self.calls("sudo")]
+        self.assertTrue([args for args in actions if "/etc/apt/sources.list.d/charm.list" in args])
+        self.assertIn(["apt-get", "update"], actions)
+        self.assertEqual(actions[-1], ["apt-get", "install", "-y", "--reinstall", "--no-install-recommends", "gum"])
+        self.assert_no_actions(allow_onboarding=True)
 
 
 if __name__ == "__main__":
