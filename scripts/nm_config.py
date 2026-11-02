@@ -641,7 +641,7 @@ def show(link, target, document):
     print("Auto-fix (auto_fix): max automatic fix attempts per step, not guaranteed passes; 0 disables.")
     children, problem = safe(mapping, document, ("auto_fix",))
     for step, default in AUTO_FIX.items() if problem is None else ():
-        legacy = step == "ci" and step not in children and "babysit" in children
+        legacy = step == "ci" and is_null(children.get(step)) and "babysit" in children
         key = "babysit" if legacy else step
         line("  " + step + ": ", lambda: ("unset - native default (" + str(default) + " in v1.84.0)")
              if is_null(children.get(key)) else str(scalar(children[key], ("auto_fix", key)))

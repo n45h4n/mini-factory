@@ -2386,6 +2386,29 @@ os.execv(executable, [executable, *args])
         self.assertFalse(self.calls("gum"))
         self.assertFalse(self.calls("no-mistakes"))
 
+    def test_nm_config_show_resolves_null_ci_to_legacy_babysit(self):
+        values = (None, "", "~", "null", "Null", "NULL", "0", "2")
+        for ci in values:
+            for babysit in values:
+                with self.subTest(ci=ci, babysit=babysit):
+                    config = "agent: codex\nauto_fix:\n  review: 1\n"
+                    for key, value in (("ci", ci), ("babysit", babysit)):
+                        if value is not None:
+                            config += "  " + key + ": " + value + "\n"
+                    source = self.nm_link(config)
+                    result = self.nm_config("show")
+                    self.assert_success(result)
+                    if ci in ("0", "2"):
+                        expected = ci
+                    elif babysit in ("0", "2"):
+                        expected = babysit + " (legacy auto_fix.babysit)"
+                    else:
+                        expected = "unset - native default (3 in v1.84.0)"
+                    self.assertIn("  ci: " + expected, result.stdout.splitlines())
+                    self.assertEqual(source.read_bytes(), config.encode())
+        self.assertFalse(self.calls("gum"))
+        self.assertFalse(self.calls("no-mistakes"))
+
     def test_nm_config_edits_review_roles_and_budgets_and_preserves_unrelated_yaml(self):
         customized = ("agent: codex # my pipeline choice\n"
                       "auto_fix:\n  review: 1 # keep reviews short\n  ci: 3\n  document: 2\n"
