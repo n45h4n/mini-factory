@@ -547,6 +547,9 @@ def profile(document, harness):
     for key in (harness, alias):
         if key is not None:
             children = mapping(document, ("agent_config", key))
+            for knob in ("model", "effort"):
+                if knob in children:
+                    scalar(children[knob], ("agent_config", key, knob))  # a list/mapping is not unset
             if any(filled(children.get(knob)) for knob in ("model", "effort")):
                 return key, children
     return None, {}
@@ -838,12 +841,14 @@ def edit_auto_fix(text, target):
             print("auto_fix.babysit (legacy ci) is set; rename it to ci in " + str(target) + " to edit it here.")
             continue
         node = current.get(step)
-        answer = mf.gum("input", "auto_fix." + step + ": max automatic fix attempts (0 disables; blank = native "
-                        "default " + str(default) + ")",
-                        current="" if is_null(node) or node.kind != "scalar" else str(node.value)).strip()
+        # Clearing an explicit ci exposes a non-null legacy babysit natively, not the native default.
+        legacy = step == "ci" and not is_null(current.get("babysit"))
+        blank = "clear ci; legacy auto_fix.babysit then applies" if legacy else "native default " + str(default)
+        answer = mf.gum("input", "auto_fix." + step + ": max automatic fix attempts (0 disables; blank = " + blank
+                        + ")", current="" if is_null(node) or node.kind != "scalar" else str(node.value)).strip()
         if answer and not re.fullmatch(r"0|[1-9][0-9]{0,3}", answer):
             raise ConfigError("invalid auto_fix." + step + " " + repr(answer) + ": use a whole number from 0 to "
-                              "9999, or leave it blank for the native default")
+                              "9999, or leave it blank (" + blank + ")")
         knobs[step] = int(answer) if answer else None
     return apply(text, ("auto_fix",), knobs)
 

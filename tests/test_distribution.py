@@ -2471,6 +2471,25 @@ os.execv(executable, [executable, *args])
                 self.assertEqual(self.prompt("auto_fix.ci:")[2], "")
                 self.assertEqual(source.read_text(), config.replace("ci: " + value, "ci: 4", 1))
 
+    def test_nm_config_ci_prompt_says_clearing_ci_exposes_legacy_babysit(self):
+        for babysit, blank in (("5", "blank = clear ci; legacy auto_fix.babysit then applies"),
+                               ("~", "blank = native default 3")):
+            with self.subTest(babysit=babysit):
+                config = "agent: codex\nauto_fix:\n  ci: 0\n  babysit: " + babysit + "\n"
+                source = self.nm_link(config)
+                result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "", "", "", "", NM_MENU["save"], "yes")
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertIn(blank, self.prompt("auto_fix.ci:")[1])
+                # Only the explicit ci is cleared; babysit is kept, so it becomes the effective CI budget.
+                self.assertEqual(source.read_text(), "agent: codex\nauto_fix:\n  babysit: " + babysit + "\n")
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  ci: unset - native default (3 in v1.84.0)", show.stdout.splitlines())
+        source.write_text("agent: codex\nauto_fix:\n  babysit: 5\n")
+        show = self.nm_config("show")
+        self.assertIn("  ci: 5 (legacy auto_fix.babysit)", show.stdout.splitlines())
+
     def test_nm_config_recovery_requires_the_same_native_rejection(self):
         source = self.nm_link(STABLE_DEFAULT)
         result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "3", NM_MENU["save"],
@@ -2614,6 +2633,35 @@ os.execv(executable, [executable, *args])
         self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 3", "review: 2"))
         self.assertEqual(list(source.parent.glob(".config.yaml.nm-config.*")), [])
         self.assert_no_actions()
+
+    def test_nm_config_refuses_non_scalar_agent_config_knobs_without_rewriting_them(self):
+        for knobs, problem in (
+                ("    model:\n      name: gpt-5.4\n    effort: high\n",
+                 "agent_config.codex.model must be one value, not a mapping; fix it in YAML (line 4)"),
+                ("    model: gpt-5.4\n    effort:\n      - high\n",
+                 "agent_config.codex.effort must be one value, not a list; fix it in YAML (line 5)"),
+                ("    effort: [high, low]\n",
+                 "agent_config.codex.effort must be one value, not a list; fix it in YAML (line 4)")):
+            with self.subTest(knobs=knobs):
+                config = "agent: codex\nagent_config:\n  codex:\n" + knobs + "auto_fix:\n  review: 3\n"
+                source = self.nm_link(config)
+                show = self.nm_config("show")
+                self.assert_success(show)
+                line = next(line for line in show.stdout.splitlines() if line.startswith("  Codex: "))
+                self.assertIn("agent_config unreadable (" + problem + ")", line)
+                self.assertNotIn("native default", line)
+                result, remaining = self.edit_nm(NM_MENU["agent_config"], "Codex", NM_MENU["save"])
+                self.assert_success(result)
+                self.assertEqual(remaining, [])
+                self.assertIn("nm-config cannot safely edit Harness model/effort defaults (agent_config): " + problem,
+                              result.stdout)
+                self.assertIn("No change; nothing was saved.", result.stdout)
+                self.assertEqual(source.read_text(), config)
+        # Empty and null scalars remain native defaults.
+        self.nm_link("agent: codex\nagent_config:\n  codex:\n    model:\n    effort: ~\n")
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("  Codex: model: native default; effort: native default", show.stdout.splitlines())
 
     def test_nm_config_refuses_unsafe_yaml_per_edit_without_rewriting_it(self):
         config = ("agent: [codex, claude]\n"
