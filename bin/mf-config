@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+	printf 'mf-config: %s\n' "$*" >&2
+	exit 1
+}
+
+# Resolve links with BSD-compatible readlink; macOS system Bash has no realpath.
+launcher="${BASH_SOURCE[0]}"
+link_count=0
+while [ -L "$launcher" ]; do
+	link_count=$((link_count + 1))
+	[ "$link_count" -le 40 ] || die 'launcher symlink loop'
+	launcher_directory="$(cd -P "$(dirname "$launcher")" && pwd -P)"
+	link_target="$(readlink "$launcher")" || die 'unable to resolve launcher link'
+	case "$link_target" in
+		/*) launcher="$link_target" ;;
+		*) launcher="$launcher_directory/$link_target" ;;
+	esac
+done
+bundle="$(cd -P "$(dirname "$launcher")/.." && pwd -P)" || die 'unable to resolve the mini-factory bundle'
+[ -r "$bundle/scripts/mf_config.py" ] || die "missing helper: $bundle/scripts/mf_config.py"
+command -v python3 >/dev/null 2>&1 || die 'python3 >= 3.9 is required; run make setup'
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die 'python3 >= 3.9 is required; run make setup'
+exec python3 -I -B "$bundle/scripts/mf_config.py" "$@"
