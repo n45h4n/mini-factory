@@ -215,10 +215,15 @@ class Document:
         if "\r" in text:
             raise Unsafe("carriage returns (CRLF line endings)")
         self.text, self.lines, self.content = text, text.split("\n"), []
+        start = True
         for number, line in enumerate(self.lines):
             body = line.lstrip(" ")
             if not line.strip() or body.startswith("#"):
                 continue
+            if start and re.fullmatch(r"---(?:[ \t]+#.*)?[ \t]*", line):
+                start = False
+                continue
+            start = False
             if body[0] == "\t":
                 raise Unsafe("tab indentation", number)
             if re.match(r"(?:---|\.\.\.)(?:\s|$)|%", line):
@@ -328,6 +333,14 @@ def mapping(document, path):
     if node is not None and node.kind not in ("map", "null"):
         raise Unsafe(dotted(path[:len(path) - len(missing)]) + " is not a plain mapping", node.line)
     return {} if missing else node.children
+
+
+def scalar(node, path):
+    """The value of a one-line setting; Unsafe when a list or mapping stands where one value belongs."""
+    if node.kind in ("list", "map"):
+        raise Unsafe(dotted(path) + " must be one value, not a " + ("list" if node.kind == "list" else "mapping")
+                     + "; fix it in YAML", node.line)
+    return node.value
 
 
 def render(value):
@@ -572,7 +585,7 @@ def pipeline_text(document):
         return "unset - native default auto"
     if node.kind == "list":
         return "ordered fallback list " + ", ".join(map(str, node.value)) + " (first available entry runs)"
-    return str(node.value)
+    return str(scalar(node, ("agent",)))
 
 
 def role_text(document, role, pipeline):
@@ -582,14 +595,16 @@ def role_text(document, role, pipeline):
         if base != role:
             return "none - every round uses the " + base
         return "no override - uses the pipeline agent (" + pipeline + ") with its agent_config"
-    harness = children["agent"].value if "agent" in children else None
+    values = {key: scalar(node, ("review_agents", role, key)) for key, node in children.items()
+              if key in ("agent", "model", "effort", "after_round")}
+    harness = values.get("agent")
     if not harness:
         return "no agent set (No-Mistakes requires one; fix it in YAML)"
     text = label(harness) + " - " + knob_text(document, harness, children)
     if base != role:
-        after = children["after_round"].value if "after_round" in children else 1
+        after = values.get("after_round", 1)
         text += ("; from round " + str(after + 1) + " (after_round: " + str(after) + "; rounds 1-" + str(after)
-                 + " use the " + base + ")") if isinstance(after, int) else "; after_round: " + str(after)
+                 + " use the " + base + ")") if type(after) is int else "; after_round: " + str(after)
     return text
 
 
@@ -610,7 +625,7 @@ def show(link, target, document):
     print("Harness model/effort defaults (agent_config):"
           + (" none (each harness keeps its native defaults)" if defaults == {} else ""))
     for harness in defaults or {}:
-        print("  " + label(harness) + ": " + knob_text(document, harness))
+        line("  " + label(harness) + ": ", knob_text, document, harness)
     if problem:
         print("  cannot display safely (" + problem + "); see the YAML")
     print("Review phase (review_agents): one native Review step repeats review/fix rounds. These roles serve only")
@@ -620,16 +635,16 @@ def show(link, target, document):
     print("Auto-fix (auto_fix): max automatic fix attempts per step, not guaranteed passes; 0 disables.")
     children, problem = safe(mapping, document, ("auto_fix",))
     for step, default in AUTO_FIX.items() if problem is None else ():
-        node = children.get(step)
-        legacy = step == "ci" and node is None and "babysit" in children
-        node = children["babysit"] if legacy else node
-        print("  " + step + ": " + (("unset - native default (" + str(default) + " in v1.84.0)") if node is None
-                                   else str(node.value) + (" (legacy auto_fix.babysit)" if legacy else "")))
+        legacy = step == "ci" and step not in children and "babysit" in children
+        key = "babysit" if legacy else step
+        line("  " + step + ": ", lambda: ("unset - native default (" + str(default) + " in v1.84.0)")
+             if key not in children else str(scalar(children[key], ("auto_fix", key)))
+             + (" (legacy auto_fix.babysit)" if legacy else ""))
     if problem:
         print("  cannot display safely (" + problem + "); see the YAML")
     line("Fixer session reuse (session_reuse): ",
          lambda: "unset - native default (true in v1.84.0)" if document.get(("session_reuse",)) is None
-         else str(document.get(("session_reuse",)).value).lower())
+         else str(scalar(document.get(("session_reuse",)), ("session_reuse",))).lower())
     overrides, problem = safe(mapping, document, ("agent_args_override",))
     if overrides or problem:
         print("Native argument overrides (agent_args_override) win over agent_config and review_agents:")
@@ -794,7 +809,8 @@ def edit_role(text, target, role):
     if overlay:
         node = current.get("after_round")
         answer = mf.gum("input", dotted(path) + ": after_round - base-role rounds before the switch (1 or more; "
-                        "blank = native default 1)", current="" if node is None else str(node.value)).strip()
+                        "blank = native default 1)",
+                        current="" if node is None or node.kind != "scalar" else str(node.value)).strip()
         if answer and not re.fullmatch(r"[1-9][0-9]{0,3}", answer):
             raise ConfigError("invalid after_round " + repr(answer) + ": use a whole number from 1 to 9999, or "
                               "leave it blank for the native default 1")
@@ -817,7 +833,8 @@ def edit_auto_fix(text, target):
             continue
         node = current.get(step)
         answer = mf.gum("input", "auto_fix." + step + ": max automatic fix attempts (0 disables; blank = native "
-                        "default " + str(default) + ")", current="" if node is None else str(node.value)).strip()
+                        "default " + str(default) + ")",
+                        current="" if node is None or node.kind != "scalar" else str(node.value)).strip()
         if answer and not re.fullmatch(r"0|[1-9][0-9]{0,3}", answer):
             raise ConfigError("invalid auto_fix." + step + " " + repr(answer) + ": use a whole number from 0 to "
                               "9999, or leave it blank for the native default")

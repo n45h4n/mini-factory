@@ -2506,8 +2506,9 @@ os.execv(executable, [executable, *args])
         self.assertIn("  cannot display safely (a top-level merge key (<<) (line 1)); see the YAML", show.stdout)
         self.assertNotIn("test: unset", show.stdout)
         # A file whose structure nm-config cannot read is never edited; both modes explain why.
-        for content in ("agent: codex\r\nauto_fix:\r\n  review: 3\r\n", "---\nagent: codex\n",
-                        "agent: codex\nagent: claude\n", "auto_fix:\n\treview: 3\n"):
+        for content in ("agent: codex\r\nauto_fix:\r\n  review: 3\r\n", "---\nagent: codex\n---\nagent: pi\n",
+                        "%YAML 1.2\n---\nagent: codex\n", "agent: codex\nagent: claude\n",
+                        "auto_fix:\n\treview: 3\n"):
             with self.subTest(content=content):
                 source.write_bytes(content.encode())
                 result = self.nm_config("show")
@@ -2518,6 +2519,51 @@ os.execv(executable, [executable, *args])
                 self.assertIn("nothing was changed", result.stdout)
                 self.assertFalse(self.calls("gum"))
                 self.assertEqual(source.read_bytes(), content.encode())
+
+    def test_nm_config_keeps_a_leading_document_start_marker(self):
+        config = "# globals\n--- # start\nagent: codex\nauto_fix:\n  review: 3\n"
+        source = self.nm_link(config)
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertIn("Pipeline agent (agent): codex", show.stdout)
+        self.assertIn("  review: 3", show.stdout)
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "", "", "", NM_MENU["save"], "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(source.read_text(), config.replace("review: 3", "review: 2"))
+
+    def test_nm_config_show_explains_lists_and_mappings_where_one_value_belongs(self):
+        config = ("agent:\n  name: codex\n"
+                  "review_agents:\n  reviewer:\n    agent: [codex, claude]\n"
+                  "  fixer_after_round:\n    agent: claude\n    after_round:\n      n: 2\n"
+                  "auto_fix:\n  review:\n    max: 2\n  test: 4\n"
+                  "session_reuse: [true]\n")
+        source = self.nm_link(config)
+        show = self.nm_config("show")
+        self.assert_success(show)
+        self.assertNotIn("None", show.stdout)
+        for expected in (
+                "Pipeline agent (agent): cannot display safely (agent must be one value, not a mapping; fix it in "
+                "YAML (line 1)); see the YAML",
+                "  Reviewer: cannot display safely (review_agents.reviewer.agent must be one value, not a list; fix "
+                "it in YAML (line 5)); see the YAML",
+                "  Later-round fixer: cannot display safely (review_agents.fixer_after_round.after_round must be "
+                "one value, not a mapping; fix it in YAML (line 8)); see the YAML",
+                "  review: cannot display safely (auto_fix.review must be one value, not a mapping; fix it in YAML "
+                "(line 11)); see the YAML",
+                "  test: 4",
+                "Fixer session reuse (session_reuse): cannot display safely (session_reuse must be one value, not a "
+                "list; fix it in YAML (line 14)); see the YAML"):
+            self.assertIn(expected, show.stdout)
+        # The editor opens with the same explanation, and refusing the unsafe edit leaves the file untouched.
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "", "2", "4", "", "", NM_MENU["quit"])
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertIn("  Reviewer: cannot display safely", result.stdout)
+        self.assertIn("nm-config cannot safely edit Auto-fix attempts (auto_fix): auto_fix.review holds a mapping or "
+                      "list", result.stdout)
+        self.assertEqual(self.prompt("auto_fix.review: max automatic fix attempts")[2], "")
+        self.assertEqual(source.read_text(), config)
 
     def test_nm_config_follows_acp_alias_profiles_and_combined_codex_pins(self):
         # cursor and acp:cursor share one native profile: prefill and clear the entry that applies.
