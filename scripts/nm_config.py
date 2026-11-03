@@ -1022,8 +1022,8 @@ def edit():
 def daemon_path():
     """The PATH stable No-Mistakes (v1.84.0 shellenv) gives its daemon and agents: the user service starts with
     the fixed well-known directories, probes the login shell (interactive for bash/zsh, where nvm and fnm are
-    usually sourced) for its environment, and appends any well-known directory the shell PATH lacks. When the
-    probe fails, only the well-known directories remain."""
+    usually sourced) for its environment, allowing it shellenv's 30 seconds, and appends any well-known directory
+    the shell PATH lacks. When the probe fails, only the well-known directories remain."""
     home = os.environ.get("HOME") or str(Path.home())
     known = [os.path.join(home, name) for name in (".local/bin", "go/bin", ".cargo/bin", "bin")] + [
         "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin", "/usr/bin", "/bin",
@@ -1046,7 +1046,7 @@ def daemon_path():
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    start_new_session=True)
         try:
-            out = process.communicate(timeout=10)[0]
+            out = process.communicate(timeout=30)[0]
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)

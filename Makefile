@@ -2,7 +2,7 @@
 
 .PHONY: help setup update doctor test
 help:
-	@printf '%s\n' 'make setup   Install or update the runtime and guide authentication (ISSUE_AGENT=, PR_REVIEW_AGENT=claude|codex|cursor)' 'make update  From this clone on main: fast-forward, offer consented native tool upgrades, rerun setup and doctor' 'make doctor  Check installation, authentication, and current Herdr context' 'make test    Run isolated tests with mocked external tools'
+	@printf '%s\n' 'make setup   Install or update the runtime and guide authentication (ISSUE_AGENT=claude|codex|cursor, PR_REVIEW_AGENT=claude|codex|cursor)' 'make update  From this clone on main: fast-forward, offer consented native tool upgrades, rerun setup and doctor' 'make doctor  Check installation, authentication, and current Herdr context' 'make test    Run isolated tests with mocked external tools'
 
 setup:
 	@./scripts/setup.sh

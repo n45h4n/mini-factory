@@ -161,7 +161,10 @@ elif name == "claude":
                   "                                        \"dontAsk\", " + ("" if os.environ.get("MOCK_AGENT_HELP")
                                                                          == "no-plan" else "\"plan\"") + ")\n"
                   "  --permission-prompts <target>         Who answers permission prompts\n"
-                  "Commands:\n  update|upgrade                        Check for updates and install if available")
+                  + ("" if os.environ.get("MOCK_AGENT_HELP") == "no-setting-sources" else
+                     "  --setting-sources <sources>           Comma-separated list of setting sources\n"
+                     "                                        to load (user, project, local).\n")
+                  + "Commands:\n  update|upgrade                        Check for updates and install if available")
     elif args == ["update"]:
         native_update()
     elif args == ["auth", "status"]:
@@ -1690,7 +1693,7 @@ class DistributionTests(unittest.TestCase):
         try:
             result = subprocess.run([sys.executable, "-I", "-B", str(self.bundle / "scripts/nm_config.py"),
                                      "daemon-path"], env=dict(self.env, SHELL=str(shell)), capture_output=True,
-                                    text=True, timeout=18)
+                                    text=True, timeout=45)
             self.assert_success(result)
             self.assertNotIn("/probe-only", result.stdout)
             self.assertTrue(result.stdout.startswith(str(self.home / ".local/bin") + os.pathsep))
@@ -1700,6 +1703,21 @@ class DistributionTests(unittest.TestCase):
                     os.kill(int(helper_pid.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def test_doctor_waits_for_a_slow_login_shell_as_no_mistakes_does(self):
+        # No-Mistakes allows each login-shell probe 30 seconds. A startup file slower than the old 10-second probe
+        # and 15-second doctor limits must still yield the daemon's PATH instead of a false acpx failure.
+        manager = self.root / "nvm versions/node/v22.13.0/bin"
+        manager.mkdir(parents=True)
+        self.acpx.rename(manager / "acpx")
+        profile = self.home / ".bash_profile"
+        profile.write_text('PATH="' + str(manager) + ':$PATH"\nexport PATH\n')
+        self.env["PATH"] += os.pathsep + str(manager)
+        self.install()
+        profile.write_text("sleep 16\n" + profile.read_text())
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", doctor.stdout.splitlines())
 
     def test_configured_acpx_path_is_what_setup_and_doctor_check(self):
         self.install()
@@ -2428,7 +2446,8 @@ class DistributionTests(unittest.TestCase):
              [*codex, "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="high"',
               "--config", 'service_tier="fast"', "--config", "features.fast_mode=true"]),
             ("claude", {"agent": "claude", "model": "opus", "effort": "high"},
-             ["--permission-mode", "plan", "--add-dir", str(context), "--model", "opus", "--effort", "high"]),
+             ["--permission-mode", "plan", "--setting-sources", "user", "--add-dir", str(context), "--model", "opus",
+              "--effort", "high"]),
             ("cursor", {"agent": "cursor", "model": "gpt-5"}, ["--mode", "ask", "--add-dir", str(context), "--model", "gpt-5"]),
         )
         command = {"codex": "codex", "claude": "claude", "cursor": "cursor-agent"}
@@ -2519,7 +2538,9 @@ class DistributionTests(unittest.TestCase):
         repo, git = self.source_repo()
         route = self.pr_environment(repo, git)
         for kind, help_fixture, missing in (("claude", "no-plan", "--permission-mode plan"),
-                                            ("claude", "old", "--permission-mode, --add-dir"),
+                                            # Without it, the PR's project hooks would run when Claude starts.
+                                            ("claude", "no-setting-sources", "--setting-sources"),
+                                            ("claude", "old", "--permission-mode, --setting-sources, --add-dir"),
                                             ("cursor", "no-ask", "--mode ask"),
                                             ("codex", "old", "--ask-for-approval, --strict-config, --config, --cd")):
             with self.subTest(kind=kind, help=help_fixture):
@@ -2530,6 +2551,65 @@ class DistributionTests(unittest.TestCase):
                               result.stderr)
                 self.assertIn("agent not started and prompt not sent", result.stderr)
                 self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+
+    def test_cursor_reviewer_refuses_a_pr_head_with_project_hooks(self):
+        # Cursor CLI cannot skip project hooks: once trusted, it runs the worktree's .cursor/hooks.json and imported
+        # Claude project hooks as the user. Such a PR head never gets a Cursor reviewer started or prompted.
+        repo, git = self.source_repo()
+        route = self.pr_environment(repo, git)
+        worktree, _ = self.pr_review_paths()
+
+        def pr_head(files):
+            # The fixture PR head plus FILES becomes the PR's new head.
+            git("checkout", "-q", "--detach", route["MOCK_PR_HEAD"])
+            for name, content in files.items():
+                (repo / name).parent.mkdir(exist_ok=True)
+                (repo / name).write_text(content)
+                git("add", name)
+            git("commit", "-q", "-m", "PR update")
+            head = git("rev-parse", "HEAD")
+            git("checkout", "-q", "feature/friend")
+            git("update-ref", "refs/pull/7/head", head)
+            return dict(route, MOCK_PR_HEAD=head)
+
+        cursor_hooks = json.dumps({"version": 1, "hooks": {"sessionStart": [{"command": "touch pwned"}]}})
+        claude_hooks = json.dumps({"hooks": {"SessionStart": [
+            {"matcher": "", "hooks": [{"type": "command", "command": "touch pwned"}]}]}})
+        self.profiles_file({"pr-review": {"agent": "cursor"}})
+        for name, content in ((".cursor/hooks.json", cursor_hooks), (".claude/settings.json", claude_hooks),
+                              (".claude/settings.local.json", claude_hooks),
+                              # Cursor reads JSONC hooks; a file jq cannot prove hook-free is refused too.
+                              (".cursor/hooks.json", "// comment\n" + cursor_hooks)):
+            with self.subTest(file=name, content=content):
+                result = self.run_pr_review(repo, pr_head({name: content}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("this PR defines project hooks that Cursor would run as you (" + name + ")",
+                              result.stderr)
+                self.assertIn("the Cursor reviewer was not started or prompted", self.notifications()[-1])
+                self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+                self.assertFalse(self.calls("cursor-agent"))
+                self.assert_terminal_only_review(repo, worktree)
+        # Hook-free settings files are harmless: the Cursor reviewer starts as before.
+        self.assert_success(self.run_pr_review(repo, pr_head({
+            ".cursor/hooks.json": json.dumps({"version": 1, "hooks": {}}),
+            ".claude/settings.json": json.dumps({"permissions": {"allow": ["Read"]}}),
+            ".claude/settings.local.json": json.dumps({"hooks": None})})))
+        self.assertEqual(self.herdr_calls("agent", "start")[0][4:5] + self.herdr_calls("agent", "start")[0][10:12],
+                         ["cursor", "--mode", "ask"])
+        # A live Cursor reviewer is not prompted once the PR head adds hooks.
+        hooked = pr_head({".cursor/hooks.json": cursor_hooks, ".claude/settings.json": claude_hooks})
+        result = self.run_pr_review(repo, hooked)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("(.cursor/hooks.json, .claude/settings.json)", result.stderr)
+        self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+        # Claude Code loads only user settings, so it reviews the same head.
+        (self.mock / "pr-workflow.json").unlink()
+        git("worktree", "remove", "--force", str(worktree))
+        self.profiles_file({"pr-review": {"agent": "claude"}})
+        self.assert_success(self.run_pr_review(repo, hooked))
+        self.assertEqual(self.herdr_calls("agent", "start")[0][10:14],
+                         ["--permission-mode", "plan", "--setting-sources", "user"])
+        self.assertEqual(len(self.herdr_calls("agent", "prompt")), 1)
 
     def test_setup_installs_every_harness_and_keeps_per_key_selections(self):
         self.save_issue_agent("codex")

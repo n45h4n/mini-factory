@@ -4,7 +4,7 @@
 git clone https://github.com/n45h4n/mini-factory.git
 cd mini-factory
 make setup ISSUE_AGENT=codex   # or claude, or cursor
-# Optional: the PRs I reviewer too, for example Cursor for every role:
+# Optional: also choose the PRs I reviewer, for example Cursor for every role:
 # make setup ISSUE_AGENT=cursor PR_REVIEW_AGENT=cursor
 ```
 
@@ -411,8 +411,18 @@ read-only mode:
 | Reviewer | Native read-only launch |
 | -------- | ----------------------- |
 | Codex | `--ask-for-approval never --strict-config --cd WORKTREE` with a launch-scoped `:read-only` permission profile and no network |
-| Claude Code | `--permission-mode plan` (Plan mode), `--add-dir` for the diff |
+| Claude Code | `--permission-mode plan` (Plan mode), `--setting-sources user`, `--add-dir` for the diff |
 | Cursor | `--mode ask` (Ask mode), `--add-dir` for the diff |
+
+The PR author controls the review worktree's project settings, which can run
+commands as you when an agent starts. Claude Code therefore loads only your user
+settings (your Herdr hooks still run), never the PR's `.claude/settings.json`,
+`.claude/settings.local.json`, or `.mcp.json` servers. Cursor CLI has no option
+to skip project hooks: once you trust the worktree, it runs `.cursor/hooks.json`
+and Claude project hooks from those two settings files. PR `I` therefore refuses
+to start or prompt a Cursor reviewer when the PR head defines hooks there; pick
+Codex or Claude Code for that PR with `mf-config`. Cursor still asks before
+starting project MCP servers; decline them in the pane.
 
 The prompt asks for concise, actionable findings ordered by severity with
 file/line references, or an explicit "no actionable findings", **in the
@@ -805,7 +815,11 @@ No-Mistakes v1.84.0 updater source, on 2026-11-02; and the selectable read-only
 PR reviewer against the native help of Codex CLI 0.166.0 (including a local
 `codex sandbox` check of the no-network `:read-only` profile), Claude Code
 2.1.317 (`--permission-mode plan`, `--add-dir`), and Cursor CLI 2026.10.22
-(`--mode ask`, `--add-dir`) on 2026-11-02. Mocked
+(`--mode ask`, `--add-dir`) on 2026-11-02; and, with local hook fixtures on
+2026-11-03, that Claude Code 2.1.317 with `--setting-sources user` skips project
+and local hooks and `.mcp.json` servers while running user hooks, and that
+trusted Cursor CLI 2026.10.22 Ask mode runs `.cursor/hooks.json` and Claude
+project hooks. Mocked
 macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those

@@ -1383,6 +1383,24 @@ if [ "$agent_present" -eq 1 ]; then
 	esac
 fi
 
+# Cursor CLI has no option to skip project hooks: once its workspace trust is accepted, it runs the worktree's
+# .cursor/hooks.json and imported Claude project hooks as you. A PR head that defines any (or whose file is not
+# plain hook-free JSON) gets no Cursor reviewer started or prompted; hook-free settings files are fine.
+if [ "$reviewer_kind" = cursor ]; then
+	project_hook_files=
+	for project_hook_file in .cursor/hooks.json .claude/settings.json .claude/settings.local.json; do
+		project_hook_path="$worktree_root/$project_hook_file"
+		[ -e "$project_hook_path" ] || [ -L "$project_hook_path" ] || continue
+		if [ -L "$project_hook_path" ] || [ ! -f "$project_hook_path" ] ||
+			! jq -e -s 'length == 1 and ((.[0].hooks // {}) | type == "object" and length == 0)' \
+				"$project_hook_path" >/dev/null 2>&1; then
+			project_hook_files="$project_hook_files, $project_hook_file"
+		fi
+	done
+	[ -z "$project_hook_files" ] ||
+		die "this PR defines project hooks that Cursor would run as you (${project_hook_files#, }), and Cursor CLI cannot skip them; the Cursor reviewer was not started or prompted. Review this PR with Codex or Claude Code instead: choose it with mf-config (and exit any open Cursor reviewer in its pane), then press I"
+fi
+
 # The full diff is handed off in a private file outside the worktree, so the worktree stays clean and
 # reviewers whose read-only mode cannot run shell commands can still read it.
 review_context_root="$state_root/contexts"
@@ -1401,6 +1419,8 @@ fi
 if [ "$agent_present" -eq 0 ]; then
 	# Native interactive read-only modes. Codex gets a launch-scoped read-only permission profile without
 	# network access; Claude Code starts in Plan mode and Cursor in Ask mode, each with read access to the diff.
+	# The PR author controls the worktree's project settings, so Claude Code loads only user settings (your
+	# Herdr hooks) and never the worktree's .claude/settings*.json hooks or .mcp.json servers.
 	case "$reviewer_kind" in
 	codex)
 		reviewer_args=(
@@ -1411,7 +1431,7 @@ if [ "$agent_present" -eq 0 ]; then
 			--config 'permissions.gh_dash_pr_review={extends=":read-only"}'
 		)
 		;;
-	claude) reviewer_args=(--permission-mode plan --add-dir "$review_context_directory") ;;
+	claude) reviewer_args=(--permission-mode plan --setting-sources user --add-dir "$review_context_directory") ;;
 	cursor) reviewer_args=(--mode ask --add-dir "$review_context_directory") ;;
 	esac
 	# Only a fresh reviewer reads the saved profile. mf-config first verifies that the installed CLI offers

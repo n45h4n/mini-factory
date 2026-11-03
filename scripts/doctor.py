@@ -11,9 +11,9 @@ import subprocess
 import sys
 
 
-def output(argv, environment=None):
+def output(argv, environment=None, timeout=15):
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=15, env=environment)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=environment)
         return result.stdout if result.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -128,7 +128,8 @@ def acpx_executable(config):
 def daemon_path():
     """The PATH the No-Mistakes daemon resolves (login-shell PATH plus SERVICE_PATH), read by the bundled nm-config."""
     helper = Path(__file__).resolve().parent / "nm_config.py"
-    text = output([sys.executable, "-I", "-B", str(helper), "daemon-path"])
+    # Covers the helper's 30-second login-shell probe (as No-Mistakes allows) plus its bounded 5-second cleanup.
+    text = output([sys.executable, "-I", "-B", str(helper), "daemon-path"], timeout=45)
     return text.strip() if text and text.strip() else SERVICE_PATH
 
 

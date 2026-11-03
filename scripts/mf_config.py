@@ -45,7 +45,7 @@ SOURCES = {
 # (options that must be offered, option whose help must list the mode, mode).
 REVIEW_MODES = {
     "codex": (("--ask-for-approval", "--strict-config", "--config", "--cd"), None, None),
-    "claude": (("--permission-mode", "--add-dir"), "--permission-mode", "plan"),
+    "claude": (("--permission-mode", "--setting-sources", "--add-dir"), "--permission-mode", "plan"),
     "cursor": (("--mode", "--add-dir"), "--mode", "ask"),
 }
 REVIEW_MODE_NAMES = {"codex": "permission profile :read-only, no network", "claude": "Plan mode", "cursor": "Ask mode"}
