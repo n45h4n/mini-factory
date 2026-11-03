@@ -118,8 +118,8 @@ for command_name in bash tr mkdir chmod nohup stat python3; do
 	command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
 done
 
-dotfiles_directory="${DOTFILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)}"
-helper="$dotfiles_directory/scripts/integrations/gh-dash/gh-dash-codex-issue.sh"
+# The helper is this dispatcher's sibling in its own bundle; an inherited DOTFILES_DIR may name another installation.
+helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/gh-dash-codex-issue.sh"
 [ -f "$helper" ] && [ ! -L "$helper" ] && [ -x "$helper" ] ||
 	die "issue helper is not an executable regular file: $helper"
 if ! helper_syntax_error="$(bash -n "$helper" 2>&1)"; then

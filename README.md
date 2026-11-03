@@ -163,7 +163,10 @@ None of these needs Node/npm. No-Mistakes runs Cursor (`cursor` or
   `~/.local/bin`, `~/go/bin`, `~/.cargo/bin`, `~/bin`, `/opt/homebrew/bin` and
   `sbin`, `/usr/local/bin` and `sbin`, `/usr/bin`, `/bin`, `/usr/sbin`, and
   `/sbin`. Setup and doctor resolve that PATH the same way and check that
-  `acpx` (and the `node` it starts) runs from it. When the No-Mistakes global
+  `acpx` (and the `node` it starts) runs from it, and that the first `node` on
+  it is 22.13+. That check is separate from the shell Node.js and npm that
+  install acpx: a suitable Node.js in your current shell does not stand in for
+  an older one that the daemon finds first. When the No-Mistakes global
   config sets `acpx_path`, that executable is checked instead and setup never
   installs over it. An `acpx` or Node.js that only your current shell provides
   fails this check with the exact action instead of passing silently.
@@ -404,9 +407,10 @@ PR **I** is an interactive, read-only, terminal-only review. It verifies the
 selected PR's head and base, fetches both (the base without updating any local
 ref), and opens or reuses a clean, detached review worktree at the PR head in
 its own Herdr workspace. It writes the PR's complete diff from the merge base
-(`git diff --stat --patch`) to a private file outside the worktree, then
-starts the `mf-config` reviewer (Codex by default) in its native interactive
-read-only mode:
+(`git diff --stat --patch`) to a private file outside the worktree, named by
+the merge-base and PR-head commits and never rewritten, then starts the
+`mf-config` reviewer (Codex by default) in its native interactive read-only
+mode:
 
 | Reviewer | Native read-only launch |
 | -------- | ----------------------- |
@@ -422,7 +426,15 @@ to skip project hooks: once you trust the worktree, it runs `.cursor/hooks.json`
 and Claude project hooks from those two settings files. PR `I` therefore refuses
 to start or prompt a Cursor reviewer when the PR head defines hooks there; pick
 Codex or Claude Code for that PR with `mf-config`. Cursor still asks before
-starting project MCP servers; decline them in the pane.
+starting project MCP servers; decline them in the pane. Codex loads the
+worktree's `.codex/config.toml` (including MCP servers it starts at launch)
+and `.codex/rules` exec policies (whose allow rules run commands outside the
+sandbox) once the repository is trusted, and a review worktree inherits the
+trust of your main checkout. Its interactive CLI has no option to skip project
+config, so PR `I` refuses to start or prompt a Codex reviewer when the PR head
+has `.codex/config.toml`, `.codex/rules`, or `.codex/hooks.json`, or when
+`.codex` is a symbolic link; pick Claude Code or Cursor for that PR. Other
+`.codex` content, such as skills, does not block Codex.
 
 The prompt asks for concise, actionable findings ordered by severity with
 file/line references, or an explicit "no actionable findings", **in the
@@ -432,7 +444,8 @@ native modes are not hardened OS sandboxes, and an agent may still offer to
 leave its read-only mode (for example Claude Code's plan approval); decline
 that in the pane. A repeated `I` never
 starts a second reviewer: an idle, finished, or working reviewer gets the
-review prompt again with a refreshed diff; a blocked one (for example waiting on
+review prompt again with the current diff in its own file, while diffs from
+earlier prompts stay readable until a fresh reviewer starts; a blocked one (for example waiting on
 a plan or trust prompt) and one with an unknown status are focused instead,
 never typed into. A live reviewer keeps its original harness and options; a new
 `mf-config` choice applies once you exit it in its pane and press `I` again.
@@ -737,8 +750,8 @@ make doctor
 
 Doctor separates **installed**, **authentication/setup pending**, and **ready to
 launch from this context**. It checks the tools and versions above (including
-Gum, all three agent CLIs, Node.js 22.13+, npm, and `acpx` running from the
-No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
+Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
+22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
 effective agent, authentication for the agents a gh-dash role or No-Mistakes
 duty uses, Herdr integrations for the gh-dash roles' agents only, the
 No-Mistakes configuration link, and the pipeline agent's readiness via native
@@ -758,7 +771,8 @@ Dispatcher diagnostics live in
 `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-issue/` (preparation logs
 end in `-prepare.log`; captured intents are in its private `intents/`
 directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`
-(review diffs are in its private `contexts/` directory).
+(review diffs are in its private `contexts/` directory, one
+`pr-MERGE_BASE-HEAD.diff` per reviewed commit pair).
 Preparation keeps its last fetched default-branch commit under
 `refs/gh-dash-issue-prepare/` in the target repository. Dispatch reports the
 relevant log path. Herdr's default-session logs are under
@@ -819,7 +833,11 @@ PR reviewer against the native help of Codex CLI 0.166.0 (including a local
 2026-11-03, that Claude Code 2.1.317 with `--setting-sources user` skips project
 and local hooks and `.mcp.json` servers while running user hooks, and that
 trusted Cursor CLI 2026.10.22 Ask mode runs `.cursor/hooks.json` and Claude
-project hooks. Mocked
+project hooks; and, against the Codex CLI 0.166.0 source and an isolated local
+`codex mcp list` check on 2026-11-03, that a linked worktree of a trusted main
+checkout loads that worktree's `.codex/config.toml` MCP servers and
+`.codex/rules`, while hook declarations come from the main checkout and run
+only with persisted hook trust. Mocked
 macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those

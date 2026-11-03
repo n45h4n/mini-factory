@@ -1383,6 +1383,25 @@ if [ "$agent_present" -eq 1 ]; then
 	esac
 fi
 
+# Codex loads a trusted worktree's .codex/config.toml (including MCP servers it starts as you at launch) and
+# .codex/rules exec policies (allow rules run commands outside the sandbox). A linked worktree inherits its main
+# checkout's trust, and the interactive CLI cannot skip project config. A PR head that defines either, a
+# project hooks file, or a symbolic-link .codex gets no Codex reviewer started or prompted; other .codex
+# content, such as skills, is fine.
+if [ "$reviewer_kind" = codex ]; then
+	project_config_files=
+	if [ -L "$worktree_root/.codex" ]; then
+		project_config_files=', .codex (symbolic link)'
+	else
+		for project_config_file in .codex/config.toml .codex/rules .codex/hooks.json; do
+			[ -e "$worktree_root/$project_config_file" ] || [ -L "$worktree_root/$project_config_file" ] ||
+				continue
+			project_config_files="$project_config_files, $project_config_file"
+		done
+	fi
+	[ -z "$project_config_files" ] ||
+		die "this PR defines project Codex configuration that Codex would load as you once the repository is trusted (${project_config_files#, }); the Codex reviewer was not started or prompted. Review this PR with Claude Code or Cursor instead: choose it with mf-config (and exit any open Codex reviewer in its pane), then press I"
+fi
 # Cursor CLI has no option to skip project hooks: once its workspace trust is accepted, it runs the worktree's
 # .cursor/hooks.json and imported Claude project hooks as you. A PR head that defines any (or whose file is not
 # plain hook-free JSON) gets no Cursor reviewer started or prompted; hook-free settings files are fine.
@@ -1402,18 +1421,33 @@ if [ "$reviewer_kind" = cursor ]; then
 fi
 
 # The full diff is handed off in a private file outside the worktree, so the worktree stays clean and
-# reviewers whose read-only mode cannot run shell commands can still read it.
+# reviewers whose read-only mode cannot run shell commands can still read it. Each file is named by the
+# commits it compares and never rewritten, so a reviewer still reading an earlier prompt keeps its diff.
 review_context_root="$state_root/contexts"
 review_context_directory="$review_context_root/$lock_identity"
-review_diff_path="$review_context_directory/pr.diff"
+review_diff_path="$review_context_directory/pr-$(printf '%s' "$merge_base_sha" | lowercase)-$pr_head_sha.diff"
 ensure_private_directory "$review_context_root" 'PR review context parent directory'
 ensure_private_directory "$review_context_directory" 'PR review context directory'
-review_diff_stage="$review_diff_path.$$"
-if ! (umask 077 && git -C "$source_root" diff --no-color --no-ext-diff --no-textconv --stat --patch \
-	"$merge_base_sha" "$pr_head_sha" >"$review_diff_stage") ||
-	! mv -f -- "$review_diff_stage" "$review_diff_path"; then
-	rm -f -- "$review_diff_stage"
-	die 'unable to write the PR diff for the reviewer; prompt not sent'
+if [ "$agent_present" -eq 0 ]; then
+	# Under the PR lock, no reviewer for this PR can still be reading an older diff once none is running.
+	for obsolete_diff in "$review_context_directory"/pr.diff "$review_context_directory"/pr-*.diff; do
+		[ "$obsolete_diff" != "$review_diff_path" ] || continue
+		[ -f "$obsolete_diff" ] && [ ! -L "$obsolete_diff" ] || continue
+		rm -f -- "$obsolete_diff" ||
+			printf 'WARNING: %s: unable to remove obsolete PR diff %s\n' "$PROGRAM" "$obsolete_diff" >&2
+	done
+fi
+if [ -L "$review_diff_path" ] || { [ -e "$review_diff_path" ] && { [ ! -f "$review_diff_path" ] || [ ! -O "$review_diff_path" ]; }; }; then
+	die "the PR diff path is not a private regular file; prompt not sent: $review_diff_path"
+fi
+if [ ! -e "$review_diff_path" ]; then
+	review_diff_stage="$review_diff_path.$$"
+	if ! (umask 077 && git -C "$source_root" diff --no-color --no-ext-diff --no-textconv --stat --patch \
+		"$merge_base_sha" "$pr_head_sha" >"$review_diff_stage") ||
+		! mv -f -- "$review_diff_stage" "$review_diff_path"; then
+		rm -f -- "$review_diff_stage"
+		die 'unable to write the PR diff for the reviewer; prompt not sent'
+	fi
 fi
 
 if [ "$agent_present" -eq 0 ]; then

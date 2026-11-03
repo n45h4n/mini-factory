@@ -627,9 +627,20 @@ login_agent() {
 	fi
 }
 
+# Reads node --version output: Node.js 22.13+ succeeds; empty or older output fails.
+node_version_is_suitable() {
+	awk 'NR == 1 {sub(/^v/, ""); split($0, v, "."); ok = v[1] > 22 || (v[1] == 22 && v[2] >= 13)} END {exit !ok}'
+}
+
+# Your shell's node and npm install acpx.
 node_is_suitable() {
 	command -v node >/dev/null 2>&1 &&
-		node --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, ""); split($0, v, "."); exit !(v[1] > 22 || (v[1] == 22 && v[2] >= 13))}'
+		node --version 2>/dev/null | node_version_is_suitable
+}
+
+# acpx starts the node that the daemon's PATH finds first, whichever node your shell finds.
+daemon_node_is_suitable() {
+	env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null | node_version_is_suitable
 }
 
 # madison lists repository-provided versions only (as for Gum); any configured source counts, such as NodeSource.
@@ -667,7 +678,7 @@ acpx_runs_for_daemon() {
 # Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the
 # pipeline agent or any review role) through acpx, so choosing Cursor later needs no new install.
 ensure_node_and_acpx() {
-	local prefix found
+	local prefix found daemon_node
 	local npm_arguments=(install -g acpx@latest)
 	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
 	[ -n "$daemon_path" ] || daemon_path="$service_path"
@@ -681,6 +692,16 @@ ensure_node_and_acpx() {
 		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup."
 		pending=1
 		return 0
+	fi
+	# A suitable shell Node.js never stands in for the daemon's; acpx is still provisioned below.
+	if ! daemon_node_is_suitable; then
+		daemon_node="$(env PATH="$daemon_path" /bin/sh -c 'command -v node' 2>/dev/null)" || daemon_node=''
+		found='no Node.js'
+		if [ -n "$daemon_node" ]; then
+			found="$daemon_node, Node.js $(env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null || printf 'of unknown version')"
+		fi
+		notice "Remaining action: the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories) finds $found first, but acpx runs with that PATH and needs Node.js 22.13+; your current shell's $(command -v node) does not count. Setup never replaces an existing Node.js or version manager: put a Node.js 22.13+ first on that PATH yourself (for example by activating your version manager's 22.13+ default in your login shell's startup files, or by upgrading the Node.js found there with the tool that installed it), then rerun make setup."
+		pending=1
 	fi
 	# An existing acpx the daemon can run (from ~/bin, Homebrew, ... or acpx_path) is reused as is.
 	acpx_runs_for_daemon && return 0
