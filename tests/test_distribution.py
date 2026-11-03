@@ -1845,15 +1845,7 @@ class DistributionTests(unittest.TestCase):
                  "OK: No-Mistakes review_agents.reviewer: cursor"),
                 (original + "review_agents:\n  fixer:\n    agent: acp:cursor\n", "OK: No-Mistakes review_agents.fixer: acp:cursor"),
                 (original + "review_agents:\n  fixer_after_round:\n    agent: cursor\n    after_round: 2\n",
-                 "OK: No-Mistakes review_agents.fixer_after_round: cursor"),
-                # Ordinary native-valid one-line flow mappings are read, not refused.
-                (original.replace("agent: codex", "agent: acp:cursor", 1) + "review_agents: {}\n",
-                 "OK: No-Mistakes agent: acp:cursor"),
-                (original + "review_agents:\n  reviewer: {agent: cursor}\n",
-                 "OK: No-Mistakes review_agents.reviewer: cursor"),
-                # Native-valid CRLF line endings are read too; the file itself is never rewritten.
-                ((original + "review_agents:\n  fixer:\n    agent: cursor\n").replace("\n", "\r\n"),
-                 "OK: No-Mistakes review_agents.fixer: cursor")):
+                 "OK: No-Mistakes review_agents.fixer_after_round: cursor")):
             with self.subTest(config=config):
                 source.write_text(config)
                 result = self.run_script(doctor, env={"MOCK_INTEGRATION": "pending"})
@@ -1870,14 +1862,19 @@ class DistributionTests(unittest.TestCase):
                 self.assertIn("Remaining action: cursor-agent login", result.stdout)
                 self.assertEqual(source.read_bytes().decode(), config)
         # Duties nm-config cannot read may need a logged-out agent: login stays pending, never complete.
-        source.write_text(original + "review_agents: &roles\n  reviewer:\n    agent: cursor\n")
-        result = self.run_script(doctor, env={"MOCK_CURSOR_AUTH": "pending"})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("FAIL: No-Mistakes agent login pending: cannot read their agents", result.stdout)
-        self.assertNotIn("Authentication/setup: complete", result.stdout)
-        result = self.setup(MOCK_CURSOR_AUTH="pending")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Remaining action: No-Mistakes agents not checked", result.stdout)
+        for config in (original + "review_agents: &roles\n  reviewer:\n    agent: cursor\n",
+                       original + "review_agents:\n  reviewer: {agent: cursor}\n",
+                       (original + "review_agents:\n  fixer:\n    agent: cursor\n").replace("\n", "\r\n")):
+            with self.subTest(config=config):
+                source.write_text(config)
+                result = self.run_script(doctor, env={"MOCK_CURSOR_AUTH": "pending"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAIL: No-Mistakes agent login pending: cannot read their agents", result.stdout)
+                self.assertNotIn("Authentication/setup: complete", result.stdout)
+                result = self.setup(MOCK_CURSOR_AUTH="pending")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Remaining action: No-Mistakes agents not checked", result.stdout)
+                self.assertEqual(source.read_bytes().decode(), config)
         source.write_text(original)
         self.acpx.unlink()
         result = self.run_script(doctor)

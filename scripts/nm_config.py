@@ -180,42 +180,6 @@ def flow_list(line, index, number):
         raise Unsafe("unsupported flow list", number)
 
 
-FLOW_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"&*!|>%@`{}\[\],?:-][^\s,\[\]{}:#]*)[ \t]*:(?=[ \t,}]|$)""")
-
-
-def flow_map(line, index, number):
-    """A one-line flow mapping of scalars, scalar lists, and nested one-line flow mappings: (children, end).
-
-    Read-only: only the duties reader accepts it, so edits never rewrite flow YAML."""
-    children, index = {}, skip(line, index + 1)
-    while not line.startswith("}", index):
-        match = FLOW_KEY.match(line, index)
-        if not match:
-            raise Unsafe("unsupported flow mapping", number)
-        node = Node(unquote(match.group(1)), number, index)
-        if node.key == "<<" or node.key in children:
-            raise Unsafe("merge or duplicate key in a flow mapping", number)
-        index = skip(line, match.end())
-        if line.startswith("{", index):
-            node.kind, (node.children, index) = "map", flow_map(line, index, number)
-        elif line.startswith("[", index):
-            node.kind, (node.value, index) = "list", flow_list(line, index, number)
-        elif index < len(line) and line[index] in "'\"":
-            node.kind, (node.value, index) = "scalar", token(line, index, number)
-        else:
-            raw = FLOW_PLAIN.match(line, index).group().rstrip()
-            if raw and (raw[0] in "&*!|>%@`?:" or re.search(r":(?:[ \t]|$)", raw)):
-                raise Unsafe("unsupported flow mapping value", number)
-            node.kind, node.value, index = "scalar" if raw else "null", plain(raw), index + len(raw)
-        children[node.key] = node
-        index = skip(line, index)
-        if line.startswith(",", index):
-            index = skip(line, index + 1)
-        elif not line.startswith("}", index):
-            raise Unsafe("unsupported flow mapping", number)
-    return children, index + 1
-
-
 def inline(line, index, number):
     """The value after a colon or list dash: (kind, value, start, stop); kind 'null' means nothing written."""
     index = skip(line, index)
@@ -251,8 +215,7 @@ class Node:
 
 
 class Document:
-    def __init__(self, text, flow_maps=False):
-        self.flow_maps = flow_maps  # read-only callers may accept one-line flow mappings
+    def __init__(self, text):
         if text.startswith("﻿"):
             raise Unsafe("byte-order mark")
         if "\r" in text:
@@ -298,13 +261,7 @@ class Document:
         if node.key == "<<":
             raise Unsafe("merge keys", number)
         node.colon = match.end()
-        start = skip(line, node.colon)
-        if self.flow_maps and line.startswith("{", start):
-            node.kind, node.start, (node.children, node.stop) = "map", start, flow_map(line, start, number)
-            if line[node.stop:].strip() and not re.match(r"[ \t]+#", line[node.stop:]):
-                raise Unsafe("unexpected text after a value", number)
-        else:
-            node.kind, node.value, node.start, node.stop = inline(line, node.colon, number)
+        node.kind, node.value, node.start, node.stop = inline(line, node.colon, number)
         node.comment = bool(line[node.stop:].strip())
         position += 1
         following = self.content[position] if position < len(self.content) else None
@@ -536,9 +493,9 @@ def read(target):
         raise ConfigError(str(target) + " is not UTF-8 text. " + manual(target))
 
 
-def load(text, target, flow_maps=False):
+def load(text, target):
     try:
-        return Document(text, flow_maps)
+        return Document(text)
     except Unsafe as error:
         raise ConfigError("cannot safely read " + str(target) + ": " + str(error) + ". " + manual(target)
                           + "; nothing was changed")
@@ -1124,9 +1081,7 @@ def main(argv):
     if len(argv) == 2 and argv[0] == "duties":
         target = Path(argv[1])
         try:
-            # Native No-Mistakes accepts CRLF; this read-only lookup normalizes it in memory only.
-            text = re.sub(r"\r\n?", "\n", read(target)[1])
-            found = duties(load(text, target, flow_maps=True))
+            found = duties(load(read(target)[1], target))
         except Unsafe as error:
             raise ConfigError("cannot safely read the No-Mistakes duties in " + str(target) + ": " + str(error))
         for duty, agent, harness in found:
@@ -1135,8 +1090,7 @@ def main(argv):
     if len(argv) == 2 and argv[0] == "acpx-path":
         target = Path(argv[1])
         try:
-            text = re.sub(r"\r\n?", "\n", read(target)[1])
-            node = load(text, target, flow_maps=True).get(("acpx_path",))
+            node = load(read(target)[1], target).get(("acpx_path",))
             # Native No-Mistakes runs a nonempty acpx_path verbatim (no ~ expansion), else acpx from its PATH.
             value = None if is_null(node) else scalar(node, ("acpx_path",))
         except Unsafe as error:
