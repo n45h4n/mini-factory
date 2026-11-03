@@ -2584,9 +2584,11 @@ class DistributionTests(unittest.TestCase):
                 self.assertFalse(self.herdr_calls("agent", "start"))
                 self.assertEqual([args[:3] for args in self.herdr_calls("agent", "prompt")],
                                  [["agent", "prompt", "pr-pane"]])
-                self.assertIn("read-only Claude Code reviewer", self.notifications()[-1])
+                self.assertIn("exact existing Claude Code reviewer", self.notifications()[-1])
+                self.assertNotIn("exact read-only", self.notifications()[-1])
                 self.assertIn("Kept the existing Claude Code reviewer with its original options; the Cursor setting "
                               "applies once it is closed", self.notifications()[-1])
+                self.assertIn("it may not be read-only", self.notifications()[-1])
                 # Saved options are not even read for a retained reviewer.
                 self.assertFalse(self.calls("cursor-agent") + self.calls("claude"))
                 self.assert_terminal_only_review(repo, worktree)
@@ -2609,6 +2611,31 @@ class DistributionTests(unittest.TestCase):
         self.assert_success(self.run_pr_review(repo, route))
         self.assertFalse(self.herdr_calls("agent", "start"))
         self.assertIn("Reused the existing reviewer with its original options", self.notifications()[-1])
+        self.assertIn("it may not be read-only", self.notifications()[-1])
+
+    def test_pr_review_warns_that_a_reused_default_reviewer_may_not_be_read_only(self):
+        repo, git = self.source_repo()
+        route = self.pr_environment(repo, git)
+        worktree, _ = self.pr_review_paths()
+        # No mf-config selection: the default Codex reviewer starts read-only, as it reports.
+        self.assert_success(self.run_pr_review(repo, route))
+        self.assertEqual(self.herdr_calls("agent", "start")[0][4], "codex")
+        self.assertIn("exact read-only Codex reviewer", self.notifications()[-1])
+        self.assertNotIn("may not be read-only", self.notifications()[-1])
+        # Reused with the same default selection, its launch options cannot be verified: warn, never restart.
+        result = self.run_pr_review(repo, route)
+        self.assert_success(result)
+        self.assertFalse(self.herdr_calls("agent", "start"))
+        self.assertEqual([args[:3] for args in self.herdr_calls("agent", "prompt")], [["agent", "prompt", "pr-pane"]])
+        notice = self.notifications()[-1]
+        self.assertIn("exact existing Codex reviewer", notice)
+        self.assertNotIn("exact read-only", notice)
+        self.assertIn("Reused the existing reviewer with its original options. WARNING: Herdr does not report those "
+                      "options, so its read-only permissions cannot be verified and it may not be read-only. Exit it "
+                      "in its pane, then press I again to start a fresh reviewer with the configured read-only options.",
+                      notice)
+        self.assertIn("its read-only permissions cannot be verified", result.stderr)
+        self.assert_terminal_only_review(repo, worktree)
 
     def advance_pr_head(self, repo, git, route, files, links=()):
         # The fixture PR head plus FILES (and symbolic LINKS) becomes the PR's new head.
@@ -3945,8 +3972,9 @@ os.execv(executable, [executable, *args])
         formula.parent.mkdir(parents=True)
         shutil.copyfile(self.mock / "mock-cli", formula)
         formula.chmod(0o755)
-        (self.mock / "node").unlink()
-        (self.mock / "node").symlink_to(formula)
+        # The Node.js acpx starts is the one the No-Mistakes daemon's PATH finds.
+        self.daemon_node.unlink()
+        self.daemon_node.symlink_to(formula)
         brew = {"MOCK_BREW_CELLAR": str(cellar)}
         # Prompt order: gh-dash, then Node.js (Homebrew's node includes npm), then acpx (setup's ~/.local install).
         result = self.interactive_update(["n", "y", "y"], **brew)
@@ -3962,8 +3990,8 @@ os.execv(executable, [executable, *args])
         fnm.parent.mkdir(parents=True)
         shutil.copyfile(self.mock / "mock-cli", fnm)
         fnm.chmod(0o755)
-        (self.mock / "node").unlink()
-        (self.mock / "node").symlink_to(fnm)
+        self.daemon_node.unlink()
+        self.daemon_node.symlink_to(fnm)
         self.log.write_text("")
         result = self.interactive_update(["n", "n"], **brew)
         self.assert_success(result)
@@ -3972,6 +4000,46 @@ os.execv(executable, [executable, *args])
         self.assertIn("make update never changes a Node version manager, npm prefix, or shell configuration", result.stdout)
         self.assertIn("Declined (left unchanged): gh-dash acpx", result.stdout)
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["upgrade"]])
+        self.assertFalse(self.npm_changes())
+        self.assert_no_actions()
+
+    def test_update_targets_the_daemon_node_not_a_different_shell_node(self):
+        self.clone_fixture()
+        self.install()
+
+        def place(path, version):
+            path.parent.mkdir(parents=True)
+            path.write_text("#!/bin/sh\necho " + version + "\n")
+            path.chmod(0o755)
+            return path
+
+        cellar = self.root / "brew/Cellar"
+        formula = place(cellar / "node/24.11.0/bin/node", "v24.11.0")
+        fnm = place(self.root / "fnm/node-versions/v23.0.0/installation/bin/node", "v23.0.0")
+        brew = {"MOCK_BREW_CELLAR": str(cellar)}
+        # Your shell finds Homebrew's node but the daemon's PATH finds fnm's: only fnm guidance, no brew upgrade.
+        (self.mock / "node").unlink()
+        (self.mock / "node").symlink_to(formula)
+        self.daemon_node.unlink()
+        self.daemon_node.symlink_to(fnm)
+        self.log.write_text("")
+        result = self.interactive_update(["n"], **brew)
+        self.assert_success(result)
+        self.assertIn("Node.js and npm: manual update only: " + str(fnm) + " is managed by fnm", result.stdout)
+        self.assertNotIn("Homebrew formula node", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["upgrade"]])
+        # Reversed, the plan and the displayed version are the daemon's Homebrew node, not the shell's fnm node.
+        (self.mock / "node").unlink()
+        (self.mock / "node").symlink_to(fnm)
+        self.daemon_node.unlink()
+        self.daemon_node.symlink_to(formula)
+        self.log.write_text("")
+        result = self.interactive_update(["n", "y"], **brew)
+        self.assert_success(result)
+        self.assertIn("Node.js and npm (v24.11.0): Homebrew formula node", result.stdout)
+        self.assertIn("for " + str(self.daemon_node) + ", the Node.js the No-Mistakes daemon's PATH finds", result.stdout)
+        self.assertNotIn("v23.0.0", result.stdout)
+        self.assertEqual([c["args"] for c in self.calls("brew") if c["args"][:1] == ["upgrade"]], [["upgrade", "node"]])
         self.assertFalse(self.npm_changes())
         self.assert_no_actions()
 

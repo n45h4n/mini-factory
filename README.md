@@ -449,6 +449,10 @@ earlier prompts stay readable until a fresh reviewer starts; a blocked one (for 
 a plan or trust prompt) and one with an unknown status are focused instead,
 never typed into. A live reviewer keeps its original harness and options; a new
 `mf-config` choice applies once you exit it in its pane and press `I` again.
+Herdr does not report a live reviewer's launch options, so PR `I` cannot verify
+that a reused reviewer is still read-only: it warns that it may not be, and
+never restarts or replaces it. Exit it in its pane and press `I` again to start
+a fresh reviewer with the configured read-only options.
 
 `ghd` captures the physical source root, canonical GitHub repository, branch,
 commit SHA, and dirty status **before** opening gh-dash. New implementation

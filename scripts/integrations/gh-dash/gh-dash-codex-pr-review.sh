@@ -1321,6 +1321,7 @@ if [ "$agent_get_status" -eq 125 ]; then
 	die "agent lookup did not return exactly one JSON object; prompt not sent: $agent_document"
 fi
 reuse_notice=
+reviewer_mode='read-only'
 if [ "$complete_agent_count" -eq 0 ]; then
 	case "$agent_get_status" in
 	0) agent_conflict "agent list and agent lookup disagree for alias $agent_alias" ;;
@@ -1343,16 +1344,23 @@ else
 	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 		agent_conflict "$runtime_validation_error"
 	agent_present=1
-	# Herdr does not report launch options; a retained reviewer is never replaced.
+	# Herdr does not report launch options, so a retained reviewer's read-only mode cannot be verified;
+	# it is never replaced, restarted, or changed.
 	if [ "$retained_kind" != "$reviewer_kind" ]; then
-		reuse_notice=" Kept the existing $(agent_label "$retained_kind") reviewer with its original options; the $reviewer_label setting applies once it is closed (exit it in its pane, then press I)."
+		reuse_notice=" Kept the existing $(agent_label "$retained_kind") reviewer with its original options; the $reviewer_label setting applies once it is closed."
 		printf 'WARNING: %s: retaining existing %s reviewer for %s instead of the %s setting\n' \
 			"$PROGRAM" "$retained_kind" "$workspace_label" "$reviewer_kind" >&2
 		reviewer_kind="$retained_kind"
 		reviewer_label="$(agent_label "$reviewer_kind")"
 	elif [ "$reviewer_source" = override ]; then
-		reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer (exit it in its pane, then press I).'
+		reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer.'
+	else
+		reuse_notice=' Reused the existing reviewer with its original options.'
 	fi
+	reuse_notice="$reuse_notice WARNING: Herdr does not report those options, so its read-only permissions cannot be verified and it may not be read-only. Exit it in its pane, then press I again to start a fresh reviewer with the configured read-only options."
+	reviewer_mode='existing'
+	printf 'WARNING: %s: reusing existing %s reviewer for %s; its read-only permissions cannot be verified\n' \
+		"$PROGRAM" "$reviewer_kind" "$workspace_label" >&2
 fi
 require_reviewer_manifest
 
@@ -1529,5 +1537,5 @@ agent_identity_matches \
 validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 	die "PR review prompt completed but runtime identity became uncertain: $runtime_validation_error"
 
-notify "PR review prompt sent to the exact read-only $reviewer_label reviewer; its findings appear in its pane.$reuse_notice" 'done'
+notify "PR review prompt sent to the exact $reviewer_mode $reviewer_label reviewer; its findings appear in its pane.$reuse_notice" 'done'
 exit 0

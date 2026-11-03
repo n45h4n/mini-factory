@@ -123,7 +123,7 @@ tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
 		text="$(gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
-	elif [ "$1" = acpx ]; then
+	elif [ "$1" = acpx ] || [ "$1" = node ]; then
 		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$plan_path" --version 2>/dev/null)" || true
 	else
 		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$1" --version 2>/dev/null)" || true
@@ -255,10 +255,18 @@ plan_upgrade() {
 				return 0
 			fi
 		fi
+	fi
+	# acpx and the node it starts run from the No-Mistakes daemon's PATH, as setup and doctor check them.
+	if [ "$tool" = acpx ] || [ "$tool" = node ]; then
+		[ "$tool" = acpx ] || acpx=node
 		daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
-		# shellcheck disable=SC2016 # Resolve the configured executable using the daemon's PATH.
+		# shellcheck disable=SC2016 # Resolve the executable using the daemon's PATH, not this shell's.
 		if ! path="$(env PATH="$daemon_path" /bin/sh -c 'command -v "$1"' sh "$acpx" 2>/dev/null)"; then
-			plan_manual="No-Mistakes acpx executable $acpx is unavailable from the daemon's PATH; make setup reports the action"
+			if [ "$tool" = node ]; then
+				plan_manual="Node.js is unavailable from the No-Mistakes daemon's PATH $daemon_path; make setup reports the action"
+			else
+				plan_manual="No-Mistakes acpx executable $acpx is unavailable from the daemon's PATH; make setup reports the action"
+			fi
 			return 0
 		fi
 		plan_path="$path"
@@ -277,6 +285,7 @@ plan_upgrade() {
 		;;
 	node)
 		plan_package node "$real" node nodejs npm
+		[ -z "$plan_detail" ] || plan_detail="$plan_detail; for $path, the Node.js the No-Mistakes daemon's PATH finds"
 		return 0
 		;;
 	acpx)
