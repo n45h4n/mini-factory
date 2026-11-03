@@ -46,6 +46,12 @@ def fail(message="forbidden external action"):
     sys.exit(91)
 def envelope(kind, key, value):
     print(json.dumps({"id": "test", "result": {"type": kind, key: value}}))
+def native_update():
+    if name in os.environ.get("MOCK_UPDATE_FAIL", "").split():
+        (root / (name + "-partly-updated")).write_text("yes")
+        fail(name + " update: simulated failure after replacing files")
+    (root / (name + "-updated")).write_text("yes")
+    print(name + " is up to date (test)")
 if name == "uname":
     print(os.environ.get("MOCK_ARCH", "arm64") if args == ["-m"]
           else os.environ.get("MOCK_OS", "Darwin"))
@@ -86,6 +92,8 @@ elif name == "gh":
         if args != ["extension", "install", "dlvhdr/gh-dash"]:
             fail()
         (root / "extension-installed").write_text("yes")
+    elif args == ["extension", "upgrade", "dash"]:
+        print("[dash]: already up to date")
     elif args and args[0] == "dash":
         if "--version" in args:
             if os.environ.get("MOCK_EXTENSION") == "missing" and not (root / "extension-installed").exists():
@@ -112,7 +120,10 @@ elif name == "codex":
         print("codex-cli " + os.environ.get("MOCK_CODEX_VERSION", "0.115.0"))
     elif args == ["--help"]:
         print("Codex CLI: login logout --version" if os.environ.get("MOCK_AGENT_HELP") == "old"
-              else "Codex CLI\n  -c, --config <key=value>\n      --strict-config\n  -m, --model <MODEL>\n  login logout --version")
+              else "Codex CLI\n  -c, --config <key=value>\n      --strict-config\n  -m, --model <MODEL>\n  login logout --version\n"
+                   "Commands:\n  update            Update Codex to the latest version")
+    elif args == ["update"]:
+        native_update()
     elif args[:2] == ["login", "status"]:
         if os.environ.get("MOCK_CODEX_AUTH") == "pending" and not (root / "codex-authenticated").exists():
             fail("AUTH_SECRET_SENTINEL should never be displayed")
@@ -137,7 +148,10 @@ elif name == "claude":
                   "                                        an alias for the latest model (e.g.\n"
                   "                                        'fable', 'opus', or 'sonnet') or a\n"
                   "                                        model's full name.\n"
-                  "  --name <name>                         Session name")
+                  "  --name <name>                         Session name\n"
+                  "Commands:\n  update|upgrade                        Check for updates and install if available")
+    elif args == ["update"]:
+        native_update()
     elif args == ["auth", "status"]:
         if os.environ.get("MOCK_CLAUDE_AUTH") == "pending" and not (root / "claude-authenticated").exists():
             fail("AUTH_SECRET_SENTINEL should never be displayed")
@@ -150,7 +164,10 @@ elif name == "cursor-agent":
     if args == ["--version"]:
         print("2026.10.22-test")
     elif args == ["--help"]:
-        print("  --model <model>  Model to use\n  --list-models  List available models and exit")
+        print("  --model <model>  Model to use\n  --list-models  List available models and exit\n"
+              "Commands:\n  update                       Update Cursor Agent to the latest version")
+    elif args == ["update"]:
+        native_update()
     elif args == ["--list-models"]:
         if os.environ.get("MOCK_CURSOR_MODELS") == "missing":
             fail("Error: Authentication required.")
@@ -251,6 +268,9 @@ elif name == "no-mistakes":
             rejected.append((number, key.group(2), types[scope]))
     if args == ["--version"]:
         print("no-mistakes version " + version + " (test) 2026-10-01T00:00:00Z")
+    elif args == ["--help"]:
+        print("Available Commands:\n  doctor      Check system health and dependencies\n"
+              "  update      Update no-mistakes and reset the daemon")
     elif args == ["daemon", "restart"]:
         # Native startup writes a default config when missing.
         if rejected:
@@ -371,6 +391,11 @@ elif name == "herdr":
     started = [branch for branch in sessions if issue_state.get(branch, {}).get("agent_started")]
     if args == ["--version"] or args == ["version"]:
         print("herdr version 0.20.0")
+    elif args == ["--help"]:
+        print("Usage: herdr [options]\n       herdr update [--handoff]\n"
+              "  herdr update                     Download and install the latest version")
+    elif args == ["update"]:
+        native_update()
     elif "--help" in args:
         print("integration install status list claude codex cursor --json --cwd --workspace --pane --kind --timeout --wait --base --branch --path server agent-manifests")
     elif args[:1] == ["integration"] and args[1:2] in (["status"], ["list"]):
@@ -463,6 +488,8 @@ elif name == "herdr":
 elif name in ("brew", "sudo", "apt-get"):
     if name == "brew" and args == ["--version"]:
         print("Homebrew 4.6.0")
+    elif name == "brew" and args == ["--cellar"]:
+        print(os.environ.get("MOCK_BREW_CELLAR", str(root / "no Homebrew Cellar")))
     elif name == "brew" and args[:2] == ["list", "--versions"]:
         if args[2] not in os.environ.get("MOCK_BREW_LISTED", "").split():
             sys.exit(1)
@@ -498,6 +525,8 @@ elif name == "git":
     elif (os.environ.get("MOCK_PR_WORKFLOW") == "1" and "worktree" in args
           and args[args.index("worktree") + 1:args.index("worktree") + 3] == ["add", "--detach"]):
         pass
+    elif os.environ.get("MOCK_CLONE_UPDATE") == "1" and args[2:3] in (["fetch"], ["merge"]):
+        pass  # make update fetches and fast-forwards the disposable retained clone fixture
     elif any(arg in args for arg in ("worktree", "push", "fetch", "clone", "commit", "checkout", "reset")):
         fail("unexpected Git mutation")
     os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
@@ -548,6 +577,12 @@ elif name == "curl":
 elif name == "dpkg":
     if args == ["--print-architecture"]:
         print("amd64")
+    elif args[:1] == ["-S"] and len(args) == 2:
+        owners = json.loads(os.environ.get("MOCK_DPKG", "{}"))
+        if args[1] not in owners:
+            print("dpkg-query: no path found matching pattern " + args[1], file=sys.stderr)
+            sys.exit(1)
+        print(owners[args[1]] + ": " + args[1])
     else:
         fail()
 else:
@@ -736,8 +771,8 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("gh-dash-codex-issue-dispatch.sh", config)
         for forbidden in ("--factory", "diffnav", "lazygit", "tuicr", "octo", "queue", "sandbox", "$HOME/dotfiles", "repoPaths"):
             self.assertNotIn(forbidden, config)
-        for relative in ("bin/ghd", "bin/mf-config", "bin/nm-config", "scripts/setup.sh", "scripts/doctor.sh",
-                         "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
+        for relative in ("bin/ghd", "bin/mf-config", "bin/nm-config", "scripts/setup.sh", "scripts/update.sh",
+                         "scripts/doctor.sh", "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-pr-review-dispatch.sh"):
@@ -2998,6 +3033,386 @@ os.execv(executable, [executable, *args])
         self.assertIn("mf-config launcher: " + str(self.wrapper.parent / "mf-config"), result.stdout)
         # The repository-local command still works.
         self.assert_success(self.nm_config("show"))
+        self.assert_no_actions()
+
+    # make update: fast-forward the retained clone, optional native upgrades, then the setup/doctor handoff.
+
+    def clone_fixture(self):
+        """Make the copied bundle a retained clone of a disposable upstream, as git clone leaves it."""
+        identity = {"GIT_AUTHOR_NAME": "Maintainer", "GIT_AUTHOR_EMAIL": "maintainer@example.invalid",
+                    "GIT_COMMITTER_NAME": "Maintainer", "GIT_COMMITTER_EMAIL": "maintainer@example.invalid"}
+
+        def git(directory, *args):
+            return subprocess.run([REAL_GIT, "-C", str(directory), *args], env=dict(self.env, PATH=REAL_PATH, **identity),
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        upstream, maintainer = self.root / "upstream with spaces.git", self.root / "maintainer clone"
+        git(self.bundle, "init", "-q", "-b", "main")
+        git(self.bundle, "add", "-A")
+        git(self.bundle, "commit", "-q", "-m", "Release 1")
+        git(self.root, "clone", "-q", "--bare", str(self.bundle), str(upstream))
+        git(self.bundle, "remote", "add", "origin", str(upstream))
+        git(self.bundle, "fetch", "-q", "origin")
+        git(self.bundle, "branch", "-q", "--set-upstream-to=origin/main", "main")
+        git(self.root, "clone", "-q", str(upstream), str(maintainer))
+
+        def publish(relative, content, message="Upstream change"):
+            path = maintainer / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            git(maintainer, "add", relative)
+            git(maintainer, "commit", "-q", "-m", message)
+            git(maintainer, "push", "-q", "origin", "main")
+            return git(maintainer, "rev-parse", "HEAD")
+
+        return git, publish
+
+    def update(self, **env):
+        return self.run_script(self.bundle / "scripts/update.sh", env=dict(MOCK_CLONE_UPDATE="1", **env))
+
+    def interactive_update(self, answers, **env):
+        return self.run_in_terminal([str(self.bundle / "scripts/update.sh")], dict(self.env, MOCK_CLONE_UPDATE="1", **env),
+                                    "".join(answer + "\n" for answer in answers).encode())
+
+    def native_updates(self, tool):
+        return [c["args"] for c in self.calls(tool) if c["args"][:1] == ["update"]]
+
+    def assert_safe_clone_actions(self):
+        clone = [c["args"] for c in self.calls("git") if c["args"][:2] == ["-C", str(self.bundle)]]
+        for args in clone:
+            self.assertFalse({"reset", "stash", "checkout", "switch", "pull", "rebase", "push", "clean", "restore",
+                              "--force"} & set(args), args)
+        self.assertTrue(all("--ff-only" in args for args in clone if args[2] == "merge"), clone)
+
+    def native_layouts(self, *tools):
+        """Place mock CLIs exactly where each upstream native installer puts them."""
+        local_bin = self.home / ".local/bin"
+
+        def copy(destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.mock / "mock-cli", destination)
+            destination.chmod(0o755)
+            return destination
+
+        for tool in tools:
+            if tool == "herdr":
+                copy(local_bin / "herdr")
+            elif tool == "codex":
+                release = copy(self.home / ".codex/packages/standalone/releases/0.115.0/bin/codex").parent.parent
+                (release.parent.parent / "current").symlink_to(release)
+                (local_bin / "codex").symlink_to(release.parent.parent / "current/bin/codex")
+            else:
+                (local_bin / tool).symlink_to(copy({
+                    "no-mistakes": self.home / ".no-mistakes/bin/no-mistakes",
+                    "claude": self.home / ".local/share/claude/versions/2.1.0",
+                    "cursor-agent": self.home / ".local/share/cursor-agent/versions/2026.10.22/cursor-agent",
+                }[tool]))
+            if tool == "cursor-agent":
+                # Cursor's installer also links agent and writes its cursor shim.
+                (local_bin / "agent").symlink_to(os.readlink(local_bin / tool))
+                (local_bin / "cursor").write_text("#!/bin/sh\n# Find cursor executable in PATH, excluding the current shim\n")
+
+    def test_update_fast_forwards_clean_clone_refreshes_runtime_and_reruns_idempotently(self):
+        git, publish = self.clone_fixture()
+        # First-time setup initializes the tracked No-Mistakes YAML, so the clone is no longer clean.
+        self.install()
+        source = self.bundle / "no-mistakes/config.yaml"
+        link = self.home / ".no-mistakes/config.yaml"
+        self.assertEqual(git(self.bundle, "status", "--porcelain"), "M no-mistakes/config.yaml")
+        configured = source.read_bytes()
+        setting = Path(self.env["XDG_CONFIG_HOME"]) / "mini-factory/issue-agent"
+        profiles = self.profiles_file({"issue-prepare": {"agent": "codex"}})
+        kept = {path: path.read_bytes() for path in (setting, profiles)}
+        for path in (self.home / ".local/bin/personal-tool", link.with_name("notes.txt")):
+            path.write_text("keep me\n")
+            kept[path] = path.read_bytes()
+        upstream = publish("README.md", (self.bundle / "README.md").read_text() + "\nUpstream release note.\n")
+        result = self.update()
+        self.assert_success(result)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertIn("Clone: fast-forwarded main", result.stdout)
+        # The existing make setup path refreshed the managed runtime and ended with doctor.
+        self.assertIn("Upstream release note.", (self.installed / "README.md").read_text())
+        self.assertIn("Installation: installed", result.stdout)
+        self.assertIn("Authentication/setup: complete", result.stdout)
+        self.assertIn("Runtime: make setup passed, including the doctor checks.", result.stdout)
+        self.assertEqual(source.read_bytes(), configured)
+        self.assertEqual(os.readlink(link), str(source))
+        # Mock tools are not native installations: guidance only; the extension offer is skipped headless.
+        self.assertIn("Herdr: manual update only", result.stdout)
+        self.assertIn("Skipped without an interactive terminal; no approval was assumed. "
+                      "Run gh extension upgrade dash yourself", result.stdout)
+        for unused in ("Claude Code:", "Cursor CLI:", "Claude Code (", "Cursor CLI ("):
+            self.assertNotIn(unused, result.stdout)
+        for tool in ("herdr", "codex", "claude", "cursor-agent", "no-mistakes"):
+            self.assertFalse(self.native_updates(tool), tool)
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        runtime = (self.installed / "bin/ghd").read_bytes()
+        result = self.update()
+        self.assert_success(result)
+        self.assertIn("Clone: already up to date with origin/main", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertEqual((self.installed / "bin/ghd").read_bytes(), runtime)
+        self.assertEqual(source.read_bytes(), configured)
+        self.assertEqual(os.readlink(link), str(source))
+        for path, content in kept.items():
+            self.assertEqual(path.read_bytes(), content, path)
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_update_refuses_runtime_copy_non_clone_detached_head_other_branch_and_missing_upstream(self):
+        self.install()
+        result = self.run_script(self.installed / "scripts/update.sh", env={"MOCK_CLONE_UPDATE": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run make update from your retained mini-factory clone, not the installed runtime copy",
+                      result.stderr)
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not a Git clone", result.stderr)
+        git, publish = self.clone_fixture()
+        publish("README.md", "Upstream rewrite\n")
+        start = git(self.bundle, "rev-parse", "HEAD")
+        git(self.bundle, "checkout", "-q", "-b", "feature/local")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("on branch feature/local: make update runs only on main and never switches branches", result.stderr)
+        self.assertIn("Switch yourself (git switch main)", result.stderr)
+        self.assertEqual(git(self.bundle, "branch", "--show-current"), "feature/local")
+        git(self.bundle, "checkout", "-q", "--detach", "main")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detached HEAD: make update runs only on main", result.stderr)
+        self.assertEqual(git(self.bundle, "branch", "--show-current"), "")
+        git(self.bundle, "checkout", "-q", "main")
+        git(self.bundle, "branch", "-q", "--unset-upstream")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("main has no upstream branch", result.stderr)
+        self.assertIn("git branch --set-upstream-to=origin/main main", result.stderr)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), start)
+        self.assertNotIn("make setup", result.stdout)
+        self.assertFalse([c for c in self.calls("git") if {"fetch", "merge"} & set(c["args"])])
+        self.assert_safe_clone_actions()
+
+    def test_update_keeps_nonconflicting_local_config_and_stops_on_conflicts_or_divergence(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        source = self.bundle / "no-mistakes/config.yaml"
+        edited = source.read_text().replace("review: 3", "review: 1") + "# my local setting\n"
+        source.write_text(edited)
+        publish("README.md", (self.bundle / "README.md").read_text() + "\nUnrelated upstream change.\n")
+        self.assert_success(self.update())
+        self.assertEqual(source.read_text(), edited)
+        self.assertIn("Unrelated upstream change.", (self.installed / "README.md").read_text())
+        # Upstream changes to a locally edited file, or to the path of an untracked file, stop before any change.
+        head = git(self.bundle, "rev-parse", "HEAD")
+        (self.bundle / "notes.txt").write_text("my untracked notes\n")
+        publish("no-mistakes/config.yaml", git(self.bundle, "show", "HEAD:no-mistakes/config.yaml") + "\n# upstream\n")
+        publish("notes.txt", "upstream notes\n")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("origin/main changes files that you edited or created locally: no-mistakes/config.yaml, notes.txt",
+                      result.stderr)
+        self.assertIn("git stash push --include-untracked -- no-mistakes/config.yaml notes.txt", result.stderr)
+        self.assertNotIn("Refreshing the managed runtime", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), head)
+        self.assertEqual(source.read_text(), edited)
+        self.assertEqual((self.bundle / "notes.txt").read_text(), "my untracked notes\n")
+        # A local commit on main makes the histories diverge; nothing is rebased or reset.
+        (self.bundle / "notes.txt").unlink()
+        (self.bundle / "local.md").write_text("local commit\n")
+        git(self.bundle, "add", "local.md")
+        git(self.bundle, "commit", "-q", "-m", "Local commit")
+        local = git(self.bundle, "rev-parse", "HEAD")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("main and origin/main have diverged (1 local, 2 upstream commit(s))", result.stderr)
+        self.assertIn("git rebase origin/main", result.stderr)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), local)
+        self.assertEqual(source.read_text(), edited)
+        self.assertEqual(git(self.bundle, "stash", "list"), "")
+        self.assert_safe_clone_actions()
+
+    def test_update_never_overwrites_an_ignored_local_file_that_upstream_adds(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        head = git(self.bundle, "rev-parse", "HEAD")
+        with (self.bundle / ".git/info/exclude").open("a") as exclude:
+            exclude.write("notes.txt\n")
+        (self.bundle / "notes.txt").write_text("my ignored notes\n")
+        publish("notes.txt", "upstream notes\n")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("did not complete", result.stderr)
+        self.assertNotIn("Refreshing the managed runtime", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), head)
+        self.assertEqual((self.bundle / "notes.txt").read_text(), "my ignored notes\n")
+        self.assert_safe_clone_actions()
+
+    def test_update_checks_only_harnesses_that_setup_provisions(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("claude", "cursor-agent")
+        source = self.bundle / "no-mistakes/config.yaml"
+        original = source.read_text()
+        # Review roles and fallback lists are not provisioned by setup, so update does not inspect them.
+        source.write_text("agent:\n  - claude # first\n  - codex\nauto_fix:\n  review: 3\n"
+                          "review_agents:\n  fixer:\n    agent: cursor\n    model: x\n")
+        result = self.update()
+        self.assert_success(result)
+        for unused in ("Claude Code", "Cursor CLI"):
+            self.assertNotIn(unused, result.stdout)
+        # A scalar pipeline agent is provisioned by setup, so update inspects it.
+        self.log.write_text("")
+        source.write_text(original.replace("agent: codex", "agent: claude", 1))
+        result = self.update()
+        self.assert_success(result)
+        self.assertIn("Claude Code (", result.stdout)
+        self.assertIn("Run claude update yourself", result.stdout)
+        self.assertNotIn("Cursor CLI", result.stdout)
+        for tool in ("claude", "cursor-agent"):
+            self.assertFalse(self.native_updates(tool), tool)
+
+    def test_update_offers_each_native_upgrade_with_consent_and_reports_decline_and_failure(self):
+        self.clone_fixture()
+        self.install()
+        self.profiles_file({"issue-prepare": {"agent": "claude"}, "issue-implement": {"agent": "cursor"}})
+        self.native_layouts("herdr", "codex", "no-mistakes", "claude", "cursor-agent")
+        cellar = self.root / "brew/Cellar"
+        formula = cellar / "gh/2.88.1/bin/gh"
+        formula.parent.mkdir(parents=True)
+        shutil.copyfile(self.mock / "mock-cli", formula)
+        formula.chmod(0o755)
+        (self.mock / "gh").unlink()
+        (self.mock / "gh").symlink_to(formula)
+        brew = {"MOCK_BREW_CELLAR": str(cellar)}
+        # Prompt order: gh, gh-dash, herdr, codex, no-mistakes, claude, cursor-agent (this Gum is not brew-owned).
+        result = self.interactive_update(["y", "n", "y", "n", "y", "y", "y"], MOCK_UPDATE_FAIL="cursor-agent", **brew)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(["upgrade", "gh"], [c["args"] for c in self.calls("brew")])
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["upgrade"] and c["args"] != ["upgrade", "gh"]])
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assertEqual(self.native_updates("herdr"), [["update"]])
+        self.assertFalse(self.native_updates("codex"))
+        # Stable channel only: never --beta, --force, or --yes.
+        self.assertEqual(self.native_updates("no-mistakes"), [["update"]])
+        self.assertEqual(self.native_updates("claude"), [["update"]])
+        self.assertEqual(self.native_updates("cursor-agent"), [["update"]])
+        self.assertIn("Declined; gh-dash extension was left unchanged.", result.stdout)
+        self.assertIn("Declined; Codex was left unchanged.", result.stdout)
+        self.assertIn("Gum: manual update only", result.stdout)
+        self.assertIn("FAILED: cursor-agent update exited with status 91. It may have changed Cursor CLI before failing; "
+                      "nothing was rolled back.", result.stdout)
+        # Setup and doctor still decide readiness after the failed optional upgrade.
+        self.assertIn("Installation: installed", result.stdout)
+        self.assertIn("Runtime: make setup passed, including the doctor checks.", result.stdout)
+        self.assertIn("FAILED optional upgrade (may be partly changed; see setup/doctor above): cursor-agent", result.stdout)
+        self.assertIn("Updater completed (updated or already current): gh herdr no-mistakes claude", result.stdout)
+        self.assertIn("Finished; Herdr is still herdr version 0.20.0 (already current).", result.stdout)
+        # Declining every offer leaves the working installation in place and succeeds.
+        self.log.write_text("")
+        result = self.interactive_update(["n"] * 7, **brew)
+        self.assert_success(result)
+        self.assertIn("Declined (left unchanged): gh gh-dash herdr codex no-mistakes claude cursor-agent", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["upgrade"]])
+        for tool in ("herdr", "codex", "claude", "cursor-agent", "no-mistakes"):
+            self.assertFalse(self.native_updates(tool), tool)
+        self.assert_no_actions()
+
+    def test_update_gives_cursor_guidance_when_its_updater_would_replace_unrelated_commands(self):
+        self.clone_fixture()
+        self.install()
+        self.profiles_file({"issue-prepare": {"agent": "cursor"}, "issue-implement": {"agent": "cursor"}})
+        self.native_layouts("cursor-agent")
+        local_bin = self.home / ".local/bin"
+        ide = self.root / "cursor ide/cursor"
+        ide.parent.mkdir()
+        ide.write_text("#!/bin/sh\necho ide\n")
+        (local_bin / "agent").unlink()
+        (local_bin / "cursor").unlink()
+        for unrelated in ("agent", "cursor"):
+            with self.subTest(unrelated):
+                if unrelated == "agent":
+                    (local_bin / "agent").write_text("#!/bin/sh\necho my agent\n")
+                else:
+                    (local_bin / "agent").unlink()
+                    (local_bin / "cursor").symlink_to(ide)
+                kept = {path: (path.is_symlink() and os.readlink(path), path.read_bytes())
+                        for path in (local_bin / "agent", local_bin / "cursor", ide) if path.exists()}
+                self.log.write_text("")
+                result = self.interactive_update(["y"] * 8)
+                self.assert_success(result)
+                self.assertIn("Cursor CLI: manual update only: its updater also replaces", result.stdout)
+                self.assertFalse(self.native_updates("cursor-agent"))
+                for path, content in kept.items():
+                    self.assertEqual((path.is_symlink() and os.readlink(path), path.read_bytes()), content, path)
+
+    def test_stable_no_mistakes_update_leaves_a_busy_daemon_alone(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("no-mistakes")
+        result = self.interactive_update(["y"] * 8, MOCK_NM_ACTIVE_RUNS="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("refusing to update while 1 pipeline run is active", result.stdout)
+        self.assertIn("they were left running: make update never passes --force or --beta", result.stdout)
+        self.assertEqual(self.native_updates("no-mistakes"), [["update"]])
+        self.assertIn(["extension", "upgrade", "dash"], [c["args"] for c in self.calls("gh")])
+        self.assertIn("Installation: installed", result.stdout)
+        self.assertIn("FAILED optional upgrade (may be partly changed; see setup/doctor above): no-mistakes", result.stdout)
+
+    def test_update_without_terminal_skips_upgrades_and_checks_only_selected_agents(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr", "codex", "claude", "cursor-agent")
+        result = self.update(MOCK_AGENT_HELP="old")
+        self.assert_success(result)
+        self.assertIn("Herdr (herdr version 0.20.0): native installer at " + str(self.home / ".local/bin/herdr"),
+                      result.stdout)
+        self.assertIn("Skipped without an interactive terminal; no approval was assumed. Run herdr update yourself",
+                      result.stdout)
+        # A CLI that does not list its updater gets guidance instead of a guessed command.
+        self.assertIn("Codex: manual update only: the installed codex does not list an update command", result.stdout)
+        self.assertIn("Skipped without a terminal: gh-dash herdr", result.stdout)
+        for unused in ("Claude Code", "Cursor CLI"):
+            self.assertNotIn(unused, result.stdout)
+        for tool in ("herdr", "codex", "claude", "cursor-agent", "no-mistakes"):
+            self.assertFalse(self.native_updates(tool), tool)
+        self.assert_no_actions()
+
+    def test_update_reports_failed_setup_after_fast_forward_and_keeps_the_runtime(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        worker = "scripts/integrations/gh-dash/gh-dash-codex-issue.sh"
+        installed = (self.installed / worker).read_bytes()
+        upstream = publish(worker, "#!/usr/bin/env bash\nif\n", "Broken worker")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertIn("replacement bundle failed validation; existing installation preserved", result.stderr)
+        self.assertIn("Runtime: make setup did not pass", result.stdout)
+        self.assertEqual((self.installed / worker).read_bytes(), installed)
+
+    def test_mocked_ubuntu_update_upgrades_only_the_apt_owned_package(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        ubuntu = {"MOCK_OS": "Linux", "MOCK_ARCH": "x86_64"}
+        self.clone_fixture()
+        self.assert_success(self.interactive_setup("y", **ubuntu))
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        system = self.root / "usr bin/gum"
+        system.parent.mkdir()
+        shutil.copyfile(self.mock / "mock-cli", system)
+        system.chmod(0o755)
+        (self.mock / "gum").unlink()
+        (self.mock / "gum").symlink_to(system)
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8, MOCK_DPKG=json.dumps({str(system): "gum"}), **ubuntu)
+        self.assert_success(result)
+        self.assertEqual([c["args"] for c in self.calls("sudo")],
+                         [["apt-get", "update"], ["apt-get", "install", "-y", "--only-upgrade", "--no-install-recommends", "gum"]])
+        self.assertIn("GitHub CLI: manual update only", result.stdout)
+        self.assertIn("Updater completed (updated or already current): gh-dash gum", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["upgrade"], ["install"])])
         self.assert_no_actions()
 
 

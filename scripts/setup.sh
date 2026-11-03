@@ -470,7 +470,7 @@ install_native_tool() {
 install_bundle() {
 	local input source relative quoted
 	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config bin/nm-config gh-dash/config.yml no-mistakes/config.yaml
-		scripts/setup.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py scripts/nm_config.py
+		scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py scripts/nm_config.py
 		scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh
@@ -495,7 +495,7 @@ install_bundle() {
 			;;
 		esac
 	done
-	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
+	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
 	"$stage/scripts/doctor.sh" --bundle "$stage" --integrity-only || die 'replacement bundle failed validation; existing installation preserved'
 	launcher_stage="$(mktemp "$bin_directory/.mini-factory-launcher.XXXXXX")"

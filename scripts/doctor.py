@@ -140,7 +140,7 @@ def integrity(bundle):
                 bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py", bundle / "scripts/mf_config.py",
                 bundle / "scripts/nm_config.py"]
     executables = [bundle / "bin/ghd", bundle / "bin/mf-config", bundle / "bin/nm-config", bundle / "scripts/setup.sh",
-                   bundle / "scripts/doctor.sh"]
+                   bundle / "scripts/update.sh", bundle / "scripts/doctor.sh"]
     executables += [workers / name for name in (
         "gh-dash-codex-issue.sh", "gh-dash-codex-issue-dispatch.sh",
         "gh-dash-codex-pr-review.sh", "gh-dash-codex-pr-review-dispatch.sh")]
