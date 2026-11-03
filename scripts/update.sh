@@ -119,8 +119,8 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
-# The agents mf-config resolves for issue i/I plus the No-Mistakes pipeline agent and any
-# review_agents role harnesses selected in the same YAML.
+# The harnesses setup provisions: the agents mf-config resolves for issue i/I plus the
+# scalar No-Mistakes pipeline agent (read as read_pipeline_agent in setup.sh does).
 selected_agents() {
 	local role output file="$bundle/no-mistakes/config.yaml"
 	selected=''
@@ -132,13 +132,7 @@ selected_agents() {
 		selected="$selected ${output%%$'\n'*}"
 	done
 	[ ! -r "$nm_config" ] || file="$nm_config"
-	# Reads scalar, flow-list, and block-list (agent: then "- name" lines) values.
-	selected="$selected $(awk '/^[ \t]*(#|$)/ { next }
-		list && /^[ \t]*-/ { sub(/^[ \t]*-[ \t]*/, ""); sub(/[ \t]*#.*$/, ""); gsub(/["\047]/, ""); print; next }
-		{ list = 0 }
-		/^[^ \t#]/ { review = /^review_agents:/ }
-		/^agent:/ || (review && /^[ \t]+agent:/) { sub(/^[ \t]*agent:[ \t]*/, ""); sub(/[ \t]*#.*$/, ""); list = ($0 == "")
-			gsub(/[][,"\047]/, " "); print }' "$file" | tr '\n' ' ') "
+	selected="$selected $(awk '/^agent:/ { sub(/^agent:[ \t]*/, ""); sub(/[ \t]*#.*$/, ""); gsub(/["\047]/, ""); print; exit }' "$file") "
 }
 
 tool_version() {

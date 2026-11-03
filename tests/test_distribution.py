@@ -3249,33 +3249,27 @@ os.execv(executable, [executable, *args])
         self.assertEqual((self.bundle / "notes.txt").read_text(), "my ignored notes\n")
         self.assert_safe_clone_actions()
 
-    def test_update_checks_selected_review_role_harness(self):
+    def test_update_checks_only_harnesses_that_setup_provisions(self):
         self.clone_fixture()
         self.install()
         self.native_layouts("claude", "cursor-agent")
         source = self.bundle / "no-mistakes/config.yaml"
-        source.write_text(source.read_text() + "review_agents:\n  reviewer:\n    agent: codex\n"
-                          "  fixer:\n    agent: claude\n    model: opus\n")
+        original = source.read_text()
+        # Review roles and fallback lists are not provisioned by setup, so update does not inspect them.
+        source.write_text("agent:\n  - claude # first\n  - codex\nauto_fix:\n  review: 3\n"
+                          "review_agents:\n  fixer:\n    agent: cursor\n    model: x\n")
+        result = self.update()
+        self.assert_success(result)
+        for unused in ("Claude Code", "Cursor CLI"):
+            self.assertNotIn(unused, result.stdout)
+        # A scalar pipeline agent is provisioned by setup, so update inspects it.
+        self.log.write_text("")
+        source.write_text(original.replace("agent: codex", "agent: claude", 1))
         result = self.update()
         self.assert_success(result)
         self.assertIn("Claude Code (", result.stdout)
         self.assertIn("Run claude update yourself", result.stdout)
         self.assertNotIn("Cursor CLI", result.stdout)
-        for tool in ("claude", "cursor-agent"):
-            self.assertFalse(self.native_updates(tool), tool)
-
-    def test_update_checks_harnesses_selected_in_block_lists(self):
-        self.clone_fixture()
-        self.install()
-        self.native_layouts("claude", "cursor-agent")
-        # A top-level fallback list and a role's fallback list, each in block form.
-        (self.bundle / "no-mistakes/config.yaml").write_text(
-            "agent:\n  - claude # first\n  - codex\nauto_fix:\n  review: 3\n"
-            "review_agents:\n  fixer:\n    agent:\n\n    - 'cursor'\n    model: x\n")
-        result = self.update()
-        self.assert_success(result)
-        self.assertIn("Claude Code (", result.stdout)
-        self.assertIn("Cursor CLI (", result.stdout)
         for tool in ("claude", "cursor-agent"):
             self.assertFalse(self.native_updates(tool), tool)
 
