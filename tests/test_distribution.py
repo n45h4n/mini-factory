@@ -13,6 +13,7 @@ import pty
 import re
 import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1675,6 +1676,30 @@ class DistributionTests(unittest.TestCase):
         self.assertTrue((manager / "acpx").is_file())
         self.assertFalse(self.npm_changes())
         self.assert_no_actions()
+
+    def test_daemon_path_timeout_does_not_wait_for_a_detached_stdout_holder(self):
+        shell = self.root / "probe shell"
+        helper_pid = self.root / "detached-helper.pid"
+        shell.write_text("#!" + sys.executable + "\nimport subprocess, sys\n"
+                         "from pathlib import Path\n"
+                         "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                         "start_new_session=True)\n"
+                         "Path(" + repr(str(helper_pid)) + ").write_text(str(helper.pid))\n"
+                         "print('PATH=/probe-only', flush=True)\n")
+        shell.chmod(0o755)
+        try:
+            result = subprocess.run([sys.executable, "-I", "-B", str(self.bundle / "scripts/nm_config.py"),
+                                     "daemon-path"], env=dict(self.env, SHELL=str(shell)), capture_output=True,
+                                    text=True, timeout=18)
+            self.assert_success(result)
+            self.assertNotIn("/probe-only", result.stdout)
+            self.assertTrue(result.stdout.startswith(str(self.home / ".local/bin") + os.pathsep))
+        finally:
+            if helper_pid.exists():
+                try:
+                    os.kill(int(helper_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_configured_acpx_path_is_what_setup_and_doctor_check(self):
         self.install()
@@ -3693,6 +3718,54 @@ os.execv(executable, [executable, *args])
         self.assertIn("Declined (left unchanged): gh-dash acpx", result.stdout)
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["upgrade"]])
         self.assertFalse(self.npm_changes())
+        self.assert_no_actions()
+
+    def test_update_uses_configured_acpx_outside_path_and_keeps_ownership_checks(self):
+        self.clone_fixture()
+        self.install()
+        source = self.bundle / "no-mistakes/config.yaml"
+        original = source.read_text()
+        prefix = self.root / "custom npm prefix"
+        target = prefix / "lib/node_modules/acpx/dist/cli.js"
+        target.parent.mkdir(parents=True)
+        target.write_text((self.mock / "mock-cli").read_text().replace('print("0.20.0")', 'print("0.21.0")'))
+        target.chmod(0o755)
+        custom = prefix / "bin/acpx"
+        custom.parent.mkdir()
+        custom.symlink_to(target)
+        source.write_text(original + "acpx_path: " + json.dumps(str(custom)) + "\n")
+        environment = {"MOCK_NPM_PREFIX": str(prefix)}
+        # The configured runner is outside PATH; the different acpx on PATH must not stand in for it.
+        result = self.update(**environment)
+        self.assert_success(result)
+        self.assertIn("acpx (0.21.0): npm package acpx", result.stdout)
+        self.assertFalse(self.npm_changes())
+        self.acpx.unlink()
+        self.log.write_text("")
+        result = self.interactive_update(["n", "y"], **environment)
+        self.assert_success(result)
+        self.assertIn("acpx (0.21.0): npm package acpx", result.stdout)
+        self.assertEqual([c["args"] for c in self.npm_changes()], [["install", "-g", "acpx@latest"]])
+        # An unrecognized installation gets manual guidance for the configured path, never an unrelated upgrade.
+        standalone = self.root / "standalone/acpx"
+        standalone.parent.mkdir()
+        shutil.copyfile(target, standalone)
+        standalone.chmod(0o755)
+        source.write_text(original + "acpx_path: " + json.dumps(str(standalone)) + "\n")
+        self.log.write_text("")
+        result = self.interactive_update(["n"], **environment)
+        self.assert_success(result)
+        self.assertIn("acpx: manual update only: " + str(standalone), result.stdout)
+        self.assertFalse(self.npm_changes())
+        # An unreadable setting cannot fall back to the unrelated acpx on PATH.
+        shutil.copyfile(self.mock / "mock-cli", self.acpx)
+        self.acpx.chmod(0o755)
+        source.write_text(original + "acpx_path: [acpx]\n")
+        result = self.update(**environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("acpx: manual update only: cannot read No-Mistakes acpx_path", result.stdout)
+        self.assertFalse(self.npm_changes())
+        self.assert_safe_clone_actions()
         self.assert_no_actions()
 
     def test_update_offers_each_native_upgrade_with_consent_and_reports_decline_and_failure(self):

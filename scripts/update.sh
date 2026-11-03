@@ -123,6 +123,8 @@ tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
 		text="$(gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
+	elif [ "$1" = acpx ]; then
+		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$plan_path" --version 2>/dev/null)" || true
 	else
 		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$1" --version 2>/dev/null)" || true
 	fi
@@ -237,14 +239,30 @@ cursor_commands_owned() {
 # Each native updater is offered only for the layout its own installer creates
 # (see install_native_tool in setup.sh) and only when the installed CLI lists it.
 plan_upgrade() {
-	local tool="$1" path real help
+	local tool="$1" path real help config acpx daemon_path
 	plan_kind='' plan_text='' plan_detail='' plan_manual='' plan_path=''
 	plan_targets=()
 	if [ "$tool" = gh-dash ]; then
 		plan_gh_dash
 		return 0
 	fi
-	if ! path="$(command -v "$tool" 2>/dev/null)"; then
+	if [ "$tool" = acpx ]; then
+		config="${NM_HOME:-$HOME/.no-mistakes}/config.yaml"
+		acpx=acpx
+		if [ -e "$config" ] || [ -L "$config" ]; then
+			if ! acpx="$(python3 -I -B "$bundle/scripts/nm_config.py" acpx-path "$config" 2>&1)"; then
+				plan_manual="cannot read No-Mistakes acpx_path: ${acpx#nm-config: }; fix the configuration, then rerun make update"
+				return 0
+			fi
+		fi
+		daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
+		# shellcheck disable=SC2016 # Resolve the configured executable using the daemon's PATH.
+		if ! path="$(env PATH="$daemon_path" /bin/sh -c 'command -v "$1"' sh "$acpx" 2>/dev/null)"; then
+			plan_manual="No-Mistakes acpx executable $acpx is unavailable from the daemon's PATH; make setup reports the action"
+			return 0
+		fi
+		plan_path="$path"
+	elif ! path="$(command -v "$tool" 2>/dev/null)"; then
 		plan_manual='not installed; make setup offers its installer'
 		return 0
 	fi

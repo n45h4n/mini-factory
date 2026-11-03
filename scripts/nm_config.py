@@ -1048,12 +1048,19 @@ def daemon_path():
         try:
             out = process.communicate(timeout=10)[0]
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            finally:
+                # Detached rc-file helpers may retain stdout after the shell dies; do not wait for EOF.
+                process.stdout.close()
             out = b""
         if process.returncode == 0:
             entries = out.decode("utf-8", "replace").split("\0")
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     path = []
     for part in entries:
