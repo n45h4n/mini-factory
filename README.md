@@ -13,7 +13,8 @@ value to change it. To choose the `i` and `I` agents separately, or a model and
 effort per key, use [`mf-config`](#agent-profiles-mf-config). **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
 [No-Mistakes](#no-mistakes-configuration-and-unattended-runs); edit it with
-[`nm-config`](#no-mistakes-global-defaults-nm-config)).
+[`nm-config`](#no-mistakes-global-defaults-nm-config)). Update later with
+`make update` from this clone (see [Updating](#updating)).
 
 Complete the native login/integration steps offered by setup. If setup reports a
 PATH action, run `export PATH="$HOME/.local/bin:$PATH"` in your current shell.
@@ -388,8 +389,9 @@ including a newer prerelease you installed deliberately, so it never downgrades
 one. Only when those flags are missing does setup offer the native stable
 updater `no-mistakes update`, with your consent. That updater restarts the
 daemon and refuses while pipeline runs are active; setup never passes `--beta`
-or `--force`, and it reports the refusal instead of interrupting your runs. Both
-run before the config link is created, because they restart the daemon; the
+or `--force`, and it reports the refusal instead of interrupting your runs.
+`make update` offers the same stable updater as an optional upgrade (see
+[Updating](#updating)). Both run before the config link is created, because they restart the daemon; the
 default `config.yaml` that a fresh install writes is then kept as the backup
 described below. Doctor checks the same `axi run` capability, not a version
 number.
@@ -424,8 +426,8 @@ Earlier versions of this file had the prerelease-only
 has them, or any other field your installed release does not support, setup
 leaves the file unchanged and doctor shows the rejected fields. Remove them
 yourself, or keep using a release that supports them. Your edits are local changes in the clone, so
-`git pull --ff-only` keeps them unless an update changes the same file, in which
-case Git stops and you merge them yourself. Keep the clone in place: if you
+`make update` keeps them unless an update changes the same file, in which case
+it stops and you merge them yourself. Keep the clone in place: if you
 move it, rerun `make setup` from the new location to relink, and deleting it
 leaves No-Mistakes without its configuration.
 
@@ -555,6 +557,65 @@ adding CI only when missing CI is independently established. After resolving
 the blocker, continue with `no-mistakes axi status` from the worktree. This bundle
 never bypasses CI or marks checks passed.
 
+## Updating
+
+```sh
+cd /path/to/mini-factory   # your retained clone, with main checked out
+make update
+```
+
+`make update` runs only from the retained clone, on `main` with an upstream
+configured. It refuses the installed runtime copy, a detached HEAD, or another
+branch; switch yourself (`git switch main`), because it never switches branches.
+It then:
+
+1. **Fast-forwards only.** It fetches the upstream and runs
+   `git merge --ff-only --no-autostash`, the equivalent of `git pull --ff-only`
+   without depending on your rebase/autostash settings. A clean worktree is not
+   required: local edits, including your tracked `no-mistakes/config.yaml`,
+   carry over when upstream did not change the same files. If upstream changed
+   one of them (or adds a file where you have an untracked one), or `main` has
+   diverged, it stops before changing anything and prints the manual steps. It
+   never resets, stashes, force-pulls, or discards configuration.
+2. **Offers optional upgrades**, each with its own `[y/N]` consent, for the
+   installed tools this installation uses, through the mechanism that matches
+   how each one was installed (table below).
+3. **Runs `make setup`**, which refreshes the managed runtime and ends with the
+   doctor checks, then prints a summary.
+
+| Tool | Offered when installed as | Command |
+| ---- | ------------------------- | ------- |
+| GitHub CLI, Gum | Homebrew formula, or apt package | `brew upgrade gh` (Homebrew may refresh its index first); or `sudo apt-get update`, then `sudo apt-get install --only-upgrade gh` |
+| gh-dash | the `dlvhdr/gh-dash` extension | `gh extension upgrade dash` |
+| Herdr | native `~/.local/bin/herdr` | `herdr update` (no `--handoff`) |
+| Codex | standalone, under `${CODEX_HOME:-~/.codex}/packages/standalone` | `codex update` |
+| No-Mistakes | native, in `~/.no-mistakes/bin` | `no-mistakes update` |
+| Claude Code, Cursor (only when selected for `i`, `I`, or the pipeline) | native, under `~/.local/share/claude` or `~/.local/share/cursor-agent` | `claude update`, `cursor-agent update` |
+
+A native updater is offered only when the installed CLI lists it. Any other
+installation (for example npm, or a package manager not shown) gets manual
+guidance instead, and missing tools are left to setup. Each updater decides
+whether a newer release exists: Mini-Factory compares no versions, never runs a
+general `brew upgrade` or `apt upgrade`, and never installs unused agents.
+System prerequisites (Git, Make, jq, Python, curl, tar) keep setup's targeted
+checks.
+
+- **Stable only.** No-Mistakes is updated with plain `no-mistakes update`, never
+  `--beta`, `--force`, or `--yes`. Its updater reports a newer prerelease you
+  installed deliberately as already up to date instead of downgrading it, and it
+  refuses while pipeline runs are active; those runs are left alone, so rerun
+  `make update` after they finish. Manage beta releases yourself, outside
+  `make update`.
+- **Consent.** Declining keeps the installed version. Without an interactive
+  terminal (for example `ssh host 'cd mini-factory && make update'`), upgrade
+  prompts are skipped with the commands to run yourself; no approval is assumed.
+  A failed updater makes `make update` exit nonzero. It may already have changed
+  its tool, so nothing is rolled back; the setup and doctor output shows whether
+  the installation still works. A refused fast-forward or a failed setup also
+  exits nonzero with the action to take.
+- `make update` never runs automatically or in the background, and never edits
+  shell startup files.
+
 ## Managed files, diagnostics, and updates
 
 Setup copies the runtime into
@@ -622,15 +683,9 @@ Preparation keeps its last fetched default-branch commit under
 relevant log path. Herdr's default-session logs are under
 `~/.config/herdr/`; named-session logs live under its `sessions/NAME/` directory.
 
-To update from your retained clone:
+To update, run `make update` from your retained clone (see [Updating](#updating)).
 
-```sh
-git pull --ff-only
-make setup
-no-mistakes update   # optional: latest stable No-Mistakes, natively; refuses while runs are active
-```
-
-`make help` lists the four standalone targets. `make test` uses disposable homes
+`make help` lists the five standalone targets. `make test` uses disposable homes
 and Git repositories with mocked external tools; it needs Bash, Git, Make, jq,
 and Python 3.9+. It does not install packages or authenticate/run agents, and it
 needs no live No-Mistakes daemon, network installer, GitHub write, or real PR.
@@ -649,13 +704,13 @@ Before committing changes, review the diff and run the focused checks:
 git diff --check
 make test
 # For changes to the launcher, setup/doctor, or worker shell scripts:
-bash -n bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
-shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+bash -n bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
 ```
 
-Commit and push reviewed changes to this repository. Users update their clone
-with `git pull --ff-only`, then run `make setup` to refresh the installed copy.
-There is no background updater or automatic cross-repository sync.
+Commit and push reviewed changes to this repository. Users update with
+`make update` from their clone (a fast-forward, consented tool upgrades, then
+`make setup`). There is no background updater or automatic cross-repository sync.
 
 Mini-Factory's own CI, `.github/workflows/ci.yml`, runs `make test` on an Ubuntu
 runner for every pull request and push to `main`, with read-only repository
@@ -672,7 +727,10 @@ No-Mistakes support against the v1.84.0 (latest stable) documentation and native
 help on 2026-11-01; `mf-config` against Codex CLI 0.166.0, Claude Code 2.1.316,
 Cursor CLI 2026.10.22, Gum 2.0.2, and Herdr 0.9.5 help on 2026-11-01; and
 `nm-config` against the No-Mistakes v1.84.0 global config reference and its
-native config loader (`no-mistakes doctor`) on 2026-11-01. Mocked
+native config loader (`no-mistakes doctor`) on 2026-11-01; and `make update`
+against the native help and installers of Herdr 0.9.5, Codex CLI 0.166.0,
+Claude Code 2.1.316, Cursor CLI 2026.10.22, and GitHub CLI 2.103.3, and the
+No-Mistakes v1.84.0 updater source, on 2026-11-02. Mocked
 macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those
@@ -694,3 +752,6 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
 4. Confirm the agent's final report gives the actual No-Mistakes outcome and the
    open PR URL, including any skips, overrides, or blockers, and that the PR was
    not merged.
+5. From the clone, `make update` fast-forwards (or reports already up to date),
+   offers only the native upgrades that match each tool's installation, and
+   ends with setup's doctor report.
