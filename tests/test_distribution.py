@@ -1729,12 +1729,16 @@ class DistributionTests(unittest.TestCase):
                       "and needs Node.js 22.13+; your current shell's " + str(self.mock / "node") + " does not count",
                       result.stdout)
         self.assertIn("OK: Node.js 22.13+ for acpx", result.stdout.splitlines())
+        # A running daemon keeps the PATH it started with, so the action includes restarting it before doctor.
+        self.assertIn("restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun "
+                      "make doctor.", result.stdout)
         doctor = self.run_script(self.installed / "scripts/doctor.sh")
         self.assertNotEqual(doctor.returncode, 0)
         self.assertIn("OK: Node.js 22.13+ for acpx", doctor.stdout.splitlines())
         self.assertIn("FAIL: Node.js 22.13+ required by acpx from the No-Mistakes daemon's PATH (", doctor.stdout)
         self.assertIn("which finds " + str(self.daemon_node) + " v18.19.1; your shell's Node.js does not count",
                       doctor.stdout)
+        self.assertIn("restart the No-Mistakes daemon, which keeps the PATH it started with", doctor.stdout)
         self.assertEqual(self.daemon_node.read_text(), old_node)
         self.assertFalse(self.npm_changes() + self.calls("sudo")
                          + [c for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])])
@@ -1747,7 +1751,7 @@ class DistributionTests(unittest.TestCase):
         self.assert_success(self.setup())
         doctor = self.run_script(self.installed / "scripts/doctor.sh")
         self.assert_success(doctor)
-        self.assertIn("OK: Node.js 22.13+ runs from the No-Mistakes daemon's PATH", doctor.stdout.splitlines())
+        self.assertIn("OK: Node.js 22.13+ runs from the No-Mistakes daemon's freshly resolved PATH", doctor.stdout.splitlines())
         self.assertEqual(self.daemon_node.read_text(), old_node)
         self.assert_no_actions()
 

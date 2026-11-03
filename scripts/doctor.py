@@ -355,14 +355,15 @@ def main():
         acpx, acpx_problem = None, str(error)
     path = daemon_path()
     # acpx starts the node the daemon's PATH finds first; a suitable node in your shell does not stand in for it.
+    # The PATH is resolved afresh, as a newly started daemon would; a running daemon keeps the PATH it started with.
     found = (output(["env", "PATH=" + path, "/bin/sh", "-c",
                      'command -v node && { node --version || echo "of unknown version"; }']) or "").splitlines()
     daemon_node = node_version(found[1]) if len(found) == 2 else None
-    check(daemon_node is not None and daemon_node >= (22, 13), "Node.js 22.13+ runs from the No-Mistakes daemon's PATH",
+    check(daemon_node is not None and daemon_node >= (22, 13), "Node.js 22.13+ runs from the No-Mistakes daemon's freshly resolved PATH",
           "Node.js 22.13+ required by acpx from the No-Mistakes daemon's PATH (" + path + "), which finds "
           + (found[0] + " " + found[1].strip() if len(found) == 2 else "no Node.js")
           + "; your shell's Node.js does not count. Put a 22.13+ first on that PATH, then run make setup for the "
-          "exact action")
+          "exact action and restart the No-Mistakes daemon, which keeps the PATH it started with")
     service = acpx and output(["env", "PATH=" + path, "/bin/sh", "-c",
                                'command -v "$1" >/dev/null && "$1" --version', "sh", acpx])
     configured = "" if acpx in (None, "acpx") else " (acpx_path: " + acpx + ")"

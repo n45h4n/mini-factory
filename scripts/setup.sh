@@ -689,7 +689,7 @@ ensure_node_and_acpx() {
 			found="$(command -v node) is Node.js $(node --version 2>/dev/null || printf 'of unknown version')"
 			command -v npm >/dev/null 2>&1 || found="$found without npm"
 		fi
-		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup."
+		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
 		return 0
 	fi
@@ -700,7 +700,7 @@ ensure_node_and_acpx() {
 		if [ -n "$daemon_node" ]; then
 			found="$daemon_node, Node.js $(env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null || printf 'of unknown version')"
 		fi
-		notice "Remaining action: the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories) finds $found first, but acpx runs with that PATH and needs Node.js 22.13+; your current shell's $(command -v node) does not count. Setup never replaces an existing Node.js or version manager: put a Node.js 22.13+ first on that PATH yourself (for example by activating your version manager's 22.13+ default in your login shell's startup files, or by upgrading the Node.js found there with the tool that installed it), then rerun make setup."
+		notice "Remaining action: the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories) finds $found first, but acpx runs with that PATH and needs Node.js 22.13+; your current shell's $(command -v node) does not count. Setup never replaces an existing Node.js or version manager: put a Node.js 22.13+ first on that PATH yourself (for example by activating your version manager's 22.13+ default in your login shell's startup files, or by upgrading the Node.js found there with the tool that installed it), then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
 	fi
 	# An existing acpx the daemon can run (from ~/bin, Homebrew, ... or acpx_path) is reused as is.
@@ -732,7 +732,7 @@ ensure_node_and_acpx() {
 		notice "Remaining action: npm ${npm_arguments[*]} (acpx, the ACP runner No-Mistakes uses for Cursor), then rerun make setup"
 		pending=1
 	else
-		notice "Remaining action: $(command -v acpx) runs only from your current shell PATH, not from the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories). Make acpx and the Node.js 22.13+ it runs available there (for example from your login shell's startup files, or npm install -g --prefix ~/.local acpx@latest with a Homebrew, apt, or nodejs.org Node.js), then rerun make setup."
+		notice "Remaining action: $(command -v acpx) runs only from your current shell PATH, not from the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories). Make acpx and the Node.js 22.13+ it runs available there (for example from your login shell's startup files, or npm install -g --prefix ~/.local acpx@latest with a Homebrew, apt, or nodejs.org Node.js), then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
 	fi
 }
