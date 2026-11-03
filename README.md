@@ -4,13 +4,19 @@
 git clone https://github.com/n45h4n/mini-factory.git
 cd mini-factory
 make setup ISSUE_AGENT=codex   # or claude, or cursor
+# Optional: also choose the PRs I reviewer, for example Cursor for every role:
+# make setup ISSUE_AGENT=cursor PR_REVIEW_AGENT=cursor
 ```
 
 `ISSUE_AGENT` selects the shared agent for both issue actions and is saved in
 `${XDG_CONFIG_HOME:-$HOME/.config}/mini-factory/issue-agent`. Without it, the
 first setup saves `codex` and later runs keep the saved choice; rerun with a new
-value to change it. To choose the `i` and `I` agents separately, or a model and
-effort per key, use [`mf-config`](#agent-profiles-mf-config). **Keep this clone**: No-Mistakes reads its configuration
+value to change it. `PR_REVIEW_AGENT` saves the PRs `I` reviewer in the
+`mf-config` profile (Codex is the default; without it, setup keeps the saved
+reviewer). To choose the `i` and `I` agents separately, or a model and
+effort per key, use [`mf-config`](#agent-profiles-mf-config). Setup installs
+Codex, Claude Code, and Cursor regardless, so changing a role later needs no
+new install. **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
 [No-Mistakes](#no-mistakes-configuration-and-unattended-runs); edit it with
 [`nm-config`](#no-mistakes-global-defaults-nm-config)). Update later with
@@ -35,7 +41,7 @@ ghd
 | ---- | --- | ------ |
 | Issues | `i` | Prepare the issue with the selected agent: check it against freshly fetched `main` (the default branch), then edit only its title/body into an executable prompt and report **ready to dispatch**, **needs a decision**, or **already satisfied**. |
 | Issues | `I` | Implement the issue with the selected agent, commit it, and run No-Mistakes unattended (`--yes`) to an open PR. Never merges. |
-| PRs | `I` | Review the PR with **Codex** (unchanged; see [What the workflows do](#what-the-workflows-do)). |
+| PRs | `I` | Review the PR **read-only** with the selected agent (Codex by default, or Claude Code or Cursor). Findings appear only in the reviewer's Herdr pane; nothing is posted to GitHub (see [What the workflows do](#what-the-workflows-do)). |
 
 **Each target repository needs PR checks.** No-Mistakes reports a finished run
 only when the PR has registered checks (GitHub Actions or external CI), or when
@@ -46,8 +52,9 @@ before relying on `I`; see the [CI prerequisite](#ci-prerequisite-for-each-targe
 The selected item must belong to the source repository captured by `ghd`; the
 existing helpers enforce that identity. Agents start with their native model
 defaults unless you save a model/effort with [`mf-config`](#agent-profiles-mf-config).
-Neither setup nor `mf-config` adds trust or permission overrides: review
-each agent's native repository trust and permission prompts yourself (see
+Neither setup nor `mf-config` adds trust or permission overrides; only the PR
+reviewer starts in its native read-only mode. Review each agent's native
+repository trust and permission prompts yourself (see
 [Agent permissions](#agent-permissions-for-unattended-issue-runs)).
 
 If you already have a Herdr session, run this from an existing Herdr shell pane
@@ -112,14 +119,14 @@ default `ctrl+b`, then `q`, and reattach with `herdr --session my-project`.
 ## Installation and authentication
 
 Setup checks tools first and reuses suitable installations. The runtime needs
-Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Gum, Codex, Herdr,
-No-Mistakes (its stable `axi run --intent`/`--yes` interface), the agents
-selected for issue `i` and `I`, the configured No-Mistakes pipeline agent, and
-the standard system utilities used by the dispatchers. Unused agents are not
-installed.
-**Codex is always required** because the PR `I` review route still runs Codex,
-even when Claude Code or Cursor handles issues. Python supports diagnostics and
-safe log handling; no pip packages are needed.
+Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Gum, Herdr,
+No-Mistakes (its stable `axi run --intent`/`--yes` interface), **all three
+agent CLIs (Codex, Claude Code, and Cursor)**, Node.js 22.13+ with npm, `acpx`,
+and the standard system utilities used by the dispatchers. These are installed
+whichever agents the roles currently select, so a later `mf-config` or
+`nm-config` change needs no new install; only the agents in use need login
+(below). Python supports diagnostics and safe log handling; no pip packages are
+needed.
 The GitHub CLI minimum avoids the community Ubuntu 2.45/2.46 releases' deprecated
 API failures documented by [GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#ubuntu-community).
 Curl and tar support the native installers. Missing tools are installed only
@@ -134,16 +141,39 @@ with consent, each through its own upstream installer, placing commands in
 | Herdr | [installer](https://herdr.dev/install.sh) | n/a |
 | No-Mistakes | [install script](https://github.com/kunchenguid/no-mistakes/blob/main/docs/install.sh) (binary in `~/.no-mistakes/bin`, user daemon service) | n/a |
 
-None of these needs Node/npm. The exception is Cursor as the **No-Mistakes
-pipeline agent**: No-Mistakes runs it through the ACP runner `acpx`, which needs
-Node.js 22.13+. Setup does not install Node.js; with a suitable Node/npm already
-on `PATH` it offers acpx's documented `npm install -g acpx@latest`, adding
-`--prefix ~/.local` when npm's global prefix is not user-writable so acpx never
-needs sudo. Without a suitable Node/npm, or when you decline, setup reports
-Node.js 22.13+ and acpx as a remaining action.
-Cursor as the issue agent alone does not need acpx. Existing installations whose
-capabilities fail doctor need deliberate repair/update through their own
-installer; setup does not silently upgrade unrelated software.
+None of these needs Node/npm. No-Mistakes runs Cursor (`cursor` or
+`acp:cursor`, as the pipeline agent or any review role) through the ACP runner
+`acpx`, which needs Node.js 22.13+, so both are baseline:
+
+- **Node.js and npm**: a suitable existing Node.js (any version manager) is
+  reused. Only when `node` is missing does setup offer `brew install node` on
+  macOS, or on Ubuntu `sudo apt-get install nodejs` (then `npm` if separate)
+  when your configured apt sources offer 22.13+ (Ubuntu's own archive may be
+  older; a configured NodeSource source qualifies). Otherwise, and for an older
+  Node.js, setup prints the exact action and reports setup pending; it never
+  replaces an existing Node.js or version manager, npm prefix, or shell file.
+- **acpx**: an existing `acpx` the daemon can run is reused. Otherwise setup
+  offers acpx's documented `npm install -g acpx@latest`, adding
+  `--prefix ~/.local` when npm's global prefix is not user-writable or not on
+  the No-Mistakes daemon's PATH, so acpx never needs sudo. npm's configured
+  prefix is not changed.
+- **Visible to the daemon**: the No-Mistakes daemon runs as a user service
+  that adopts your login shell's PATH (probed as an interactive login shell for
+  bash and zsh, so fnm or nvm set up in their startup files count) plus
+  `~/.local/bin`, `~/go/bin`, `~/.cargo/bin`, `~/bin`, `/opt/homebrew/bin` and
+  `sbin`, `/usr/local/bin` and `sbin`, `/usr/bin`, `/bin`, `/usr/sbin`, and
+  `/sbin`. Setup and doctor resolve that PATH the same way and check that
+  `acpx` (and the `node` it starts) runs from it, and that the first `node` on
+  it is 22.13+. That check is separate from the shell Node.js and npm that
+  install acpx: a suitable Node.js in your current shell does not stand in for
+  an older one that the daemon finds first. When the No-Mistakes global
+  config sets `acpx_path`, that executable is checked instead and setup never
+  installs over it. An `acpx` or Node.js that only your current shell provides
+  fails this check with the exact action instead of passing silently.
+
+Existing installations whose capabilities fail doctor need deliberate
+repair/update through their own installer; setup does not silently upgrade
+unrelated software.
 
 Every package install, privileged operation, login, and configuration change
 requires explicit consent. With no interactive terminal, setup reports the
@@ -170,14 +200,22 @@ extension, with consent, when it is missing:
 gh extension install dlvhdr/gh-dash
 ```
 
-Agent authentication stays in each agent's CLI; setup checks the `i` and `I`
-agents, the pipeline agent, and Codex (PR reviews), and offers only the missing logins:
+Agent authentication stays in each agent's CLI. Setup and doctor require login
+only for agents that are actually used: by a gh-dash role (`i`, `I`, or PRs
+`I`), or by a No-Mistakes duty (the pipeline `agent` and any
+`review_agents` reviewer/fixer/later-round role, with `acp:cursor` counting as
+Cursor). Setup offers only the missing logins; installed but unused agents may
+stay logged out. With the defaults, that is Codex only.
 
 ```sh
 codex login --device-auth
-claude auth login         # when Claude Code is selected
-cursor-agent login        # when Cursor is selected; set NO_OPEN_BROWSER=1 when headless
+claude auth login         # when Claude Code is used
+cursor-agent login        # when Cursor is used; set NO_OPEN_BROWSER=1 when headless
 ```
+
+For `agent: auto` or a fallback list, No-Mistakes picks the agent itself;
+doctor notes that and relies on native `no-mistakes doctor`, so log in to those
+agents yourself.
 
 Enable device-code login in your ChatGPT security settings or workspace
 permissions first, then open its URL and enter its one-time code in your own
@@ -187,7 +225,8 @@ browser, or OpenAI's documented SSH callback forwarding flow. See
 paste credentials into these scripts or share your authentication files. Setup
 does not collect or log login output; the native CLIs control their own storage.
 
-After establishing `${CODEX_HOME:-$HOME/.codex}`, setup offers:
+Herdr detects the gh-dash agents through native integrations. When Codex
+handles a gh-dash role, after establishing `${CODEX_HOME:-$HOME/.codex}`, setup offers:
 
 ```sh
 herdr integration install codex
@@ -196,10 +235,12 @@ herdr integration install codex
 This changes Codex's native hook/configuration files: `herdr-agent-state.sh`,
 `hooks.json`, and hook settings in `config.toml`. The native Herdr installer owns
 this operation and preserves other settings; we do not implement a second
-config editor. When Claude Code or Cursor handles `i` or `I`, setup also offers
-`herdr integration install claude` or `herdr integration install cursor`, which
-add Herdr's state hook to that agent's user configuration. Review any native
-decisions yourself. Check with `herdr integration status`.
+config editor. When Claude Code or Cursor handles `i`, `I`, or PRs `I`, setup
+offers `herdr integration install claude` or `herdr integration install cursor`,
+which add Herdr's state hook to that agent's user configuration. No-Mistakes
+runs its agents without Herdr, so an agent used only by a No-Mistakes duty
+needs no integration. Review any native decisions yourself. Check with
+`herdr integration status`.
 
 ### Agent permissions for unattended issue runs
 
@@ -220,7 +261,7 @@ blocked in Herdr.
 | ------- | ------- | ----- |
 | Issues `i` preparer | Codex, Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
 | Issues `I` implementer | Codex, Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
-| PRs `I` reviewer | Codex only | model, reasoning effort, Fast |
+| PRs `I` reviewer | Codex (default), Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
 
 ```sh
 mf-config          # Gum editor: pick one profile, choose, preview, confirm
@@ -262,9 +303,12 @@ metadata, which is a convenience, not proof of account access:
 Profiles apply only when a **fresh** Herdr agent starts, translated to the
 native interactive options `--model`, Codex `--config model_reasoning_effort=...`
 and `--config service_tier=...`, and Claude Code `--effort`. A fresh launch
-refuses an option the installed CLI does not offer. The PR reviewer keeps its
-`--strict-config`, read-only permission profile, and worktree isolation; only
-its model/effort/Fast are appended. A working, blocked, or idle agent is
+refuses an option the installed CLI does not offer. The PR reviewer always
+starts in its native interactive read-only mode (see
+[What the workflows do](#what-the-workflows-do)), and a fresh launch refuses a
+CLI whose help does not offer that mode; only its model/effort/Fast are
+appended. `make setup PR_REVIEW_AGENT=...` saves a bare reviewer harness (or,
+for `codex`, removes the override), keeping saved options for the same harness. A working, blocked, or idle agent is
 reused with its original harness and options and is never restarted because
 settings differ. To apply new preferences, close it (exit the agent in its
 pane), then press the key again.
@@ -356,14 +400,59 @@ outcomes and blockers.
 
 The distribution contains only these issue and PR review integrations. It does
 not include Pepper/Factory workflows, queues, Supervisors, or Docker sandbox
-infrastructure. The worker file names still say `codex` for compatibility; the
-issue workers run the selected agent.
+infrastructure. The worker file names, state directories, and refs still say
+`codex` for compatibility; the issue and PR workers run the selected agent.
 
-PR **I is not read-only**. It opens/reuses a PR review worktree and asks Codex to
-review the selected PR. The existing prompt can publish or update the review
-comment carrying the marker `<!-- gh-dash-codex-pr-review -->`. Under its existing
-all-clear conditions it can also mark a draft PR ready. Review runs use your
-own GitHub identity and permissions.
+PR **I** is an interactive, read-only, terminal-only review. It verifies the
+selected PR's head and base, fetches both (the base without updating any local
+ref), and opens or reuses a clean, detached review worktree at the PR head in
+its own Herdr workspace. It writes the PR's complete diff from the merge base
+(`git diff --stat --patch`) to a private file outside the worktree, named by
+the merge-base and PR-head commits and never rewritten, then starts the
+`mf-config` reviewer (Codex by default) in its native interactive read-only
+mode:
+
+| Reviewer | Native read-only launch |
+| -------- | ----------------------- |
+| Codex | `--ask-for-approval never --strict-config --cd WORKTREE` with a launch-scoped `:read-only` permission profile and no network |
+| Claude Code | `--permission-mode plan` (Plan mode), `--setting-sources user`, `--add-dir` for the diff |
+| Cursor | `--mode ask` (Ask mode), `--add-dir` for the diff |
+
+The PR author controls the review worktree's project settings, which can run
+commands as you when an agent starts. Claude Code therefore loads only your user
+settings (your Herdr hooks still run), never the PR's `.claude/settings.json`,
+`.claude/settings.local.json`, or `.mcp.json` servers. Cursor CLI has no option
+to skip project hooks: once you trust the worktree, it runs `.cursor/hooks.json`
+and Claude project hooks from those two settings files. PR `I` therefore refuses
+to start or prompt a Cursor reviewer when the PR head defines hooks there; pick
+Codex or Claude Code for that PR with `mf-config`. Cursor still asks before
+starting project MCP servers; decline them in the pane. Codex loads the
+worktree's `.codex/config.toml` (including MCP servers it starts at launch)
+and `.codex/rules` exec policies (whose allow rules run commands outside the
+sandbox) once the repository is trusted, and a review worktree inherits the
+trust of your main checkout. Its interactive CLI has no option to skip project
+config, so PR `I` refuses to start or prompt a Codex reviewer when the PR head
+has `.codex/config.toml`, `.codex/rules`, or `.codex/hooks.json`, or when
+`.codex` is a symbolic link; pick Claude Code or Cursor for that PR. Other
+`.codex` content, such as skills, does not block Codex.
+
+The prompt asks for concise, actionable findings ordered by severity with
+file/line references, or an explicit "no actionable findings", **in the
+reviewer's pane only**. PR `I` posts no comments or reviews, never changes
+draft/ready state, and makes no other GitHub change, commit, or push. These
+native modes are not hardened OS sandboxes, and an agent may still offer to
+leave its read-only mode (for example Claude Code's plan approval); decline
+that in the pane. A repeated `I` never
+starts a second reviewer: an idle, finished, or working reviewer gets the
+review prompt again with the current diff in its own file, while diffs from
+earlier prompts stay readable until a fresh reviewer starts; a blocked one (for example waiting on
+a plan or trust prompt) and one with an unknown status are focused instead,
+never typed into. A live reviewer keeps its original harness and options; a new
+`mf-config` choice applies once you exit it in its pane and press `I` again.
+Herdr does not report a live reviewer's launch options, so PR `I` cannot verify
+that a reused reviewer is still read-only: it warns that it may not be, and
+never restarts or replaces it. Exit it in its pane and press `I` again to start
+a fresh reviewer with the configured read-only options.
 
 `ghd` captures the physical source root, canonical GitHub repository, branch,
 commit SHA, and dirty status **before** opening gh-dash. New implementation
@@ -498,8 +587,9 @@ review_agents:
   without blocking the edit.
 - Setup installs a managed `~/.local/bin/nm-config` only when no other
   `nm-config` exists (for example from dotfiles); otherwise run `bin/nm-config`
-  from this clone. Setup provisions only the pipeline and issue agents, so
-  install and log in to any other review-role harness natively.
+  from this clone. Setup installs Codex, Claude Code, Cursor, and `acpx`, and
+  checks login for any of them a pipeline or review role uses (including
+  `acp:cursor`); install and log in to any other harness natively.
 
 **Unattended means `--yes`.** `no-mistakes axi run --yes` resolves ordinary
 gates natively: it selects the findings for a fix round, accepts the result, and
@@ -577,9 +667,10 @@ It then:
    one of them (or adds a file where you have an untracked one), or `main` has
    diverged, it stops before changing anything and prints the manual steps. It
    never resets, stashes, force-pulls, or discards configuration.
-2. **Offers optional upgrades**, each with its own `[y/N]` consent, for the
-   installed tools this installation uses, through the mechanism that matches
-   how each one was installed (table below).
+2. **Offers optional upgrades**, each with its own `[y/N]` consent, for every
+   installed tool Mini-Factory provisions (including all three agent CLIs and
+   `acpx`, whichever roles use them), through the mechanism that matches how
+   each one was installed (table below).
 3. **Runs `make setup`**, which refreshes the managed runtime and ends with the
    doctor checks, then prints a summary.
 
@@ -590,13 +681,18 @@ It then:
 | Herdr | native `~/.local/bin/herdr` | `herdr update` (no `--handoff`) |
 | Codex | standalone, under `${CODEX_HOME:-~/.codex}/packages/standalone` | `codex update` |
 | No-Mistakes | native, in `~/.no-mistakes/bin` | `no-mistakes update` |
-| Claude Code, Cursor (only when selected for `i`, `I`, or the pipeline) | native, under `~/.local/share/claude` or `~/.local/share/cursor-agent` | `claude update`, `cursor-agent update` |
+| Claude Code, Cursor (whichever roles use them) | native, under `~/.local/share/claude` or `~/.local/share/cursor-agent` | `claude update`, `cursor-agent update` |
+| Node.js and npm | Homebrew `node` formula, or apt `nodejs` (with `npm` when installed separately) | `brew upgrade node`; or `sudo apt-get update`, then `sudo apt-get install --only-upgrade nodejs npm` |
+| acpx | setup's npm install (`~/.local`, or a writable npm global prefix) | `npm install -g [--prefix ~/.local] acpx@latest` |
 
 A native updater is offered only when the installed CLI lists it. Any other
 installation (for example npm, or a package manager not shown) gets manual
-guidance instead, and missing tools are left to setup. Each updater decides
-whether a newer release exists: Mini-Factory compares no versions, never runs a
-general `brew upgrade` or `apt upgrade`, and never installs unused agents.
+guidance instead, and missing tools are left to setup. A Node.js from fnm, nvm,
+Volta, or another installer gets the exact command to run yourself: `make update`
+never changes a Node version manager, npm prefix, or shell configuration, and the
+setup/doctor run that follows checks that `acpx` still runs for the No-Mistakes
+daemon. Each updater decides whether a newer release exists: Mini-Factory
+compares no versions and never runs a general `brew upgrade` or `apt upgrade`.
 System prerequisites (Git, Make, jq, Python, curl, tar) keep setup's targeted
 checks.
 
@@ -658,18 +754,19 @@ make doctor
 
 Doctor separates **installed**, **authentication/setup pending**, and **ready to
 launch from this context**. It checks the tools and versions above (including
-Gum), the shared issue agent and each issue key's effective agent, authentication
-for Codex, the `i`/`I` agents, and the pipeline agent,
-their Herdr integrations, `acpx` when Cursor is the pipeline agent, the
+Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
+22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
+effective agent, authentication for the agents a gh-dash role or No-Mistakes
+duty uses, Herdr integrations for the gh-dash roles' agents only, the
 No-Mistakes configuration link, and the pipeline agent's readiness via native
-`no-mistakes doctor` (run without update checks or telemetry). Doctor checks
-pipeline login only for `agent: claude`, `codex`, or `cursor`; for other native
-selections such as `auto`, `acp:...`, or agent lists it prints a note and relies
-on native doctor, which proves only that the agent runs, so log in to that agent
-through its own CLI. Outside Herdr it
-skips runtime-context checks and explains how to enter a pane. Inside Herdr it
-checks the inherited route, active compatible server, Codex and issue-agent
-detection manifests, target repository, and Git transport. It notes, without
+`no-mistakes doctor` (run without update checks or telemetry). Unused agents may
+stay logged out. Doctor checks No-Mistakes login only for duties set to
+`claude`, `codex`, `cursor`, or `acp:cursor`; for other native selections such
+as `auto` or agent lists it prints a note and relies on native doctor, which
+proves only that the agent runs, so log in to that agent through its own CLI.
+Outside Herdr it skips runtime-context checks and explains how to enter a pane.
+Inside Herdr it checks the inherited route, active compatible server, the
+gh-dash roles' detection manifests, target repository, and Git transport. It notes, without
 failing, when the optional `mf-config` or `nm-config` launcher is not on `PATH`. It never starts
 agents or pipelines, creates worktrees, sends prompts, writes PR comments, or
 marks PRs ready. It returns nonzero for required failed/pending checks.
@@ -677,7 +774,9 @@ marks PRs ready. It returns nonzero for required failed/pending checks.
 Dispatcher diagnostics live in
 `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-issue/` (preparation logs
 end in `-prepare.log`; captured intents are in its private `intents/`
-directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`.
+directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`
+(review diffs are in its private `contexts/` directory, one
+`pr-MERGE_BASE-HEAD.diff` per reviewed commit pair).
 Preparation keeps its last fetched default-branch commit under
 `refs/gh-dash-issue-prepare/` in the target repository. Dispatch reports the
 relevant log path. Herdr's default-session logs are under
@@ -730,7 +829,19 @@ Cursor CLI 2026.10.22, Gum 2.0.2, and Herdr 0.9.5 help on 2026-11-01; and
 native config loader (`no-mistakes doctor`) on 2026-11-01; and `make update`
 against the native help and installers of Herdr 0.9.5, Codex CLI 0.166.0,
 Claude Code 2.1.316, Cursor CLI 2026.10.22, and GitHub CLI 2.103.3, and the
-No-Mistakes v1.84.0 updater source, on 2026-11-02. Mocked
+No-Mistakes v1.84.0 updater source, on 2026-11-02; and the selectable read-only
+PR reviewer against the native help of Codex CLI 0.166.0 (including a local
+`codex sandbox` check of the no-network `:read-only` profile), Claude Code
+2.1.317 (`--permission-mode plan`, `--add-dir`), and Cursor CLI 2026.10.22
+(`--mode ask`, `--add-dir`) on 2026-11-02; and, with local hook fixtures on
+2026-11-03, that Claude Code 2.1.317 with `--setting-sources user` skips project
+and local hooks and `.mcp.json` servers while running user hooks, and that
+trusted Cursor CLI 2026.10.22 Ask mode runs `.cursor/hooks.json` and Claude
+project hooks; and, against the Codex CLI 0.166.0 source and an isolated local
+`codex mcp list` check on 2026-11-03, that a linked worktree of a trusted main
+checkout loads that worktree's `.codex/config.toml` MCP servers and
+`.codex/rules`, while hook declarations come from the main checkout and run
+only with persisted hook trust. Mocked
 macOS/Ubuntu coverage is not
 native verification. Native macOS and Ubuntu Server installation and live
 Herdr/agent/No-Mistakes onboarding still need verification by users on those
@@ -752,6 +863,11 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
 4. Confirm the agent's final report gives the actual No-Mistakes outcome and the
    open PR URL, including any skips, overrides, or blockers, and that the PR was
    not merged.
-5. From the clone, `make update` fast-forwards (or reports already up to date),
+5. In the PRs view, press `I` on that PR once for each reviewer (`mf-config`
+   PRs `I`: Codex, Claude Code, Cursor; exit the previous reviewer in its pane
+   first): each starts in its read-only mode, reads the diff file, and reports
+   findings or "no actionable findings" only in its pane. The PR gets no new
+   comment, review, or draft/ready change, and the review worktree stays clean.
+6. From the clone, `make update` fast-forwards (or reports already up to date),
    offers only the native upgrades that match each tool's installation, and
    ends with setup's doctor report.

@@ -12,7 +12,7 @@ defaults:
 keybindings:
   prs:
     - key: I
-      name: review PR in Codex
+      name: review PR read-only with the selected agent
       command: >-
         "${DOTFILES_DIR:?run through ghd}/scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh" "{{.RepoName}}" "{{.PrNumber}}"
   issues:

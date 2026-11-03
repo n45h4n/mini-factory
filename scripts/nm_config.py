@@ -35,6 +35,12 @@ USAGE = """usage: nm-config [show | --help]
   nm-config        edit No-Mistakes global defaults in Gum (needs an interactive terminal)
   nm-config show   print the configured global defaults without a terminal
 """
+# Internal, used by setup and doctor:
+#   nm-config duties FILE   print DUTY<TAB>AGENT<TAB>HARNESS per No-Mistakes duty; HARNESS is the
+#                           Mini-Factory-provisioned codex, claude, or cursor it needs, else "-"
+#   nm-config acpx-path FILE
+#                           print the acpx executable No-Mistakes runs for ACP agents: acpx_path, else acpx
+#   nm-config daemon-path   print the PATH the No-Mistakes daemon resolves at startup (see daemon_path)
 
 # Native No-Mistakes harnesses (v1.84.0 global config reference), independent of mf-config's issue agents.
 HARNESSES = {"codex": "Codex", "claude": "Claude Code", "grok": "Grok", "opencode": "OpenCode", "pi": "Pi",
@@ -618,6 +624,26 @@ def role_text(document, role, pipeline):
     return text
 
 
+def duties(document):
+    """(duty, configured agent, provisioned harness or None) for the pipeline agent and each set review role.
+
+    No-Mistakes itself resolves auto, fallback lists, and repository overrides; those name no single harness."""
+    node = document.get(("agent",))
+    if is_null(node):
+        found = [("agent", "auto")]
+    elif node.kind == "list":
+        found = [("agent", "ordered fallback list " + ", ".join(map(str, node.value)))]
+    else:
+        found = [("agent", str(scalar(node, ("agent",))))]
+    for role in ROLES:
+        agent = mapping(document, ("review_agents", role)).get("agent")
+        if not is_null(agent):
+            found.append(("review_agents." + role, str(scalar(agent, ("review_agents", role, "agent")))))
+    aliases = {target: name for name, target in ACP_ALIASES.items()}
+    return [(duty, agent, next((kind for kind in (agent, aliases.get(agent)) if kind in mf.HARNESSES), None))
+            for duty, agent in found]
+
+
 def show(link, target, document):
     print("No-Mistakes global config: " + str(link) + " -> " + str(target))
     print("Global defaults only: a target repository's trusted .no-mistakes.yaml may override the agent and")
@@ -738,8 +764,10 @@ def warn_pins(document, harness, knobs):
 def note_command(harness):
     command = COMMANDS.get(harness)
     if command and shutil.which(command) is None:
-        print("Note: " + command + " is not on PATH. make setup provisions the pipeline and issue agents only; "
-              "install and log in to " + label(harness) + " natively for review roles.")
+        print("Note: " + command + " is not on PATH. " + (
+            "Rerun make setup, which installs it." if harness in mf.HARNESSES else
+            "make setup provisions only Codex, Claude Code, and Cursor; install and log in to " + label(harness)
+            + " natively."))
 
 
 def edit_agent(text, target):
@@ -756,8 +784,8 @@ def edit_agent(text, target):
     if choice == (current or "auto"):
         return text
     if choice in mf.HARNESSES:
-        print("make setup installs and logs in to the pipeline agent; rerun it after saving if "
-              + label(choice) + " is new on this machine.")
+        print("make setup logs in to the agents No-Mistakes uses; rerun it after saving if "
+              + label(choice) + " is not logged in on this machine.")
     elif choice in HARNESSES:
         print("make setup does not provision " + label(choice) + "; install and log in to it natively.")
         note_command(choice)
@@ -829,6 +857,9 @@ def edit_role(text, target, role):
         print("Rounds 1-" + str(after) + " use the " + role.replace("_after_round", "") + "; from round "
               + str(after + 1) + " the " + ROLES[role] + " applies.")
     warn_pins(document, harness, knobs)
+    if harness in mf.HARNESSES:
+        print("make setup logs in to the agents No-Mistakes uses, including this role's; rerun it after saving if "
+              + label(harness) + " is not logged in on this machine.")
     note_command(harness)
     return apply(text, path, knobs)
 
@@ -988,6 +1019,64 @@ def edit():
     return 0
 
 
+def daemon_path():
+    """The PATH stable No-Mistakes (v1.84.0 shellenv) gives its daemon and agents: the user service starts with
+    the fixed well-known directories, probes the login shell (interactive for bash/zsh, where nvm and fnm are
+    usually sourced) for its environment, allowing it shellenv's 30 seconds, and appends any well-known directory
+    the shell PATH lacks. When the probe fails, only the well-known directories remain."""
+    home = os.environ.get("HOME") or str(Path.home())
+    known = [os.path.join(home, name) for name in (".local/bin", "go/bin", ".cargo/bin", "bin")] + [
+        "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin", "/usr/bin", "/bin",
+        "/usr/sbin", "/sbin"]
+    shell = os.environ.get("SHELL", "").strip()
+    if not shell:
+        try:
+            import pwd
+            shell = pwd.getpwuid(os.getuid()).pw_shell.strip()
+        except (ImportError, KeyError, OSError):
+            shell = ""
+    shell = shell or "bash"
+    environment = {key: os.environ[key] for key in ("USER", "LOGNAME") if key in os.environ}
+    environment.update(HOME=home, PATH=os.pathsep.join(known), SHELL=shell)
+    interactive = ["-i"] if os.path.basename(shell) in ("bash", "zsh") else []
+    entries = []
+    try:
+        # Detached from this terminal, as the daemon's probe is; rc-file output on stderr is discarded.
+        process = subprocess.Popen([shell, "-l", *interactive, "-c", "env -0"], env=environment,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            out = process.communicate(timeout=30)[0]
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            finally:
+                # Detached rc-file helpers may retain stdout after the shell dies; do not wait for EOF.
+                process.stdout.close()
+            out = b""
+        if process.returncode == 0:
+            entries = out.decode("utf-8", "replace").split("\0")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    path = []
+    for part in entries:
+        # Like shellenv, an entry may follow rc-file output on its own line.
+        for start in [0] + [index + 1 for index, character in enumerate(part) if character in "\r\n"]:
+            key, separator, value = part[start:].lstrip("\r\n").partition("=")
+            if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                break
+        else:
+            continue
+        if key == "PATH":
+            path = [entry for entry in value.split(os.pathsep) if entry]
+            break
+    return os.pathsep.join(path + [directory for directory in known if directory not in path])
+
+
 def main(argv):
     if argv in (["--help"], ["-h"], ["help"]):
         print(USAGE, end="")
@@ -995,6 +1084,28 @@ def main(argv):
     if argv == ["show"]:
         link, target = live_config()
         show(link, target, load(read(target)[1], target))
+        return 0
+    if len(argv) == 2 and argv[0] == "duties":
+        target = Path(argv[1])
+        try:
+            found = duties(load(read(target)[1], target))
+        except Unsafe as error:
+            raise ConfigError("cannot safely read the No-Mistakes duties in " + str(target) + ": " + str(error))
+        for duty, agent, harness in found:
+            print(duty + "\t" + " ".join(agent.split()) + "\t" + (harness or "-"))
+        return 0
+    if len(argv) == 2 and argv[0] == "acpx-path":
+        target = Path(argv[1])
+        try:
+            node = load(read(target)[1], target).get(("acpx_path",))
+            # Native No-Mistakes runs a nonempty acpx_path verbatim (no ~ expansion), else acpx from its PATH.
+            value = None if is_null(node) else scalar(node, ("acpx_path",))
+        except Unsafe as error:
+            raise ConfigError("cannot safely read acpx_path in " + str(target) + ": " + str(error))
+        print("acpx" if value in (None, "") else value)
+        return 0
+    if argv == ["daemon-path"]:
+        print(daemon_path())
         return 0
     if argv:
         print(USAGE, end="", file=sys.stderr)
