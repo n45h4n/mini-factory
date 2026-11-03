@@ -35,6 +35,12 @@ USAGE = """usage: nm-config [show | --help]
   nm-config        edit No-Mistakes global defaults in Gum (needs an interactive terminal)
   nm-config show   print the configured global defaults without a terminal
 """
+# Internal, used by setup and doctor:
+#   nm-config duties FILE   print DUTY<TAB>AGENT<TAB>HARNESS per No-Mistakes duty; HARNESS is the
+#                           Mini-Factory-provisioned codex, claude, or cursor it needs, else "-"
+#   nm-config acpx-path FILE
+#                           print the acpx executable No-Mistakes runs for ACP agents: acpx_path, else acpx
+#   nm-config daemon-path   print the PATH the No-Mistakes daemon resolves at startup (see daemon_path)
 
 # Native No-Mistakes harnesses (v1.84.0 global config reference), independent of mf-config's issue agents.
 HARNESSES = {"codex": "Codex", "claude": "Claude Code", "grok": "Grok", "opencode": "OpenCode", "pi": "Pi",
@@ -174,6 +180,42 @@ def flow_list(line, index, number):
         raise Unsafe("unsupported flow list", number)
 
 
+FLOW_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"&*!|>%@`{}\[\],?:-][^\s,\[\]{}:#]*)[ \t]*:(?=[ \t,}]|$)""")
+
+
+def flow_map(line, index, number):
+    """A one-line flow mapping of scalars, scalar lists, and nested one-line flow mappings: (children, end).
+
+    Read-only: only the duties reader accepts it, so edits never rewrite flow YAML."""
+    children, index = {}, skip(line, index + 1)
+    while not line.startswith("}", index):
+        match = FLOW_KEY.match(line, index)
+        if not match:
+            raise Unsafe("unsupported flow mapping", number)
+        node = Node(unquote(match.group(1)), number, index)
+        if node.key == "<<" or node.key in children:
+            raise Unsafe("merge or duplicate key in a flow mapping", number)
+        index = skip(line, match.end())
+        if line.startswith("{", index):
+            node.kind, (node.children, index) = "map", flow_map(line, index, number)
+        elif line.startswith("[", index):
+            node.kind, (node.value, index) = "list", flow_list(line, index, number)
+        elif index < len(line) and line[index] in "'\"":
+            node.kind, (node.value, index) = "scalar", token(line, index, number)
+        else:
+            raw = FLOW_PLAIN.match(line, index).group().rstrip()
+            if raw and (raw[0] in "&*!|>%@`?:" or re.search(r":(?:[ \t]|$)", raw)):
+                raise Unsafe("unsupported flow mapping value", number)
+            node.kind, node.value, index = "scalar" if raw else "null", plain(raw), index + len(raw)
+        children[node.key] = node
+        index = skip(line, index)
+        if line.startswith(",", index):
+            index = skip(line, index + 1)
+        elif not line.startswith("}", index):
+            raise Unsafe("unsupported flow mapping", number)
+    return children, index + 1
+
+
 def inline(line, index, number):
     """The value after a colon or list dash: (kind, value, start, stop); kind 'null' means nothing written."""
     index = skip(line, index)
@@ -209,7 +251,8 @@ class Node:
 
 
 class Document:
-    def __init__(self, text):
+    def __init__(self, text, flow_maps=False):
+        self.flow_maps = flow_maps  # read-only callers may accept one-line flow mappings
         if text.startswith("﻿"):
             raise Unsafe("byte-order mark")
         if "\r" in text:
@@ -255,7 +298,13 @@ class Document:
         if node.key == "<<":
             raise Unsafe("merge keys", number)
         node.colon = match.end()
-        node.kind, node.value, node.start, node.stop = inline(line, node.colon, number)
+        start = skip(line, node.colon)
+        if self.flow_maps and line.startswith("{", start):
+            node.kind, node.start, (node.children, node.stop) = "map", start, flow_map(line, start, number)
+            if line[node.stop:].strip() and not re.match(r"[ \t]+#", line[node.stop:]):
+                raise Unsafe("unexpected text after a value", number)
+        else:
+            node.kind, node.value, node.start, node.stop = inline(line, node.colon, number)
         node.comment = bool(line[node.stop:].strip())
         position += 1
         following = self.content[position] if position < len(self.content) else None
@@ -487,9 +536,9 @@ def read(target):
         raise ConfigError(str(target) + " is not UTF-8 text. " + manual(target))
 
 
-def load(text, target):
+def load(text, target, flow_maps=False):
     try:
-        return Document(text)
+        return Document(text, flow_maps)
     except Unsafe as error:
         raise ConfigError("cannot safely read " + str(target) + ": " + str(error) + ". " + manual(target)
                           + "; nothing was changed")
@@ -618,6 +667,26 @@ def role_text(document, role, pipeline):
     return text
 
 
+def duties(document):
+    """(duty, configured agent, provisioned harness or None) for the pipeline agent and each set review role.
+
+    No-Mistakes itself resolves auto, fallback lists, and repository overrides; those name no single harness."""
+    node = document.get(("agent",))
+    if is_null(node):
+        found = [("agent", "auto")]
+    elif node.kind == "list":
+        found = [("agent", "ordered fallback list " + ", ".join(map(str, node.value)))]
+    else:
+        found = [("agent", str(scalar(node, ("agent",))))]
+    for role in ROLES:
+        agent = mapping(document, ("review_agents", role)).get("agent")
+        if not is_null(agent):
+            found.append(("review_agents." + role, str(scalar(agent, ("review_agents", role, "agent")))))
+    aliases = {target: name for name, target in ACP_ALIASES.items()}
+    return [(duty, agent, next((kind for kind in (agent, aliases.get(agent)) if kind in mf.HARNESSES), None))
+            for duty, agent in found]
+
+
 def show(link, target, document):
     print("No-Mistakes global config: " + str(link) + " -> " + str(target))
     print("Global defaults only: a target repository's trusted .no-mistakes.yaml may override the agent and")
@@ -738,8 +807,10 @@ def warn_pins(document, harness, knobs):
 def note_command(harness):
     command = COMMANDS.get(harness)
     if command and shutil.which(command) is None:
-        print("Note: " + command + " is not on PATH. make setup provisions the pipeline and issue agents only; "
-              "install and log in to " + label(harness) + " natively for review roles.")
+        print("Note: " + command + " is not on PATH. " + (
+            "Rerun make setup, which installs it." if harness in mf.HARNESSES else
+            "make setup provisions only Codex, Claude Code, and Cursor; install and log in to " + label(harness)
+            + " natively."))
 
 
 def edit_agent(text, target):
@@ -756,8 +827,8 @@ def edit_agent(text, target):
     if choice == (current or "auto"):
         return text
     if choice in mf.HARNESSES:
-        print("make setup installs and logs in to the pipeline agent; rerun it after saving if "
-              + label(choice) + " is new on this machine.")
+        print("make setup logs in to the agents No-Mistakes uses; rerun it after saving if "
+              + label(choice) + " is not logged in on this machine.")
     elif choice in HARNESSES:
         print("make setup does not provision " + label(choice) + "; install and log in to it natively.")
         note_command(choice)
@@ -829,6 +900,9 @@ def edit_role(text, target, role):
         print("Rounds 1-" + str(after) + " use the " + role.replace("_after_round", "") + "; from round "
               + str(after + 1) + " the " + ROLES[role] + " applies.")
     warn_pins(document, harness, knobs)
+    if harness in mf.HARNESSES:
+        print("make setup logs in to the agents No-Mistakes uses, including this role's; rerun it after saving if "
+              + label(harness) + " is not logged in on this machine.")
     note_command(harness)
     return apply(text, path, knobs)
 
@@ -988,6 +1062,57 @@ def edit():
     return 0
 
 
+def daemon_path():
+    """The PATH stable No-Mistakes (v1.84.0 shellenv) gives its daemon and agents: the user service starts with
+    the fixed well-known directories, probes the login shell (interactive for bash/zsh, where nvm and fnm are
+    usually sourced) for its environment, and appends any well-known directory the shell PATH lacks. When the
+    probe fails, only the well-known directories remain."""
+    home = os.environ.get("HOME") or str(Path.home())
+    known = [os.path.join(home, name) for name in (".local/bin", "go/bin", ".cargo/bin", "bin")] + [
+        "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin", "/usr/bin", "/bin",
+        "/usr/sbin", "/sbin"]
+    shell = os.environ.get("SHELL", "").strip()
+    if not shell:
+        try:
+            import pwd
+            shell = pwd.getpwuid(os.getuid()).pw_shell.strip()
+        except (ImportError, KeyError, OSError):
+            shell = ""
+    shell = shell or "bash"
+    environment = {key: os.environ[key] for key in ("USER", "LOGNAME") if key in os.environ}
+    environment.update(HOME=home, PATH=os.pathsep.join(known), SHELL=shell)
+    interactive = ["-i"] if os.path.basename(shell) in ("bash", "zsh") else []
+    entries = []
+    try:
+        # Detached from this terminal, as the daemon's probe is; rc-file output on stderr is discarded.
+        process = subprocess.Popen([shell, "-l", *interactive, "-c", "env -0"], env=environment,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            out = process.communicate(timeout=10)[0]
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            out = b""
+        if process.returncode == 0:
+            entries = out.decode("utf-8", "replace").split("\0")
+    except OSError:
+        pass
+    path = []
+    for part in entries:
+        # Like shellenv, an entry may follow rc-file output on its own line.
+        for start in [0] + [index + 1 for index, character in enumerate(part) if character in "\r\n"]:
+            key, separator, value = part[start:].lstrip("\r\n").partition("=")
+            if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                break
+        else:
+            continue
+        if key == "PATH":
+            path = [entry for entry in value.split(os.pathsep) if entry]
+            break
+    return os.pathsep.join(path + [directory for directory in known if directory not in path])
+
+
 def main(argv):
     if argv in (["--help"], ["-h"], ["help"]):
         print(USAGE, end="")
@@ -995,6 +1120,31 @@ def main(argv):
     if argv == ["show"]:
         link, target = live_config()
         show(link, target, load(read(target)[1], target))
+        return 0
+    if len(argv) == 2 and argv[0] == "duties":
+        target = Path(argv[1])
+        try:
+            # Native No-Mistakes accepts CRLF; this read-only lookup normalizes it in memory only.
+            text = re.sub(r"\r\n?", "\n", read(target)[1])
+            found = duties(load(text, target, flow_maps=True))
+        except Unsafe as error:
+            raise ConfigError("cannot safely read the No-Mistakes duties in " + str(target) + ": " + str(error))
+        for duty, agent, harness in found:
+            print(duty + "\t" + " ".join(agent.split()) + "\t" + (harness or "-"))
+        return 0
+    if len(argv) == 2 and argv[0] == "acpx-path":
+        target = Path(argv[1])
+        try:
+            text = re.sub(r"\r\n?", "\n", read(target)[1])
+            node = load(text, target, flow_maps=True).get(("acpx_path",))
+            # Native No-Mistakes runs a nonempty acpx_path verbatim (no ~ expansion), else acpx from its PATH.
+            value = None if is_null(node) else scalar(node, ("acpx_path",))
+        except Unsafe as error:
+            raise ConfigError("cannot safely read acpx_path in " + str(target) + ": " + str(error))
+        print("acpx" if value in (None, "") else value)
+        return 0
+    if argv == ["daemon-path"]:
+        print(daemon_path())
         return 0
     if argv:
         print(USAGE, end="", file=sys.stderr)

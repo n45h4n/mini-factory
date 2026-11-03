@@ -25,13 +25,14 @@ USAGE = """usage: mf-config [show | --help]
 # Internal, used by setup, doctor, and the workers:
 #   mf-config agent ROLE             print the effective harness and its source
 #   mf-config launch-args ROLE KIND  print native launch options, one per line
+#   mf-config set-agent pr-review KIND  save setup's PR_REVIEW_AGENT choice
 
 HARNESSES = {"codex": "Codex", "claude": "Claude Code", "cursor": "Cursor"}
 COMMANDS = {"codex": "codex", "claude": "claude", "cursor": "cursor-agent"}
 ROLES = {
     "issue-prepare": "Issues i - preparer",
     "issue-implement": "Issues I - implementer",
-    "pr-review": "PRs I - reviewer (Codex only)",
+    "pr-review": "PRs I - reviewer",
 }
 KNOBS = {"codex": ("model", "effort", "fast"), "claude": ("model", "effort"), "cursor": ("model",)}
 SOURCES = {
@@ -39,6 +40,15 @@ SOURCES = {
     "shared": "shared issue agent (no per-role override)",
     "default": "default (no saved selection)",
 }
+# Each PR reviewer starts in its native interactive read-only mode; the worker adds the
+# options, and a fresh launch first checks that the installed CLI offers them:
+# (options that must be offered, option whose help must list the mode, mode).
+REVIEW_MODES = {
+    "codex": (("--ask-for-approval", "--strict-config", "--config", "--cd"), None, None),
+    "claude": (("--permission-mode", "--add-dir"), "--permission-mode", "plan"),
+    "cursor": (("--mode", "--add-dir"), "--mode", "ask"),
+}
+REVIEW_MODE_NAMES = {"codex": "permission profile :read-only, no network", "claude": "Plan mode", "cursor": "Ask mode"}
 # Codex 0.154.0 introduced the explicit service_tier routing used for Fast on/off.
 CODEX_FAST_MINIMUM = (0, 154, 0)
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh")
@@ -104,8 +114,6 @@ def validate_profile(role, profile, where):
     if not isinstance(profile, dict):
         raise ConfigError(location + " must be an object")
     agent = profile.get("agent")
-    if role == "pr-review" and agent != "codex":
-        raise ConfigError(location + ": the PR reviewer is Codex only")
     if agent not in HARNESSES:
         raise ConfigError(location + ": agent must be codex, claude, or cursor")
     unknown = sorted(set(profile) - {"agent", *KNOBS[agent]})
@@ -202,23 +210,34 @@ def codex_version():
     return tuple(map(int, match.groups())) if match else None
 
 
-def require_support(profile):
-    """Refuse a fresh launch whose explicit knobs the installed CLI cannot accept."""
+def require_support(profile, role):
+    """Refuse a fresh launch whose explicit knobs, or reviewer read-only mode, the installed CLI cannot accept."""
     agent = profile["agent"]
     needed = ["--model"] if "model" in profile else []
     if agent == "codex" and ("effort" in profile or "fast" in profile):
         needed.append("--config")
     if agent == "claude" and "effort" in profile:
         needed.append("--effort")
+    review = REVIEW_MODES[agent] if role == "pr-review" else None
+    if review:
+        needed += [flag for flag in review[0] if flag not in needed]
     if not needed:
         return
     command, label = COMMANDS[agent], HARNESSES[agent]
     help_text = probe([command, "--help"])
     if help_text is None:
-        raise ConfigError("cannot read " + command + " --help to verify the saved " + label
-                          + " options; repair " + label + " or choose native defaults with mf-config")
+        raise ConfigError("cannot read " + command + " --help to verify the " + label
+                          + (" read-only reviewer launch" if review else " saved options") + "; repair "
+                          + label + " or choose native defaults with mf-config")
     missing = [flag for flag in needed if not flag_available(help_text, flag)]
+    if review and review[1] and review[1] not in missing and not re.search(
+            r"\b" + review[2] + r"\b", option_block(help_text, review[1])):
+        missing.append(review[1] + " " + review[2])
     if missing:
+        if review:
+            raise ConfigError("the installed " + command + " does not offer " + ", ".join(missing) + ", needed for "
+                              "the interactive read-only PR reviewer (" + REVIEW_MODE_NAMES[agent] + "); update "
+                              + label + " or choose another PR reviewer with mf-config")
         raise ConfigError("the installed " + command + " does not offer " + ", ".join(missing)
                           + "; update " + label + " or choose native defaults with mf-config")
     if agent == "codex" and "fast" in profile:
@@ -251,14 +270,16 @@ def show(profiles, shared, path, saved):
           + " (" + str(shared_path()) + "; set with make setup ISSUE_AGENT=claude|codex|cursor)")
     for role, label in ROLES.items():
         profile, source = effective(role, profiles, shared)
+        detail = SOURCES[source]
         if role == "pr-review":
-            detail = ("saved reviewer options" if source == "override" else "native defaults")
-            detail += "; locally read-only permissions unchanged"
-        else:
-            detail = SOURCES[source]
+            detail = ("mf-config selection" if source == "override" else "default (no saved selection)")
+            detail += ("; interactive, read-only (" + REVIEW_MODE_NAMES[profile["agent"]]
+                       + "); findings stay in its terminal")
         print("\n" + label + ": " + HARNESSES[profile["agent"]] + " - " + detail)
         print("  " + describe(profile))
     print("\nPrecedence for each issue key: its mf-config selection, then the shared issue agent, then Codex.")
+    print("The PR reviewer uses its mf-config selection, else Codex. It starts in that native read-only mode and is")
+    print("asked to report findings only in its terminal: no file edits, PR comments, reviews, or other GitHub writes.")
     print("Profiles apply only when a fresh Herdr agent starts. A working, blocked, or idle agent keeps its original")
     print("harness and options; close it (exit the agent in its pane), then press the key again to relaunch.")
     print("mf-config never changes the No-Mistakes pipeline agent (no-mistakes/config.yaml in your clone).")
@@ -442,7 +463,10 @@ def edit_role(role, profiles, shared):
     current = profiles.get(role)
     label = ROLES[role].split(" (", 1)[0]
     if role == "pr-review":
-        agent = "codex"
+        # Codex with only native defaults is the default reviewer, so it saves no override.
+        choice = gum("choose", label + ": harness (Codex is the default; each starts read-only)",
+                     list(HARNESSES.values()), HARNESSES[current["agent"]] if current else HARNESSES["codex"])
+        agent = next(kind for kind, name in HARNESSES.items() if name == choice)
     else:
         inherit = "Shared issue agent: " + HARNESSES[shared or "codex"] + " (no per-role override)"
         options = [inherit] + list(HARNESSES.values())
@@ -452,9 +476,27 @@ def edit_role(role, profiles, shared):
         agent = next(kind for kind, name in HARNESSES.items() if name == choice)
     saved = current if current and current["agent"] == agent else {}
     profile = PICKERS[agent](label, saved)
-    if role == "pr-review" and len(profile) == 1:
+    if role == "pr-review" and profile == {"agent": "codex"}:
         return None
     return profile
+
+
+def set_agent(role, kind):
+    """Setup's PR_REVIEW_AGENT: keep a same-harness profile, else save the bare harness (Codex is the default)."""
+    path = profiles_path()
+    profiles, before = load_profiles(path)
+    current = profiles.get(role)
+    if current and current["agent"] == kind:
+        return "kept"
+    candidate = dict(profiles)
+    if kind == "codex":
+        candidate.pop(role, None)
+    else:
+        candidate[role] = {"agent": kind}
+    if candidate == profiles:
+        return "kept"
+    save(path, candidate, before)
+    return "saved"
 
 
 def save(path, profiles, before):
@@ -542,9 +584,12 @@ def main(argv):
         if profile["agent"] != argv[2]:
             raise ConfigError("the " + ROLES[argv[1]] + " harness changed to " + HARNESSES[profile["agent"]]
                               + " during this launch; press the key again")
-        require_support(profile)
+        require_support(profile, argv[1])
         for argument in native_arguments(profile):
             print(argument)
+        return 0
+    if len(argv) == 3 and argv[0] == "set-agent" and argv[1] == "pr-review" and argv[2] in HARNESSES:
+        print(set_agent(argv[1], argv[2]) + ": " + str(profiles_path()))
         return 0
     if argv:
         print(USAGE, end="", file=sys.stderr)

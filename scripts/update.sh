@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # make update: fast-forward the retained clone on main, offer consented native
-# upgrades for the installed tools this installation uses, then rerun make setup,
+# upgrades for the installed tools Mini-Factory provisions, then rerun make setup,
 # which refreshes the managed runtime and ends with the doctor checks.
 set -euo pipefail
 
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
-nm_config="${NM_HOME:-$HOME/.no-mistakes}/config.yaml"
 home=''
 codex_home=''
 upstream=''
@@ -19,6 +18,7 @@ plan_text=''
 plan_detail=''
 plan_manual=''
 plan_path=''
+plan_targets=()
 upgraded=()
 declined=()
 skipped=()
@@ -119,22 +119,6 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
-# The harnesses setup provisions: the agents mf-config resolves for issue i/I plus the
-# scalar No-Mistakes pipeline agent (read as read_pipeline_agent in setup.sh does).
-selected_agents() {
-	local role output file="$bundle/no-mistakes/config.yaml"
-	selected=''
-	for role in issue-prepare issue-implement; do
-		if ! output="$(python3 -I -B "$bundle/scripts/mf_config.py" agent "$role" 2>/dev/null)"; then
-			notice 'NOTE: the mf-config agent profiles are unreadable, so Claude Code/Cursor were not checked; make setup reports the problem.'
-			return 0
-		fi
-		selected="$selected ${output%%$'\n'*}"
-	done
-	[ ! -r "$nm_config" ] || file="$nm_config"
-	selected="$selected $(awk '/^agent:/ { sub(/^agent:[ \t]*/, ""); sub(/[ \t]*#.*$/, ""); gsub(/["\047]/, ""); print; exit }' "$file") "
-}
-
 tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
@@ -145,15 +129,18 @@ tool_version() {
 	printf '%s\n' "${text%%$'\n'*}"
 }
 
-# Gum and GitHub CLI come from Homebrew or apt (as setup installs them); upgrade only the owning package.
+# Gum, GitHub CLI, and Node.js come from Homebrew or apt (as setup installs them); upgrade only the
+# owning package. Homebrew's node includes npm; with apt, an installed npm package is upgraded alongside.
 plan_package() {
-	local tool="$1" real="$2" cellar owner
+	local tool="$1" real="$2" formula="$3" package="$4" cellar owner
+	shift 4
 	if command -v brew >/dev/null 2>&1 && cellar="$(brew --cellar 2>/dev/null)" && cellar="$(physical_path "$cellar")"; then
 		case "$real" in
-		"$cellar/$tool/"*)
+		"$cellar/$formula/"*)
 			plan_kind=brew
-			plan_text="brew upgrade $tool"
-			plan_detail="Homebrew formula $tool; Homebrew may refresh its formula index first, no general brew upgrade"
+			plan_targets=("$formula")
+			plan_text="brew upgrade $formula"
+			plan_detail="Homebrew formula $formula; Homebrew may refresh its formula index first, no general brew upgrade"
 			return 0
 			;;
 		esac
@@ -161,19 +148,59 @@ plan_package() {
 	if [ "$(uname -s)" = Linux ] && command -v dpkg >/dev/null 2>&1 && owner="$(dpkg -S "$real" 2>/dev/null)"; then
 		owner="${owner%%: *}"
 		case ", $owner," in
-		*", $tool,"* | *", $tool:"*)
+		*", $package,"* | *", $package:"*)
 			if ! command -v sudo >/dev/null 2>&1; then
-				plan_manual="apt package $tool, but sudo is unavailable; ask the host administrator to upgrade it"
+				plan_manual="apt package $package, but sudo is unavailable; ask the host administrator to upgrade it"
 				return 0
 			fi
 			plan_kind=apt
-			plan_text="sudo apt-get update, then sudo apt-get install --only-upgrade $tool"
-			plan_detail="apt package $tool; changes only that system package"
+			plan_targets=("$package" "$@")
+			plan_text="sudo apt-get update, then sudo apt-get install --only-upgrade ${plan_targets[*]}"
+			plan_detail="apt package $package; changes only installed packages named here"
 			return 0
 			;;
 		esac
 	fi
-	plan_manual="$real is neither a Homebrew formula nor an apt package; update it with the tool that installed it"
+	case "$tool:$real" in
+	node:*/fnm/*) plan_manual="$real is managed by fnm; run fnm install --lts (or your chosen 22.13+ version) and fnm default with it yourself" ;;
+	node:*/.nvm/*) plan_manual="$real is managed by nvm; run nvm install --lts and nvm alias default with it yourself" ;;
+	node:*/.volta/*) plan_manual="$real is managed by Volta; run volta install node yourself" ;;
+	*) plan_manual="$real is neither a Homebrew formula nor an apt package; update it with the tool that installed it" ;;
+	esac
+	[ "$tool" != node ] || plan_manual="$plan_manual (make update never changes a Node version manager, npm prefix, or shell configuration; setup and doctor then check that acpx still runs for the No-Mistakes daemon)"
+}
+
+# acpx is offered only where setup's npm install puts it: ~/.local, or a writable npm global prefix.
+plan_acpx() {
+	local real="$1" prefix
+	if ! command -v npm >/dev/null 2>&1; then
+		plan_manual='npm is missing; make setup reports the Node.js/npm action'
+		return 0
+	fi
+	case "$real" in
+	"$home/.local/lib/node_modules/acpx/"*)
+		plan_targets=(install -g --prefix "$HOME/.local" acpx@latest)
+		;;
+	*)
+		prefix="$(npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
+		case "$real" in
+		"$prefix/lib/node_modules/acpx/"*)
+			if [ ! -w "$prefix/lib/node_modules" ]; then
+				plan_manual="acpx is in npm's global prefix $prefix, which you cannot write; update it the way it was installed"
+				return 0
+			fi
+			plan_targets=(install -g acpx@latest)
+			;;
+		*)
+			plan_manual="$real is not an npm installation of acpx that setup created; update it with the tool that installed it"
+			return 0
+			;;
+		esac
+		;;
+	esac
+	plan_kind=npm
+	plan_text="npm ${plan_targets[*]}"
+	plan_detail="npm package acpx (the ACP runner No-Mistakes uses for Cursor); npm's prefix setting is unchanged"
 }
 
 plan_gh_dash() {
@@ -212,6 +239,7 @@ cursor_commands_owned() {
 plan_upgrade() {
 	local tool="$1" path real help
 	plan_kind='' plan_text='' plan_detail='' plan_manual='' plan_path=''
+	plan_targets=()
 	if [ "$tool" = gh-dash ]; then
 		plan_gh_dash
 		return 0
@@ -226,7 +254,15 @@ plan_upgrade() {
 	fi
 	case "$tool" in
 	gh | gum)
-		plan_package "$tool" "$real"
+		plan_package "$tool" "$real" "$tool" "$tool"
+		return 0
+		;;
+	node)
+		plan_package node "$real" node nodejs npm
+		return 0
+		;;
+	acpx)
+		plan_acpx "$real"
 		return 0
 		;;
 	herdr)
@@ -274,14 +310,15 @@ plan_upgrade() {
 run_plan() {
 	local tool="$1"
 	case "$plan_kind" in
-	brew) HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade "$tool" ;;
+	brew) HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade "${plan_targets[@]}" ;;
 	apt)
 		if [ "$apt_refreshed" -eq 0 ]; then
 			sudo apt-get update || return
 			apt_refreshed=1
 		fi
-		sudo apt-get install -y --only-upgrade --no-install-recommends "$tool"
+		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
+	npm) PATH="$bin_directory:$PATH" npm "${plan_targets[@]}" ;;
 	extension) gh extension upgrade dash ;;
 	# Keeping the bin directory on PATH avoids the native installers' profile-editing branches, as in setup.
 	native) PATH="$bin_directory:$PATH" "$plan_path" update ;;
@@ -332,7 +369,6 @@ offer_upgrade() {
 }
 
 offer_upgrades() {
-	local selected
 	home="$(physical_path "$HOME")" || home="$HOME"
 	codex_home="$(physical_path "${CODEX_HOME:-$HOME/.codex}")" || codex_home="${CODEX_HOME:-$HOME/.codex}"
 	notice ''
@@ -343,10 +379,11 @@ offer_upgrades() {
 	offer_upgrade herdr 'Herdr'
 	offer_upgrade codex 'Codex'
 	offer_upgrade no-mistakes 'No-Mistakes'
-	# Unselected agents are never inspected or installed.
-	selected_agents
-	case "$selected" in *" claude "*) offer_upgrade claude 'Claude Code' ;; esac
-	case "$selected" in *" cursor "*) offer_upgrade cursor-agent 'Cursor CLI' ;; esac
+	# All three agent CLIs, Node.js, and acpx are baseline, whichever roles currently use them.
+	offer_upgrade claude 'Claude Code'
+	offer_upgrade cursor-agent 'Cursor CLI'
+	offer_upgrade node 'Node.js and npm'
+	offer_upgrade acpx 'acpx'
 }
 
 summary_line() {

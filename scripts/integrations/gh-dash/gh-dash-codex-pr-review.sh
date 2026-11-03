@@ -17,7 +17,7 @@ unset GH_DASH_CODEX_PR_REVIEW_BACKEND
 unset GH_DASH_CODEX_PR_REVIEW_LOG_PATH
 
 PROGRAM="${0##*/}"
-NOTIFICATION_TITLE="gh-dash Codex PR review"
+NOTIFICATION_TITLE="gh-dash PR review"
 AGENT_START_TOTAL_ATTEMPTS=10
 AGENT_START_RETRY_INTERVAL_SECONDS=1
 DIAGNOSTIC_RETENTION_SECONDS=604800
@@ -28,6 +28,9 @@ candidate_ref_owned=0
 candidate_ref=
 candidate_sha=
 source_root=
+reviewer_kind=codex
+reviewer_label=Codex
+reviewer_source=default
 
 notify() {
 	local body="$1" sound="${2:-request}"
@@ -64,6 +67,38 @@ agent_conflict() {
 	printf 'ERROR: %s: %s\n' "$PROGRAM" "$detail" >&2
 	notify 'PR review agent identity is ambiguous or conflicting; prompt not sent.' request
 	exit 1
+}
+
+finish_without_action() {
+	local message="$1"
+
+	printf 'INFO: %s: %s\n' "$PROGRAM" "$message" >&2
+	notify "$message" request
+	exit 0
+}
+
+agent_label() {
+	case "$1" in
+	claude) printf 'Claude Code\n' ;;
+	codex) printf 'Codex\n' ;;
+	cursor) printf 'Cursor\n' ;;
+	*) printf '%s\n' "$1" ;;
+	esac
+}
+
+# mf-config resolves the reviewer harness: its PR I selection, else Codex. It owns validation.
+read_reviewer_setting() {
+	local output
+
+	output="$(python3 -I -B "$mf_config_helper" agent pr-review 2>&1)" ||
+		die "unable to read the PR reviewer preference: $output"
+	reviewer_kind="${output%%$'\n'*}"
+	reviewer_source="${output#*$'\n'}"
+	case "$reviewer_kind" in
+	claude | codex | cursor) ;;
+	*) die "unexpected PR reviewer preference: $output" ;;
+	esac
+	reviewer_label="$(agent_label "$reviewer_kind")"
 }
 
 require_command() {
@@ -694,9 +729,10 @@ if [ -n "$detached_log_path" ]; then
 fi
 prune_inactive_diagnostic_logs
 
-for command_name in git gh herdr jq codex python3; do
+for command_name in git gh herdr jq python3; do
 	require_command "$command_name"
 done
+read_reviewer_setting
 
 source_environment_count=0
 for variable_name in \
@@ -840,12 +876,18 @@ if ! json_has_type "$agent_manifests_json" agent_manifest_status ||
 		     (type == "object") and
 		     (.agent | type == "string" and length > 0) and
 		     (.active_version == null or
-		      (.active_version | type == "string" and length > 0))) and
-		 ([.result.manifests[] | select(.agent == "codex")] | length) == 1 and
-		 ([.result.manifests[] | select(.agent == "codex")][0].active_version |
-		  type == "string" and length > 0)' >/dev/null 2>&1; then
-	die 'the Herdr server does not have an active Codex detection manifest'
+		      (.active_version | type == "string" and length > 0)))' >/dev/null 2>&1; then
+	die "the Herdr server does not have an active $reviewer_label detection manifest (invalid manifest response)"
 fi
+
+# Detection must cover the reviewer actually reused or launched.
+require_reviewer_manifest() {
+	printf '%s\n' "$agent_manifests_json" | jq -e --arg kind "$reviewer_kind" \
+		'([.result.manifests[] | select(.agent == $kind)] | length) == 1 and
+		 ([.result.manifests[] | select(.agent == $kind)][0].active_version |
+		  type == "string" and length > 0)' >/dev/null 2>&1 ||
+		die "the Herdr server does not have an active $reviewer_label detection manifest"
+}
 
 pr_json=
 capture_json pr_json gh pr view "$pr_number" \
@@ -897,14 +939,16 @@ case "$candidate_lookup_status" in
 *) die 'unable to inspect the temporary PR review ref' ;;
 esac
 
+# The base branch is fetched without updating any local ref, only so its commit is available for the diff.
 git -C "$source_root" fetch \
 	--no-tags \
 	--no-write-fetch-head \
 	--no-auto-maintenance \
 	--force \
 	"$fetch_url" \
-	"+refs/pull/${pr_number}/head:$candidate_ref" ||
-	die 'unable to fetch the pull request head ref'
+	"+refs/pull/${pr_number}/head:$candidate_ref" \
+	"refs/heads/${pr_base_ref}" ||
+	die 'unable to fetch the pull request head and base refs'
 candidate_ref_owned=1
 candidate_sha="$(git -C "$source_root" rev-parse --verify "$candidate_ref" 2>/dev/null)" ||
 	die 'the fetched pull request head ref is unavailable'
@@ -914,6 +958,12 @@ git -C "$source_root" cat-file -e "${candidate_sha}^{commit}" 2>/dev/null ||
 candidate_sha="$(printf '%s' "$candidate_sha" | lowercase)"
 [ "$candidate_sha" = "$pr_head_sha" ] ||
 	die 'the pull request head changed while it was being fetched; press I to retry'
+git -C "$source_root" cat-file -e "${pr_base_sha}^{commit}" 2>/dev/null ||
+	die 'the pull request base commit is unavailable after fetching its branch; press I to retry'
+# Like GitHub's Files changed view, the review compares the PR head with its merge base.
+merge_base_sha="$(git -C "$source_root" merge-base "$pr_base_sha" "$pr_head_sha" 2>/dev/null)" ||
+	die 'the pull request head and base have no merge base; review not started'
+validate_commit_id "$merge_base_sha" 'pull request merge base'
 
 load_worktree_state() {
 	local listed_source_path listed_source_root listed_worktree_common_directory
@@ -1008,6 +1058,8 @@ load_worktree_state
 initial_worktree_count="$worktree_count"
 initial_worktree_root="$listed_worktree_root"
 initial_open_workspace_id="$target_open_workspace_id"
+# A new worktree cannot hold a retained reviewer, so the selected kind is checked before creating it.
+[ "$initial_worktree_count" -eq 1 ] || require_reviewer_manifest
 
 review_ref_lookup_status=0
 git -C "$source_root" show-ref --verify --quiet "$review_ref" || review_ref_lookup_status=$?
@@ -1236,7 +1288,7 @@ complete_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
 	--arg pane_id "$root_pane_id" \
 	'[.result.agents[] | select(
 		.name == $name and
-		.agent == "codex" and
+		(.agent == "claude" or .agent == "codex" or .agent == "cursor") and
 		.workspace_id == $workspace_id and
 		.tab_id == $tab_id and
 		.pane_id == $pane_id
@@ -1253,13 +1305,13 @@ related_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
 		.pane_id == $pane_id
 	)] | length')"
 if [ "$complete_agent_count" -gt 1 ]; then
-	agent_conflict "multiple complete Codex identities match $workspace_label"
+	agent_conflict "multiple complete reviewer identities match $workspace_label"
 fi
 if [ "$complete_agent_count" -eq 0 ] && [ "$related_agent_count" -gt 0 ]; then
 	agent_conflict "partial or coordinate-sharing agent identities conflict with $workspace_label"
 fi
 if [ "$complete_agent_count" -eq 1 ] && [ "$related_agent_count" -ne 1 ]; then
-	agent_conflict 'the complete PR review Codex identity has conflicting related entries'
+	agent_conflict 'the complete PR reviewer identity has conflicting related entries'
 fi
 
 agent_document=
@@ -1268,6 +1320,7 @@ capture_json_response agent_document herdr agent get "$agent_alias" || agent_get
 if [ "$agent_get_status" -eq 125 ]; then
 	die "agent lookup did not return exactly one JSON object; prompt not sent: $agent_document"
 fi
+reuse_notice=
 if [ "$complete_agent_count" -eq 0 ]; then
 	case "$agent_get_status" in
 	0) agent_conflict "agent list and agent lookup disagree for alias $agent_alias" ;;
@@ -1280,78 +1333,132 @@ if [ "$complete_agent_count" -eq 0 ]; then
 else
 	[ "$agent_get_status" -eq 0 ] ||
 		agent_conflict "agent lookup failed for listed alias $agent_alias: $agent_document"
+	retained_kind="$(printf '%s\n' "$agent_list_json" | jq -r \
+		--arg name "$agent_alias" \
+		'[.result.agents[] | select(.name == $name)][0].agent')"
 	agent_identity_matches \
 		"$agent_document" agent_info \
-		"$agent_alias" codex "$workspace_id" "$root_tab_id" "$root_pane_id" ||
+		"$agent_alias" "$retained_kind" "$workspace_id" "$root_tab_id" "$root_pane_id" ||
 		agent_conflict 'agent list and lookup identities do not agree completely'
 	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 		agent_conflict "$runtime_validation_error"
 	agent_present=1
+	# Herdr does not report launch options; a retained reviewer is never replaced.
+	if [ "$retained_kind" != "$reviewer_kind" ]; then
+		reuse_notice=" Kept the existing $(agent_label "$retained_kind") reviewer with its original options; the $reviewer_label setting applies once it is closed (exit it in its pane, then press I)."
+		printf 'WARNING: %s: retaining existing %s reviewer for %s instead of the %s setting\n' \
+			"$PROGRAM" "$retained_kind" "$workspace_label" "$reviewer_kind" >&2
+		reviewer_kind="$retained_kind"
+		reviewer_label="$(agent_label "$reviewer_kind")"
+	elif [ "$reviewer_source" = override ]; then
+		reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer (exit it in its pane, then press I).'
+	fi
+fi
+require_reviewer_manifest
+
+focus_exact_agent() {
+	local focus_json response_status=0
+
+	capture_json_response focus_json herdr agent focus "$root_pane_id" || response_status=$?
+	[ "$response_status" -eq 0 ] &&
+		agent_identity_matches \
+			"$focus_json" agent_info "$agent_alias" "$reviewer_kind" "$workspace_id" "$root_tab_id" "$root_pane_id"
+}
+
+# A blocked reviewer waits on its own dialog (for example a plan or trust approval), where a typed
+# prompt could answer it; an unknown status is equally uncertain. Neither is prompted.
+if [ "$agent_present" -eq 1 ]; then
+	agent_status="$(printf '%s\n' "$agent_document" | jq -r \
+		'if (.result.agent.agent_status | type) == "string" then .result.agent.agent_status else "__uncertain__" end')"
+	case "$agent_status" in
+	idle | done | working) ;;
+	*)
+		focus_exact_agent ||
+			die "the $reviewer_label reviewer is $agent_status and was not prompted, but it could not be focused"
+		if [ "$agent_status" = blocked ]; then
+			finish_without_action "PR reviewer is waiting for your answer in its pane; prompt not sent; exact $reviewer_label reviewer focused.$reuse_notice"
+		fi
+		finish_without_action "PR reviewer status is uncertain ($agent_status); prompt not sent; exact $reviewer_label reviewer focused.$reuse_notice"
+		;;
+	esac
 fi
 
-codex_args=(
-	--ask-for-approval never
-	--strict-config
-	--cd "$worktree_root"
-	--config 'default_permissions="gh_dash_pr_review"'
-	--config 'permissions.gh_dash_pr_review={extends=":read-only",network={enabled=true,domains={"github.com"="allow","api.github.com"="allow","*.githubusercontent.com"="allow"}}}'
-)
-reuse_notice=
+# The full diff is handed off in a private file outside the worktree, so the worktree stays clean and
+# reviewers whose read-only mode cannot run shell commands can still read it.
+review_context_root="$state_root/contexts"
+review_context_directory="$review_context_root/$lock_identity"
+review_diff_path="$review_context_directory/pr.diff"
+ensure_private_directory "$review_context_root" 'PR review context parent directory'
+ensure_private_directory "$review_context_directory" 'PR review context directory'
+review_diff_stage="$review_diff_path.$$"
+if ! (umask 077 && git -C "$source_root" diff --no-color --no-ext-diff --no-textconv --stat --patch \
+	"$merge_base_sha" "$pr_head_sha" >"$review_diff_stage") ||
+	! mv -f -- "$review_diff_stage" "$review_diff_path"; then
+	rm -f -- "$review_diff_stage"
+	die 'unable to write the PR diff for the reviewer; prompt not sent'
+fi
 
 if [ "$agent_present" -eq 0 ]; then
-	# Only a fresh reviewer reads the saved profile. mf-config emits nothing but
-	# --model and model/effort/Fast --config values after the fixed security options.
-	review_output="$(python3 -I -B "$mf_config_helper" launch-args pr-review codex 2>&1)" ||
-		die "unable to apply the saved PR reviewer preferences; Codex not started and prompt not sent: $review_output"
+	# Native interactive read-only modes. Codex gets a launch-scoped read-only permission profile without
+	# network access; Claude Code starts in Plan mode and Cursor in Ask mode, each with read access to the diff.
+	case "$reviewer_kind" in
+	codex)
+		reviewer_args=(
+			--ask-for-approval never
+			--strict-config
+			--cd "$worktree_root"
+			--config 'default_permissions="gh_dash_pr_review"'
+			--config 'permissions.gh_dash_pr_review={extends=":read-only"}'
+		)
+		;;
+	claude) reviewer_args=(--permission-mode plan --add-dir "$review_context_directory") ;;
+	cursor) reviewer_args=(--mode ask --add-dir "$review_context_directory") ;;
+	esac
+	# Only a fresh reviewer reads the saved profile. mf-config first verifies that the installed CLI offers
+	# its read-only mode, then emits only model/effort/Fast options, appended after the read-only options.
+	review_output="$(python3 -I -B "$mf_config_helper" launch-args pr-review "$reviewer_kind" 2>&1)" ||
+		die "unable to start the read-only $reviewer_label reviewer; agent not started and prompt not sent: $review_output"
 	if [ -n "$review_output" ]; then
 		while IFS= read -r review_argument; do
-			codex_args[${#codex_args[@]}]="$review_argument"
-		done <<EOF
-$review_output
-EOF
+			reviewer_args[${#reviewer_args[@]}]="$review_argument"
+		done <<<"$review_output"
 	fi
 	agent_start_json=
 	for ((agent_start_attempt = 1; agent_start_attempt <= AGENT_START_TOTAL_ATTEMPTS; agent_start_attempt++)); do
 		agent_start_status=0
 		capture_json_response agent_start_json herdr agent start "$agent_alias" \
-			--kind codex \
+			--kind "$reviewer_kind" \
 			--pane "$root_pane_id" \
 			--timeout 30000 \
-			-- "${codex_args[@]}" || agent_start_status=$?
+			-- "${reviewer_args[@]}" || agent_start_status=$?
 		[ "$agent_start_status" -ne 0 ] || break
 		[ "$agent_start_status" -ne 125 ] ||
-			die "unable to start Codex for PR review; prompt not sent: $agent_start_json"
+			die "unable to start $reviewer_label for PR review; prompt not sent: $agent_start_json"
 		json_is_error_only "$agent_start_json" agent_pane_busy ||
-			die "unable to start Codex for PR review; prompt not sent: $agent_start_json"
+			die "unable to start $reviewer_label for PR review; prompt not sent: $agent_start_json"
 		[ "$agent_start_attempt" -lt "$AGENT_START_TOTAL_ATTEMPTS" ] ||
 			die "exact target pane $root_pane_id did not become an available shell after $AGENT_START_TOTAL_ATTEMPTS total agent-start attempts; prompt not sent"
 		sleep "$AGENT_START_RETRY_INTERVAL_SECONDS"
 		validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
-			die "unable to retry Codex on exact target pane $root_pane_id: $runtime_validation_error; prompt not sent"
+			die "unable to retry $reviewer_label on exact target pane $root_pane_id: $runtime_validation_error; prompt not sent"
 	done
 	agent_identity_matches \
 		"$agent_start_json" agent_started \
-		"$agent_alias" codex "$workspace_id" "$root_tab_id" "$root_pane_id" ||
-		agent_conflict 'Codex started, but its returned identity conflicts with the expected PR review agent'
+		"$agent_alias" "$reviewer_kind" "$workspace_id" "$root_tab_id" "$root_pane_id" ||
+		agent_conflict "$reviewer_label started, but its returned identity conflicts with the expected PR reviewer"
 	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
-		agent_conflict "Codex started, but $runtime_validation_error"
-elif review_output="$(python3 -I -B "$mf_config_helper" agent pr-review 2>/dev/null)" &&
-	[ "${review_output#*$'\n'}" = override ]; then
-	# Herdr does not report launch options; a retained reviewer is never replaced.
-	reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer (exit it in its pane, then press I).'
+		agent_conflict "$reviewer_label started, but $runtime_validation_error"
 fi
 
-prompt="Review pull request ${selected_repo}#${pr_number} against its base. Keep repository access read-only: do not modify files, commit, or push.
+prompt="Review pull request ${selected_repo}#${pr_number} against its base. This is an interactive, read-only review: report your findings only here, in this terminal.
 
-Check for bugs, regressions, security issues, edge cases, and missing tests. Report only actionable findings with severity and file/line references.
+This worktree is detached at the PR head $pr_head_sha. The PR targets $pr_base_ref at $pr_base_sha; its changes are compared from their merge base $merge_base_sha. Read the complete PR diff (git diff --stat --patch from the merge base to the PR head) with your read-only file tools from this private file outside the worktree:
+$review_diff_path
+Read the surrounding code in this worktree as needed.
 
-After completing the review, publish the result in one Codex review comment on pull request ${selected_repo}#${pr_number}. Use concise Markdown ordered by severity. Include the marker <!-- gh-dash-codex-pr-review --> in the comment.
+Check for bugs, regressions, security issues, edge cases, and missing tests. Reply with concise, actionable findings ordered by severity, each with its severity and a file/line reference, or say explicitly that there are no actionable findings.
 
-Before writing, find a comment on this PR authored by the currently authenticated GitHub user that contains that exact marker. If one exists, update it; otherwise create it. Never create a second marked comment.
-
-If there are no actionable findings, publish a short all-clear comment and then mark the pull request as ready for review if it is currently a draft. If actionable findings exist, do not change its draft/ready state.
-
-The only permitted GitHub mutations are creating or updating that marked review comment and, when there are no actionable findings, marking the PR ready for review. Do not change the PR title, body, labels, review state, branches, commits, or any other GitHub data."
+Stay read-only: do not modify, create, or delete files, commit, push, or switch branches. Do not write to GitHub: no PR or issue comments, reviews, approvals, draft/ready changes, or edits. Do not propose an implementation plan or ask to leave this read-only mode; the findings in this terminal are the whole result."
 
 prompt_json=
 prompt_status=0
@@ -1363,10 +1470,10 @@ capture_json_response prompt_json herdr agent prompt "$root_pane_id" "$prompt" \
 	die "PR review prompt command failed or returned an uncertain result; prompt was not retried: $prompt_json"
 agent_identity_matches \
 	"$prompt_json" agent_prompted \
-	"$agent_alias" codex "$workspace_id" "$root_tab_id" "$root_pane_id" ||
-	die 'PR review prompt result did not identify the exact Codex agent'
+	"$agent_alias" "$reviewer_kind" "$workspace_id" "$root_tab_id" "$root_pane_id" ||
+	die "PR review prompt result did not identify the exact $reviewer_label reviewer"
 validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
 	die "PR review prompt completed but runtime identity became uncertain: $runtime_validation_error"
 
-notify "PR review prompt sent to the exact locally read-only Codex agent.$reuse_notice" 'done'
+notify "PR review prompt sent to the exact read-only $reviewer_label reviewer; its findings appear in its pane.$reuse_notice" 'done'
 exit 0

@@ -70,7 +70,8 @@ elif name == "gh":
         if "GH_REPO" in os.environ or args[2:5] != ["7", "--repo", "friend/target"]:
             fail("unexpected pull request lookup")
         head = os.environ["MOCK_PR_HEAD"]
-        print(json.dumps({"number": 7, "state": "OPEN", "headRefOid": head, "baseRefOid": head,
+        print(json.dumps({"number": 7, "state": "OPEN", "headRefOid": head,
+                          "baseRefOid": os.environ.get("MOCK_PR_BASE", head),
                           "baseRefName": "main", "isCrossRepository": False}))
     elif args[:2] == ["issue", "view"]:
         if "GH_REPO" in os.environ or args != ["issue", "view", "8", "--repo", "friend/target", "--json", "number,title,body"]:
@@ -120,7 +121,9 @@ elif name == "codex":
         print("codex-cli " + os.environ.get("MOCK_CODEX_VERSION", "0.115.0"))
     elif args == ["--help"]:
         print("Codex CLI: login logout --version" if os.environ.get("MOCK_AGENT_HELP") == "old"
-              else "Codex CLI\n  -c, --config <key=value>\n      --strict-config\n  -m, --model <MODEL>\n  login logout --version\n"
+              else "Codex CLI\n  -c, --config <key=value>\n      --strict-config\n  -m, --model <MODEL>\n"
+                   "  -C, --cd <DIR>\n      --add-dir <DIR>\n  -a, --ask-for-approval <APPROVAL_POLICY>\n"
+                   "  login logout --version\n"
                    "Commands:\n  update            Update Codex to the latest version")
     elif args == ["update"]:
         native_update()
@@ -149,6 +152,14 @@ elif name == "claude":
                   "                                        'fable', 'opus', or 'sonnet') or a\n"
                   "                                        model's full name.\n"
                   "  --name <name>                         Session name\n"
+                  "  --add-dir <directories...>            Additional directories to allow tool\n"
+                  "                                        access to\n"
+                  "  --permission-mode <mode>              Permission mode to use for the session\n"
+                  "                                        (choices: \"acceptEdits\", \"auto\",\n"
+                  "                                        \"bypassPermissions\", \"manual\",\n"
+                  "                                        \"dontAsk\", " + ("" if os.environ.get("MOCK_AGENT_HELP")
+                                                                         == "no-plan" else "\"plan\"") + ")\n"
+                  "  --permission-prompts <target>         Who answers permission prompts\n"
                   "Commands:\n  update|upgrade                        Check for updates and install if available")
     elif args == ["update"]:
         native_update()
@@ -165,6 +176,14 @@ elif name == "cursor-agent":
         print("2026.10.22-test")
     elif args == ["--help"]:
         print("  --model <model>  Model to use\n  --list-models  List available models and exit\n"
+              "  --mode <mode>                Start in the given execution mode. plan:\n"
+              "                               read-only/planning (analyze, propose plans, no\n"
+              "                               edits). " + ("" if os.environ.get("MOCK_AGENT_HELP") == "no-ask" else
+                                                           "ask: Q&A style for explanations and\n"
+                                                           "                               questions (read-only). ")
+              + "(choices: \"plan\"" + ("" if os.environ.get("MOCK_AGENT_HELP") == "no-ask" else ", \"ask\"") + ")\n"
+              "  --plan                       Start in plan mode (shorthand for --mode=plan).\n"
+              "  --add-dir <path>             Add an additional workspace root directory\n"
               "Commands:\n  update                       Update Cursor Agent to the latest version")
     elif args == ["update"]:
         native_update()
@@ -207,6 +226,9 @@ elif name == "apt-cache":
     if args == ["madison", "gum"]:
         if archive:
             print("       gum |   0.17.0-1 | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
+    elif args == ["madison", "nodejs"]:
+        for version in os.environ.get("MOCK_APT_NODE", "18.19.1+dfsg-6ubuntu5").split():
+            print("    nodejs | " + version + " | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
     elif args == ["policy", "gum"]:
         # Like APT, policy's Candidate may be an installed-only version whose repository was removed.
         print("gum:\n  Installed: " + ("0.17.0-1" if installed else "(none)") + "\n  Candidate: "
@@ -226,7 +248,9 @@ elif name == "node":
 elif name == "npm":
     # The default global prefix models a root-owned system Node in /usr.
     default_prefix = os.environ.get("MOCK_NPM_PREFIX", "/usr")
-    if args == ["prefix", "-g"]:
+    if args == ["--version"]:
+        print("10.9.0")
+    elif args == ["prefix", "-g"]:
         print(default_prefix)
     elif args == ["install", "-g", "acpx@latest"] or (
             len(args) == 5 and args[:3] == ["install", "-g", "--prefix"] and args[4] == "acpx@latest"):
@@ -329,8 +353,8 @@ elif name == "herdr" and os.environ.get("MOCK_PR_WORKFLOW") == "1" and (
                           **({"open_workspace_id": "pr-ws"} if state.get("open") == path else {})})
         return found
     def agent():
-        return {"name": state["alias"], "agent": "codex", "workspace_id": "pr-ws", "tab_id": "pr-tab",
-                "pane_id": "pr-pane", "agent_status": os.environ.get("MOCK_AGENT_STATUS", "idle")}
+        return {"name": state["alias"], "agent": state.get("kind", "codex"), "workspace_id": "pr-ws",
+                "tab_id": "pr-tab", "pane_id": "pr-pane", "agent_status": os.environ.get("MOCK_AGENT_STATUS", "idle")}
     if args[:2] == ["worktree", "list"]:
         print(json.dumps({"id": "test", "result": {"type": "worktree_list",
             "source": {"source_checkout_path": args[args.index("--cwd") + 1], "source_workspace_id": "ws"},
@@ -355,12 +379,13 @@ elif name == "herdr" and os.environ.get("MOCK_PR_WORKFLOW") == "1" and (
             print(json.dumps({"id": "test", "error": {"code": "agent_not_found", "message": "agent not found"}}))
             sys.exit(1)
         envelope("agent_info", "agent", agent())
-    elif args[:2] == ["agent", "start"] and args[3:8] == ["--kind", "codex", "--pane", "pr-pane", "--timeout"]:
-        state["alias"] = args[2]
+    elif (args[:2] == ["agent", "start"] and args[3] == "--kind" and args[4] in ("claude", "codex", "cursor")
+          and args[5:8] == ["--pane", "pr-pane", "--timeout"] and "alias" not in state):
+        state["alias"], state["kind"] = args[2], args[4]
         state_file.write_text(json.dumps(state))
         envelope("agent_started", "agent", agent())
-    elif args[:3] == ["agent", "prompt", "pr-pane"] and "alias" in state:
-        envelope("agent_prompted", "agent", agent())
+    elif args[:3] in (["agent", "prompt", "pr-pane"], ["agent", "focus", "pr-pane"]) and "alias" in state:
+        envelope("agent_prompted" if args[1] == "prompt" else "agent_info", "agent", agent())
     else:
         fail("unexpected PR review Herdr action")
 elif name == "herdr":
@@ -503,7 +528,7 @@ elif name in ("brew", "sudo", "apt-get"):
             fail("simulated interrupted package installation")
         if "gum" in args:
             (root / "gum-repaired").write_text("yes")
-        provided = {"gh": ("gh",), "gum": ("gum",)}
+        provided = {"gh": ("gh",), "gum": ("gum",), "node": ("node", "npm"), "nodejs": ("node",), "npm": ("npm",)}
         for command in (command for package in args for command in provided.get(package, ())):
             if not (root / command).exists():
                 shutil.copyfile(root / "mock-cli", root / command)
@@ -619,9 +644,15 @@ class DistributionTests(unittest.TestCase):
         mock_script = self.mock / "mock-cli"
         mock_script.write_text(MOCK)
         mock_script.chmod(0o755)
-        for name in ("gh", "codex", "claude", "cursor-agent", "acpx", "no-mistakes", "herdr", "uname",
+        for name in ("gh", "codex", "claude", "cursor-agent", "node", "npm", "no-mistakes", "herdr", "uname",
                      "brew", "curl", "sudo", "apt-get", "apt-cache", "git", "nohup", "ssh", "dpkg", "gum"):
             (self.mock / name).symlink_to(mock_script.name)
+        # acpx runs from the No-Mistakes daemon's PATH (login shell plus well-known directories) where setup's
+        # npm --prefix ~/.local puts it.
+        self.acpx = self.home / ".local/bin/acpx"
+        self.acpx.parent.mkdir(parents=True)
+        shutil.copyfile(mock_script, self.acpx)
+        self.acpx.chmod(0o755)
         # A controlled PATH makes genuinely missing dependencies reproducible.
         utilities = ("bash sh env make jq python3 tar mkdir cp mv rm chmod cat find readlink dirname "
                      "basename mktemp sed awk tr stat date sleep touch ln id ps cmp head cut sort uniq "
@@ -634,6 +665,8 @@ class DistributionTests(unittest.TestCase):
                     "XDG_STATE_HOME": str(self.home / "state"), "XDG_CONFIG_HOME": str(self.home / "config"),
                     "PATH": str(self.home / ".local/bin") + os.pathsep + str(self.mock), "MOCK_BIN": str(self.mock), "MOCK_LOG": str(self.log),
                     "REAL_GIT": REAL_GIT or "", "LANG": "C", "TERM": "dumb",
+                    # The login shell No-Mistakes probes for its daemon PATH; startup files live in the test home.
+                    "SHELL": shutil.which("bash", path=REAL_PATH) or "/bin/bash",
                     "PYTHONDONTWRITEBYTECODE": "1"}
         self.installed = Path(self.env["XDG_DATA_HOME"]) / "mini-factory"
         self.wrapper = self.home / ".local/bin/ghd"
@@ -690,6 +723,10 @@ class DistributionTests(unittest.TestCase):
     def calls(self, tool=None):
         records = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return [record for record in records if tool is None or record["tool"] == tool]
+
+    def npm_changes(self):
+        """npm invocations other than read-only version and global-prefix queries."""
+        return [call for call in self.calls("npm") if call["args"] not in (["--version"], ["prefix", "-g"])]
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -832,7 +869,7 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse(self.wrapper.exists())
 
     def test_refuses_unrelated_launcher(self):
-        self.wrapper.parent.mkdir(parents=True)
+        self.wrapper.parent.mkdir(parents=True, exist_ok=True)
         self.wrapper.write_text("#!/bin/sh\necho unrelated\n")
         self.wrapper.chmod(0o755)
         result = self.setup()
@@ -903,8 +940,7 @@ class DistributionTests(unittest.TestCase):
         urls = [argument for call in self.calls("curl") for argument in call["args"] if argument.startswith("https://")]
         self.assertIn("https://chatgpt.com/codex/install.sh", urls)
         self.assertIn("https://herdr.dev/install.sh", urls)
-        self.assertFalse(self.calls("npm"))
-        self.assertFalse(self.calls("node"))
+        self.assertFalse(self.npm_changes(), "an existing acpx needs no npm")
         self.assert_no_actions()
 
     def test_native_auth_and_integration_delegate_after_consent(self):
@@ -1459,9 +1495,10 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("https://cursor.com/install", urls)
         self.assertIn("https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh", urls)
         self.assertIn(["login"], [c["args"] for c in self.calls("cursor-agent")])
+        # The issue keys use Cursor and the default PR reviewer uses Codex.
         installs = [args for args in self.herdr_calls("integration", "install") if "--help" not in args]
-        self.assertEqual(installs, [["integration", "install", "codex"], ["integration", "install", "cursor"]])
-        self.assertFalse(self.calls("npm"))
+        self.assertEqual(installs, [["integration", "install", "cursor"], ["integration", "install", "codex"]])
+        self.assertFalse(self.npm_changes())
         self.assert_no_actions(allow_onboarding=True)
 
     def no_mistakes_updates(self):
@@ -1547,56 +1584,232 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse(self.no_mistakes_updates())
         self.assert_no_actions()
 
-    def test_cursor_pipeline_installs_user_owned_acpx_for_system_node(self):
-        (self.mock / "acpx").unlink()
-        for name in ("node", "npm"):
-            (self.mock / name).symlink_to("mock-cli")
-        self.assert_success(self.interactive_setup("y", ISSUE_AGENT="cursor"))
-        # Without a user-writable global prefix, acpx goes beside the other commands instead of using sudo.
+    def test_acpx_is_baseline_and_installed_user_owned_for_system_node(self):
+        # Every role and No-Mistakes duty is Codex; acpx is still provisioned so Cursor can be chosen later.
+        self.acpx.unlink()
+        self.assert_success(self.interactive_setup("y"))
+        # Without a user-writable global prefix on the daemon's PATH, acpx goes beside the other commands, never sudo.
         self.assertEqual([c["args"] for c in self.calls("npm") if c["args"][:1] == ["install"]],
                          [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
-        self.assertTrue((self.wrapper.parent / "acpx").is_file())
+        self.assertTrue(self.acpx.is_file())
         self.assertFalse(self.calls("sudo"))
         self.assert_no_actions(allow_onboarding=True)
 
-    def test_cursor_pipeline_reuses_suitable_node_npm_and_acpx(self):
-        (self.mock / "acpx").unlink()
-        for name in ("node", "npm"):
-            (self.mock / name).symlink_to("mock-cli")
+    def test_acpx_must_run_for_the_no_mistakes_daemon_without_changing_npm_or_node(self):
+        # A writable global prefix on the shell's PATH but outside the daemon's PATH (not set by the login shell).
+        self.acpx.unlink()
         prefix = self.root / "npm global"
         (prefix / "lib/node_modules").mkdir(parents=True)
         (prefix / "bin").mkdir()
         self.env["PATH"] += os.pathsep + str(prefix / "bin")
-        environment = {"ISSUE_AGENT": "cursor", "MOCK_NPM_PREFIX": str(prefix), "MOCK_NODE_VERSION": "v22.13.0"}
+        environment = {"MOCK_NPM_PREFIX": str(prefix), "MOCK_NODE_VERSION": "v22.13.0"}
         self.assert_success(self.interactive_setup("y", **environment))
         self.assertEqual([c["args"] for c in self.calls("npm") if c["args"][:1] == ["install"]],
-                         [["install", "-g", "acpx@latest"]])
-        self.assertTrue((prefix / "bin/acpx").is_file())
-        self.assertFalse(self.calls("brew"))
+                         [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
+        self.assertTrue(self.acpx.is_file())
+        self.assertFalse((prefix / "bin/acpx").exists())
         # A rerun finds acpx and needs no npm.
         self.log.unlink()
         self.assert_success(self.setup(**environment))
-        self.assertFalse(self.calls("npm") + self.calls("brew"))
+        self.assertFalse(self.npm_changes() + self.calls("brew"))
+        # An acpx that runs only from the shell's PATH is reported, never moved or reinstalled.
+        self.acpx.rename(prefix / "bin/acpx")
+        result = self.setup(**environment)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("runs only from your current shell PATH, not from the No-Mistakes daemon's PATH", result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env=environment)
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: acpx or its Node.js does not run from the No-Mistakes daemon's PATH", doctor.stdout)
+        self.assertTrue((prefix / "bin/acpx").is_file())
+        self.assertFalse(self.npm_changes())
         self.assert_no_actions()
 
-    def test_missing_node_reports_incomplete_setup_without_installing_it(self):
-        (self.mock / "acpx").unlink()
-        (self.home / ".codex").mkdir()
+    def test_existing_acpx_in_home_bin_runs_for_the_daemon_and_is_reused(self):
+        # ~/bin is on the No-Mistakes service PATH even where the shell PATH lacks it: nothing is installed or moved.
+        home_bin = self.home / "bin"
+        home_bin.mkdir()
+        self.acpx.rename(home_bin / "acpx")
+        self.install()
+        self.assertFalse(self.npm_changes())
+        self.assertFalse(self.acpx.exists())
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", doctor.stdout.splitlines())
+        # One there that does not run is genuinely unusable: reported, never claimed ready.
+        (home_bin / "acpx").write_text("#!/bin/sh\nexit 1\n")
+        self.log.write_text("")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: npm install -g --prefix " + str(self.home / ".local") + " acpx@latest",
+                      result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: acpx or its Node.js does not run from the No-Mistakes daemon's PATH", doctor.stdout)
+        self.assertFalse(self.npm_changes())
+        self.assert_no_actions()
+
+    def test_acpx_from_a_version_manager_in_the_login_shell_runs_for_the_daemon(self):
+        # Like nvm or fnm: acpx (and its Node.js) only on the PATH the login shell's startup files set. The daemon
+        # adopts that PATH, so setup and doctor accept it without installing or moving anything.
+        manager = self.root / "nvm versions/node/v22.13.0/bin"
+        manager.mkdir(parents=True)
+        self.acpx.rename(manager / "acpx")
+        profile = self.home / ".bash_profile"
+        profile.write_text('echo "rc output"\nPATH="' + str(manager) + ':$PATH"\nexport PATH\n')
+        self.env["PATH"] += os.pathsep + str(manager)
+        self.install()
+        self.assertFalse(self.npm_changes())
+        self.assertFalse(self.acpx.exists())
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", doctor.stdout.splitlines())
+        # Without that startup file the daemon would not find it: reported, never moved or reinstalled.
+        profile.unlink()
+        self.env["PATH"] += os.pathsep + str(manager)
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("runs only from your current shell PATH, not from the No-Mistakes daemon's PATH", result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: acpx or its Node.js does not run from the No-Mistakes daemon's PATH", doctor.stdout)
+        self.assertTrue((manager / "acpx").is_file())
+        self.assertFalse(self.npm_changes())
+        self.assert_no_actions()
+
+    def test_configured_acpx_path_is_what_setup_and_doctor_check(self):
+        self.install()
         source = self.bundle / "no-mistakes/config.yaml"
-        source.write_text(source.read_text().replace("agent: codex", "agent: cursor", 1))
-        for run in (self.setup, lambda **environment: self.interactive_setup("y", **environment)):
-            result = run(ISSUE_AGENT="cursor")
+        original = source.read_text()
+        custom = self.root / "custom acpx/acpx"
+        custom.parent.mkdir()
+        self.acpx.rename(custom)
+        # Native No-Mistakes runs acpx_path verbatim instead of acpx from its PATH.
+        source.write_text(original + "acpx_path: " + json.dumps(str(custom)) + "\n")
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertIn("No-Mistakes acpx_path: " + str(custom), result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH (acpx_path: " + str(custom) + ")",
+                      doctor.stdout.splitlines())
+        # A configured acpx_path that does not run is reported and never installed over, even with consent;
+        # an acpx on the PATH does not stand in for it.
+        custom.rename(self.acpx)
+        result = self.interactive_setup("y")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: acpx_path " + str(custom) + " in the No-Mistakes config does not run",
+                      result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: acpx (acpx_path: " + str(custom) + ") or its Node.js does not run from the No-Mistakes "
+                      "daemon's PATH", doctor.stdout)
+        # An acpx_path nm-config cannot read is never assumed to be acpx.
+        source.write_text(original + "acpx_path: [acpx]\n")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: No-Mistakes acpx_path not checked", result.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: cannot read acpx_path", doctor.stdout)
+        # Without the setting, the acpx on the daemon's PATH is used again.
+        source.write_text(original)
+        self.assert_success(self.setup())
+        self.assertFalse(self.npm_changes())
+        self.assert_no_actions()
+
+    def test_missing_node_is_installed_only_with_consent_and_an_existing_one_is_never_replaced(self):
+        self.acpx.unlink()
+        for name in ("node", "npm"):
+            (self.mock / name).unlink()
+        (self.home / ".codex").mkdir()
+        for run in (self.setup, lambda: self.interactive_setup("n")):
+            result = run()
             self.assertNotEqual(result.returncode, 0, result.stdout)
-            self.assertIn("Remaining action: put Node.js 22.13+ with npm first on PATH", result.stdout)
+            self.assertIn("Remaining action: Node.js is missing; acpx needs Node.js 22.13+ with npm. Setup never "
+                          "replaces an existing Node.js or version manager", result.stdout)
             self.assertIn("authentication/setup actions remain pending", result.stdout)
+            self.assertTrue(self.installed.is_dir())
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])])
-        self.assertFalse(self.calls("sudo"))
-        self.assertFalse(self.calls("npm"))
-        self.assertFalse((self.wrapper.parent / "acpx").exists())
-        self.assertTrue(self.installed.is_dir())
+        self.assertFalse(self.npm_changes())
+        # With consent, Homebrew installs the missing Node.js (with npm), then npm installs acpx.
+        self.assert_success(self.interactive_setup("y"))
+        self.assertEqual([c["args"] for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])],
+                         [["install", "node"]])
+        self.assertTrue(self.acpx.is_file())
+        # An older Node.js (for example from fnm or nvm) is reported with the exact action, never replaced.
+        self.acpx.unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_NODE_VERSION="v20.11.0")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(str(self.mock / "node") + " is Node.js v20.11.0; acpx needs Node.js 22.13+ with npm", result.stdout)
+        self.assertIn("FAIL: Node.js 22.13+ required by acpx (found v20.11)", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])])
+        self.assertFalse(self.npm_changes() + self.calls("sudo"))
         self.assert_no_actions(allow_onboarding=True)
 
-    def test_doctor_reports_unfinished_agent_and_pipeline_onboarding(self):
+    def test_mocked_ubuntu_installs_missing_node_only_from_suitable_apt_sources(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        ubuntu = {"MOCK_OS": "Linux", "MOCK_ARCH": "x86_64"}
+        self.acpx.unlink()
+        for name in ("node", "npm"):
+            (self.mock / name).unlink()
+        # Ubuntu's archive offers only an older nodejs: guidance instead of a package change.
+        result = self.interactive_setup("y", **ubuntu)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: Node.js is missing", result.stdout)
+        self.assertFalse([c for c in self.calls("sudo") if {"nodejs", "npm"} & set(c["args"])])
+        # A configured source with 22.13+ (a newer archive or NodeSource) is used with consent; npm follows if separate.
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y", MOCK_APT_NODE="22.14.0-1nodesource1", **ubuntu))
+        self.assertEqual([c["args"] for c in self.calls("sudo") if {"nodejs", "npm"} & set(c["args"])],
+                         [["apt-get", "install", "-y", "--no-install-recommends", "nodejs"],
+                          ["apt-get", "install", "-y", "--no-install-recommends", "npm"]])
+        self.assertEqual([c["args"] for c in self.calls("npm") if c["args"][:1] == ["install"]],
+                         [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_cursor_for_every_role_needs_no_codex_login_or_integration(self):
+        self.assertNotEqual(self.setup(PR_REVIEW_AGENT="copilot").returncode, 0)
+        self.assertFalse(self.installed.exists())
+        pending = {"MOCK_CODEX_AUTH": "pending", "MOCK_INTEGRATION": "pending"}
+        result = self.interactive_setup("y", ISSUE_AGENT="cursor", PR_REVIEW_AGENT="cursor", **pending)
+        self.assert_success(result)
+        self.assertIn("Issues i preparer: cursor; Issues I implementer: cursor; PRs I reviewer: cursor", result.stdout)
+        path = self.profiles_file()
+        self.assertEqual(json.loads(path.read_text()), {"version": 1, "profiles": {"pr-review": {"agent": "cursor"}}})
+        # All three CLIs are installed; only Cursor logs in and gets a Herdr integration.
+        self.assertNotIn(["login", "--device-auth"], [c["args"] for c in self.calls("codex")])
+        self.assertEqual([args for args in self.herdr_calls("integration", "install") if "--help" not in args],
+                         [["integration", "install", "cursor"]])
+        self.assertFalse((self.home / ".codex").exists())
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env=pending)
+        self.assert_success(doctor)
+        for line in ("OK: codex version responds", "OK: claude version responds", "OK: cursor-agent version responds",
+                     "OK: acpx runs from the No-Mistakes daemon's PATH", "OK: PRs I reviewer: Cursor (mf-config selection)",
+                     "OK: Cursor authenticated", "OK: Herdr Cursor integration current"):
+            self.assertIn(line, doctor.stdout.splitlines())
+        self.assertNotIn("Codex authenticated", doctor.stdout)
+        self.assertNotIn("Herdr Codex integration", doctor.stdout)
+        # The saved choice survives later runs; switching another role later needs no new prerequisite install.
+        self.assert_success(self.setup(**pending))
+        self.assertEqual(self.mf_config("agent", "pr-review").stdout, "cursor\noverride\n")
+        self.profiles_file({"pr-review": {"agent": "claude", "model": "opus"}})
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_INTEGRATION="pending")
+        self.assert_success(result)
+        self.assertFalse(self.calls("curl") + self.npm_changes() + [c for c in self.calls("brew") if "install" in c["args"]])
+        self.assertIn(["integration", "install", "claude"], self.herdr_calls("integration", "install"))
+        # PR_REVIEW_AGENT keeps a same-harness profile; Codex is the default, so choosing it removes the override.
+        self.assert_success(self.setup(PR_REVIEW_AGENT="claude"))
+        self.assertEqual(json.loads(path.read_text())["profiles"]["pr-review"], {"agent": "claude", "model": "opus"})
+        self.assert_success(self.interactive_setup("y", PR_REVIEW_AGENT="codex"))
+        self.assertEqual(self.mf_config("agent", "pr-review").stdout, "codex\ndefault\n")
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_doctor_reports_unfinished_agent_and_no_mistakes_onboarding(self):
         self.install()
         doctor = self.installed / "scripts/doctor.sh"
         self.save_issue_agent("claude")
@@ -1612,26 +1825,65 @@ class DistributionTests(unittest.TestCase):
                 self.assertNotIn("AUTH_SECRET_SENTINEL", result.stdout + result.stderr)
         source = self.bundle / "no-mistakes/config.yaml"
         original = source.read_text()
-        # Other native selections rely on native doctor instead of blocking onboarding.
         self.save_issue_agent("codex")
-        for selection in ("auto", "acp:cursor"):
-            with self.subTest(selection=selection):
-                source.write_text(original.replace("agent: codex", "agent: " + selection, 1))
-                result = self.run_script(doctor)
+        # An unused, logged-out agent never blocks doctor.
+        self.assert_success(self.run_script(doctor, env={"MOCK_CLAUDE_AUTH": "pending", "MOCK_CURSOR_AUTH": "pending"}))
+        # auto (and fallback lists) rely on native doctor instead of blocking onboarding.
+        source.write_text(original.replace("agent: codex", "agent: auto", 1))
+        result = self.run_script(doctor)
+        self.assert_success(result)
+        self.assertIn("NOTE: No-Mistakes agent auto login not checked", result.stdout)
+        self.assertIn("Authentication/setup: complete", result.stdout)
+        result = self.run_script(doctor, env={"MOCK_NM_DOCTOR": "fail"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No-Mistakes pipeline agent not ready", result.stdout)
+        # A Cursor duty needs Cursor login wherever it is configured, but no Herdr integration.
+        (self.mock / "herdr-integrated-codex").write_text("yes")
+        for config, line in (
+                (original.replace("agent: codex", "agent: acp:cursor", 1), "OK: No-Mistakes agent: acp:cursor"),
+                (original.replace("agent: codex", "agent: auto", 1) + "review_agents:\n  reviewer:\n    agent: cursor\n",
+                 "OK: No-Mistakes review_agents.reviewer: cursor"),
+                (original + "review_agents:\n  fixer:\n    agent: acp:cursor\n", "OK: No-Mistakes review_agents.fixer: acp:cursor"),
+                (original + "review_agents:\n  fixer_after_round:\n    agent: cursor\n    after_round: 2\n",
+                 "OK: No-Mistakes review_agents.fixer_after_round: cursor"),
+                # Ordinary native-valid one-line flow mappings are read, not refused.
+                (original.replace("agent: codex", "agent: acp:cursor", 1) + "review_agents: {}\n",
+                 "OK: No-Mistakes agent: acp:cursor"),
+                (original + "review_agents:\n  reviewer: {agent: cursor}\n",
+                 "OK: No-Mistakes review_agents.reviewer: cursor"),
+                # Native-valid CRLF line endings are read too; the file itself is never rewritten.
+                ((original + "review_agents:\n  fixer:\n    agent: cursor\n").replace("\n", "\r\n"),
+                 "OK: No-Mistakes review_agents.fixer: cursor")):
+            with self.subTest(config=config):
+                source.write_text(config)
+                result = self.run_script(doctor, env={"MOCK_INTEGRATION": "pending"})
                 self.assert_success(result)
-                self.assertIn("NOTE: No-Mistakes pipeline agent " + selection + " login not checked", result.stdout)
-                self.assertIn("Authentication/setup: complete", result.stdout)
-                result = self.run_script(doctor, env={"MOCK_NM_DOCTOR": "fail"})
+                self.assertIn(line + " (Cursor login checked; no Herdr integration needed)", result.stdout)
+                self.assertIn("OK: Cursor authenticated", result.stdout)
+                self.assertNotIn("Herdr Cursor integration", result.stdout)
+                result = self.run_script(doctor, env={"MOCK_CURSOR_AUTH": "pending"})
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("No-Mistakes pipeline agent not ready", result.stdout)
-        source.write_text(original.replace("agent: codex", "agent: cursor", 1))
-        (self.mock / "acpx").unlink()
+                self.assertIn("FAIL: Cursor authentication/setup pending: cursor-agent login", result.stdout)
+                result = self.setup(MOCK_CURSOR_AUTH="pending")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("No-Mistakes agents needing login: ", result.stdout)
+                self.assertIn("Remaining action: cursor-agent login", result.stdout)
+                self.assertEqual(source.read_bytes().decode(), config)
+        # Duties nm-config cannot read may need a logged-out agent: login stays pending, never complete.
+        source.write_text(original + "review_agents: &roles\n  reviewer:\n    agent: cursor\n")
+        result = self.run_script(doctor, env={"MOCK_CURSOR_AUTH": "pending"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: No-Mistakes agent login pending: cannot read their agents", result.stdout)
+        self.assertNotIn("Authentication/setup: complete", result.stdout)
+        result = self.setup(MOCK_CURSOR_AUTH="pending")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Remaining action: No-Mistakes agents not checked", result.stdout)
+        source.write_text(original)
+        self.acpx.unlink()
         result = self.run_script(doctor)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("acpx missing", result.stdout)
+        self.assertIn("FAIL: acpx or its Node.js does not run from the No-Mistakes daemon's PATH", result.stdout)
         self.assertIn("Installation: incomplete", result.stdout)
-        result = self.run_script(doctor, env={"MOCK_NM_DOCTOR": "fail"})
-        self.assertIn("No-Mistakes pipeline agent not ready", result.stdout)
         self.bundle.rename(self.root / "moved clone")
         result = self.run_script(doctor)
         self.assertNotEqual(result.returncode, 0)
@@ -1780,12 +2032,22 @@ class DistributionTests(unittest.TestCase):
         return {"CODEX_HOME": str(directory)}
 
     def pr_environment(self, repo, git, **overrides):
-        git("update-ref", "refs/pull/7/head", "HEAD")
+        # main is the PR base; the PR head adds one change on top of it, outside the source checkout.
+        base = git("rev-parse", "HEAD")
+        git("update-ref", "refs/heads/main", base)
+        git("checkout", "-q", "-b", "pr-head-fixture")
+        (repo / "reviewed.txt").write_text("reviewed change\n")
+        git("add", "reviewed.txt")
+        git("commit", "-q", "-m", "PR change")
+        head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "feature/friend")
+        git("branch", "-q", "-D", "pr-head-fixture")
+        git("update-ref", "refs/pull/7/head", head)
         return {"HERDR_SOCKET_PATH": str(self.home / "test.sock"), "HERDR_WORKSPACE_ID": "ws",
                 "HERDR_TAB_ID": "tab", "HERDR_PANE_ID": "pane", "MOCK_PR_WORKFLOW": "1",
-                "MOCK_REMOTE": str(repo), "MOCK_PR_HEAD": git("rev-parse", "HEAD"),
+                "MOCK_REMOTE": str(repo), "MOCK_PR_HEAD": head, "MOCK_PR_BASE": base,
                 "GH_DASH_SOURCE_ROOT": str(repo), "GH_DASH_SOURCE_REPO": "friend/target",
-                "GH_DASH_SOURCE_BRANCH": "feature/friend", "GH_DASH_SOURCE_SHA": git("rev-parse", "HEAD"),
+                "GH_DASH_SOURCE_BRANCH": "feature/friend", "GH_DASH_SOURCE_SHA": base,
                 "GH_DASH_SOURCE_DIRTY": "0", "GH_DASH_CODEX_PR_REVIEW_BACKEND": "1", **overrides}
 
     def test_mf_config_show_reports_legacy_fallback_and_precedence_without_a_terminal(self):
@@ -1795,8 +2057,8 @@ class DistributionTests(unittest.TestCase):
         lines = result.stdout.splitlines()
         self.assertIn("Issues i - preparer: Claude Code - shared issue agent (no per-role override)", lines)
         self.assertIn("Issues I - implementer: Claude Code - shared issue agent (no per-role override)", lines)
-        self.assertIn("PRs I - reviewer (Codex only): Codex - native defaults; locally read-only permissions unchanged",
-                      lines)
+        self.assertIn("PRs I - reviewer: Codex - default (no saved selection); interactive, read-only (permission "
+                      "profile :read-only, no network); findings stay in its terminal", lines)
         self.assertIn("(none saved yet)", result.stdout)
         self.assertIn("its mf-config selection, then the shared issue agent, then Codex", result.stdout)
         for role in ("issue-prepare", "issue-implement"):
@@ -1811,6 +2073,15 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("model: native default; reasoning effort: high; Fast: off", result.stdout)
         self.assertEqual(self.mf_config("agent", "issue-implement").stdout, "cursor\noverride\n")
         self.assertEqual(self.mf_config("agent", "pr-review").stdout, "codex\noverride\n")
+        # Each harness can review PRs; show names its native read-only mode and terminal-only output.
+        for kind, label, mode in (("claude", "Claude Code", "Plan mode"), ("cursor", "Cursor", "Ask mode")):
+            self.profiles_file({"pr-review": {"agent": kind}})
+            result = self.mf_config("show")
+            self.assert_success(result)
+            self.assertIn("PRs I - reviewer: " + label + " - mf-config selection; interactive, read-only (" + mode
+                          + "); findings stay in its terminal", result.stdout.splitlines())
+            self.assertIn("no file edits, PR comments, reviews, or other GitHub writes", result.stdout)
+            self.assertEqual(self.mf_config("agent", "pr-review").stdout, kind + "\noverride\n")
         # Editing needs a terminal; show stays available.
         result = self.mf_config()
         self.assertNotEqual(result.returncode, 0)
@@ -1848,7 +2119,8 @@ class DistributionTests(unittest.TestCase):
 
     def test_mf_config_rejects_invalid_profiles_without_repairing_them(self):
         invalid = (
-            '{"version": 1, "profiles": {"pr-review": {"agent": "claude"}}}',
+            '{"version": 1, "profiles": {"pr-review": {"agent": "cursor", "effort": "high"}}}',
+            '{"version": 1, "profiles": {"pr-review": {"agent": "claude", "fast": true}}}',
             '{"version": 1, "profiles": {"issue-prepare": {"agent": "cursor", "effort": "high"}}}',
             '{"version": 1, "profiles": {"issue-prepare": {"agent": "codex", "model": "--yolo"}}}',
             '{"version": 1, "profiles": {"issue-prepare": {"agent": "codex", "fast": "on"}}}',
@@ -1882,8 +2154,7 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(remaining, [])
         prompts = self.gum_prompts()
         self.assertEqual(prompts[0][0], "choose")
-        self.assertEqual(prompts[0][3], ["Issues i - preparer", "Issues I - implementer",
-                                         "PRs I - reviewer (Codex only)"])
+        self.assertEqual(prompts[0][3], ["Issues i - preparer", "Issues I - implementer", "PRs I - reviewer"])
         harness = prompts[1]
         self.assertEqual(harness[3], ["Shared issue agent: Claude Code (no per-role override)", "Codex",
                                       "Claude Code", "Cursor"])
@@ -1975,7 +2246,7 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text())["profiles"]["issue-implement"],
                          {"agent": "codex", "model": "gpt-test-fast", "effort": "ultra"})
         # Missing cache, custom model: no Fast choice is offered and native Fast stays untouched.
-        result, remaining = self.edit_profiles("PRs I - reviewer (Codex only)", "Custom model ID (unverified)",
+        result, remaining = self.edit_profiles("PRs I - reviewer", "Codex", "Custom model ID (unverified)",
                                                "my-model-1", "high", "yes", **new)
         self.assert_success(result)
         self.assertEqual(remaining, [])
@@ -1994,11 +2265,27 @@ class DistributionTests(unittest.TestCase):
                 self.assertEqual(remaining, [])
                 self.assertFalse([prompt for prompt in self.gum_prompts() if "Fast" in prompt[1]])
         self.assertEqual(json.loads(path.read_text())["profiles"]["issue-prepare"], {"agent": "codex"})
-        # All-native reviewer choices remove the reviewer override.
-        result, remaining = self.edit_profiles("PRs I - reviewer (Codex only)", "Native default (no override)",
+        # Codex with all-native choices is the default reviewer, so its override is removed.
+        result, remaining = self.edit_profiles("PRs I - reviewer", "Codex", "Native default (no override)",
                                                "Native default (no override)", "yes", **new)
         self.assert_success(result)
         self.assertNotIn("pr-review", json.loads(path.read_text())["profiles"])
+        # Claude Code and Cursor reviewers are saved even with native defaults; only native options are offered.
+        result, remaining = self.edit_profiles("PRs I - reviewer", "Claude Code", "Native default (no override)",
+                                               "high", "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        harness = self.gum_prompts()[1]
+        self.assertEqual(harness[1], "PRs I - reviewer: harness (Codex is the default; each starts read-only)")
+        self.assertEqual(harness[2], "Codex")
+        self.assertEqual(harness[3], ["Codex", "Claude Code", "Cursor"])
+        self.assertEqual(json.loads(path.read_text())["profiles"]["pr-review"], {"agent": "claude", "effort": "high"})
+        result, remaining = self.edit_profiles("PRs I - reviewer", "Cursor", "Native default (no override)", "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual(self.gum_prompts()[1][2], "Claude Code", "the current reviewer harness is preselected")
+        self.assertFalse([prompt for prompt in self.gum_prompts() if "effort" in prompt[1].lower()])
+        self.assertEqual(json.loads(path.read_text())["profiles"]["pr-review"], {"agent": "cursor"})
 
     def test_cursor_picker_uses_bounded_model_list_and_preserves_custom_values(self):
         path = self.profiles_file()
@@ -2084,47 +2371,145 @@ class DistributionTests(unittest.TestCase):
                 self.assertIn("agent not started and prompt not sent", result.stderr)
                 self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
 
-    def test_pr_review_applies_only_codex_model_effort_and_fast_after_security_options(self):
+    def pr_review_paths(self):
+        state = Path(self.env["XDG_STATE_HOME"]) / "gh-dash-codex-pr-review"
+        identity = "repo-6-friend-6-target-pr-7-review"
+        return state / "worktrees" / identity, state / "contexts" / identity
+
+    def run_pr_review(self, repo, route, **overrides):
+        self.log.write_text("")
+        return self.run_script(self.bundle / "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh",
+                               "friend/target", "7", cwd=repo, env=dict(route, **overrides))
+
+    def assert_terminal_only_review(self, repo, worktree):
+        # Only reads reach GitHub, and neither checkout is changed.
+        self.assertEqual({tuple(c["args"][:2]) for c in self.calls("gh")}, {("repo", "view"), ("pr", "view")})
+        for args in (c["args"] for c in self.calls("git")):
+            self.assertFalse({"push", "commit", "merge", "rebase", "reset", "checkout"} & set(args), args)
+        self.assertEqual(subprocess.run([REAL_GIT, "-C", str(worktree), "status", "--porcelain", "--untracked-files=all"],
+                                        capture_output=True, text=True, check=True).stdout, "")
+        self.assertEqual((repo / "source.txt").read_text(), "committed content\n")
+        self.assertFalse((repo / "reviewed.txt").exists())
+
+    def test_pr_review_starts_each_harness_in_its_native_read_only_mode(self):
         repo, git = self.source_repo()
         route = self.pr_environment(repo, git, MOCK_CODEX_VERSION="0.166.0")
-        worker = self.bundle / "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh"
-        # The Codex reviewer is independent of a broken shared issue-agent setting.
+        worktree, context = self.pr_review_paths()
+        # The reviewer is independent of a broken shared issue-agent setting and of issue profiles.
         self.save_issue_agent("invalid")
-        # Issue profiles never affect the reviewer.
-        self.profiles_file({"issue-implement": {"agent": "claude", "model": "opus"}})
-        self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
-        default_start = self.herdr_calls("agent", "start")
-        self.assertEqual(len(default_start), 1)
-        security = default_start[0][default_start[0].index("--") + 1:]
-        worktree = security[security.index("--cd") + 1]
-        self.assertEqual(security, ["--ask-for-approval", "never", "--strict-config", "--cd", worktree,
-                                    "--config", 'default_permissions="gh_dash_pr_review"',
-                                    "--config", 'permissions.gh_dash_pr_review={extends=":read-only",network={'
-                                    'enabled=true,domains={"github.com"="allow","api.github.com"="allow",'
-                                    '"*.githubusercontent.com"="allow"}}}'])
-        prompt = self.herdr_calls("agent", "prompt")[0][3]
-        self.assertIn("<!-- gh-dash-codex-pr-review -->", prompt)
-        # A fresh reviewer gets only its saved model/effort/Fast, after the unchanged security options.
-        (self.mock / "pr-workflow.json").unlink()
-        git("worktree", "remove", "--force", worktree)
-        alias = default_start[0][2]
-        self.profiles_file({"pr-review": {"agent": "codex", "model": "gpt-test-fast", "effort": "high", "fast": True}})
-        self.log.write_text("")
-        self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
-        self.assertEqual(self.herdr_calls("agent", "start"), [
-            ["agent", "start", alias, "--kind", "codex", "--pane", "pr-pane", "--timeout", "30000", "--",
-             *security, "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="high"',
-             "--config", 'service_tier="fast"', "--config", "features.fast_mode=true"]])
-        self.assertIn("locally read-only Codex agent.", self.notifications()[-1])
-        # A retained reviewer is reused with its original options.
-        self.profiles_file({"pr-review": {"agent": "codex", "model": "gpt-test-standard"}})
-        self.log.write_text("")
-        self.assert_success(self.run_script(worker, "friend/target", "7", cwd=repo, env=route))
+        codex = ["--ask-for-approval", "never", "--strict-config", "--cd", str(worktree),
+                 "--config", 'default_permissions="gh_dash_pr_review"',
+                 "--config", 'permissions.gh_dash_pr_review={extends=":read-only"}']
+        cases = (
+            ("codex", None, codex),
+            ("codex", {"agent": "codex", "model": "gpt-test-fast", "effort": "high", "fast": True},
+             [*codex, "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="high"',
+              "--config", 'service_tier="fast"', "--config", "features.fast_mode=true"]),
+            ("claude", {"agent": "claude", "model": "opus", "effort": "high"},
+             ["--permission-mode", "plan", "--add-dir", str(context), "--model", "opus", "--effort", "high"]),
+            ("cursor", {"agent": "cursor", "model": "gpt-5"}, ["--mode", "ask", "--add-dir", str(context), "--model", "gpt-5"]),
+        )
+        command = {"codex": "codex", "claude": "claude", "cursor": "cursor-agent"}
+        for kind, profile, native in cases:
+            with self.subTest(kind=kind, profile=profile):
+                self.profiles_file({"issue-implement": {"agent": "claude", "model": "opus"},
+                                    **({"pr-review": profile} if profile else {})})
+                result = self.run_pr_review(repo, route)
+                self.assert_success(result)
+                start = self.herdr_calls("agent", "start")
+                self.assertEqual(len(start), 1)
+                self.assertEqual(start[0][3:10], ["--kind", kind, "--pane", "pr-pane", "--timeout", "30000", "--"])
+                # Native read-only options come first; only that CLI's saved model/effort options follow.
+                self.assertEqual(start[0][10:], native)
+                self.assertTrue([c for c in self.calls(command[kind]) if c["args"] == ["--help"]],
+                                "a fresh reviewer's read-only mode is checked against the installed CLI")
+                for other in set(command.values()) - {command[kind]}:
+                    self.assertFalse(self.calls(other), other)
+                # The whole merge-base diff is readable outside the worktree, even without a shell.
+                diff = (context / "pr.diff").read_text()
+                self.assertIn("reviewed.txt | 1 +", diff)
+                self.assertIn("+reviewed change", diff)
+                self.assertNotIn("source.txt", diff)
+                self.assertEqual(stat.S_IMODE(context.stat().st_mode), 0o700)
+                prompts = self.herdr_calls("agent", "prompt")
+                self.assertEqual(len(prompts), 1)
+                prompt = prompts[0][3]
+                self.assertIn("\n" + str(context / "pr.diff") + "\n", prompt)
+                self.assertIn("detached at the PR head " + route["MOCK_PR_HEAD"], prompt)
+                self.assertIn("merge base " + route["MOCK_PR_BASE"], prompt)
+                for rule in ("report your findings only here, in this terminal", "severity and a file/line reference",
+                             "say explicitly that there are no actionable findings", "Do not write to GitHub",
+                             "do not modify, create, or delete files"):
+                    self.assertIn(rule, prompt)
+                for removed in ("<!-- gh-dash-codex-pr-review -->", "ready for review", "publish"):
+                    self.assertNotIn(removed, prompt)
+                self.assertIn("read-only " + {"codex": "Codex", "claude": "Claude Code", "cursor": "Cursor"}[kind]
+                              + " reviewer; its findings appear in its pane.", self.notifications()[-1])
+                self.assert_terminal_only_review(repo, worktree)
+                # Close the reviewer and its worktree before the next harness.
+                (self.mock / "pr-workflow.json").unlink()
+                git("worktree", "remove", "--force", str(worktree))
+
+    def test_pr_review_reuses_a_live_reviewer_with_its_original_harness(self):
+        repo, git = self.source_repo()
+        route = self.pr_environment(repo, git)
+        worktree, _ = self.pr_review_paths()
+        self.profiles_file({"pr-review": {"agent": "claude"}})
+        self.assert_success(self.run_pr_review(repo, route))
+        self.assertEqual(self.herdr_calls("agent", "start")[0][4], "claude")
+        # A changed selection never duplicates or replaces the live reviewer; idle, finished, or working
+        # reviewers get the review prompt again, as before.
+        self.profiles_file({"pr-review": {"agent": "cursor", "model": "gpt-5"}})
+        for status in ("idle", "done", "working"):
+            with self.subTest(status=status):
+                result = self.run_pr_review(repo, route, MOCK_AGENT_STATUS=status)
+                self.assert_success(result)
+                self.assertFalse(self.herdr_calls("agent", "start"))
+                self.assertEqual([args[:3] for args in self.herdr_calls("agent", "prompt")],
+                                 [["agent", "prompt", "pr-pane"]])
+                self.assertIn("read-only Claude Code reviewer", self.notifications()[-1])
+                self.assertIn("Kept the existing Claude Code reviewer with its original options; the Cursor setting "
+                              "applies once it is closed", self.notifications()[-1])
+                # Saved options are not even read for a retained reviewer.
+                self.assertFalse(self.calls("cursor-agent") + self.calls("claude"))
+                self.assert_terminal_only_review(repo, worktree)
+        # A blocked reviewer may be waiting on its own plan or trust dialog: it is focused, never typed into.
+        for status in ("blocked", "unexpected-status"):
+            with self.subTest(status=status):
+                result = self.run_pr_review(repo, route, MOCK_AGENT_STATUS=status)
+                self.assert_success(result)
+                self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start"))
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "pr-pane"]])
+                self.assertIn("prompt not sent", self.notifications()[-1])
+        # Detection must cover the retained reviewer, not the new selection.
+        result = self.run_pr_review(repo, route, MOCK_MANIFEST="claude")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not have an active Claude Code detection manifest", result.stderr)
+        self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "focus"))
+        self.assert_success(self.run_pr_review(repo, route, MOCK_MANIFEST="cursor"))
+        # The same harness with saved options is reused with a notice.
+        self.profiles_file({"pr-review": {"agent": "claude", "model": "opus"}})
+        self.assert_success(self.run_pr_review(repo, route))
         self.assertFalse(self.herdr_calls("agent", "start"))
-        self.assertEqual(len(self.herdr_calls("agent", "prompt")), 1)
         self.assertIn("Reused the existing reviewer with its original options", self.notifications()[-1])
 
-    def test_setup_provisions_selected_harnesses_and_keeps_per_key_selections(self):
+    def test_pr_review_refuses_a_cli_without_its_interactive_read_only_mode(self):
+        repo, git = self.source_repo()
+        route = self.pr_environment(repo, git)
+        for kind, help_fixture, missing in (("claude", "no-plan", "--permission-mode plan"),
+                                            ("claude", "old", "--permission-mode, --add-dir"),
+                                            ("cursor", "no-ask", "--mode ask"),
+                                            ("codex", "old", "--ask-for-approval, --strict-config, --config, --cd")):
+            with self.subTest(kind=kind, help=help_fixture):
+                self.profiles_file({"pr-review": {"agent": kind}} if kind != "codex" else {})
+                result = self.run_pr_review(repo, route, MOCK_AGENT_HELP=help_fixture)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("does not offer " + missing + ", needed for the interactive read-only PR reviewer",
+                              result.stderr)
+                self.assertIn("agent not started and prompt not sent", result.stderr)
+                self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+
+    def test_setup_installs_every_harness_and_keeps_per_key_selections(self):
         self.save_issue_agent("codex")
         path = self.profiles_file({"issue-prepare": {"agent": "claude", "effort": "high"},
                                    "issue-implement": {"agent": "claude"}})
@@ -2135,10 +2520,13 @@ class DistributionTests(unittest.TestCase):
         self.assert_success(result)
         self.assertIn("Issues i preparer: claude; Issues I implementer: claude", result.stdout)
         urls = [argument for call in self.calls("curl") for argument in call["args"] if argument.startswith("https://")]
+        # Every agent CLI is installed, but only the gh-dash roles' agents (Claude Code issues, Codex reviews)
+        # log in and get a Herdr integration; the unused Cursor stays logged out.
         self.assertIn("https://claude.ai/install.sh", urls)
-        self.assertNotIn("https://cursor.com/install", urls, "an unused harness must not be installed")
+        self.assertIn("https://cursor.com/install", urls)
+        self.assertNotIn(["login"], [c["args"] for c in self.calls("cursor-agent")])
         installs = [args for args in self.herdr_calls("integration", "install") if "--help" not in args]
-        self.assertEqual(installs, [["integration", "install", "codex"], ["integration", "install", "claude"]])
+        self.assertEqual(installs, [["integration", "install", "claude"], ["integration", "install", "codex"]])
         self.assertIn("OK: Issues i preparer: Claude Code (mf-config selection)", result.stdout)
         self.assertEqual(path.read_bytes(), saved)
         # ISSUE_AGENT stays the shared compatibility path; it never overwrites a per-key selection.
@@ -3006,7 +3394,7 @@ os.execv(executable, [executable, *args])
                          .replace("review: 3", "review: 2"))
         self.assertEqual((self.installed / "no-mistakes/config.yaml").read_bytes(), runtime_copy)
         self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
-        self.assertIn("rerun it after saving if Claude Code is new on this machine", result.stdout)
+        self.assertIn("rerun it after saving if Claude Code is not logged in on this machine", result.stdout)
         doctor = self.run_script(self.installed / "scripts/doctor.sh")
         self.assert_success(doctor)
         self.assertIn("OK: nm-config launcher resolves on PATH", doctor.stdout)
@@ -3097,6 +3485,10 @@ os.execv(executable, [executable, *args])
         for tool in tools:
             if tool == "herdr":
                 copy(local_bin / "herdr")
+            elif tool == "acpx":
+                # Setup's npm install -g --prefix ~/.local links its command into ~/.local/bin.
+                self.acpx.unlink()
+                self.acpx.symlink_to(copy(self.home / ".local/lib/node_modules/acpx/dist/cli.js"))
             elif tool == "codex":
                 release = copy(self.home / ".codex/packages/standalone/releases/0.115.0/bin/codex").parent.parent
                 (release.parent.parent / "current").symlink_to(release)
@@ -3142,8 +3534,10 @@ os.execv(executable, [executable, *args])
         self.assertIn("Herdr: manual update only", result.stdout)
         self.assertIn("Skipped without an interactive terminal; no approval was assumed. "
                       "Run gh extension upgrade dash yourself", result.stdout)
-        for unused in ("Claude Code:", "Cursor CLI:", "Claude Code (", "Cursor CLI ("):
-            self.assertNotIn(unused, result.stdout)
+        # Every baseline tool is inspected, whichever roles use it.
+        for baseline in ("Claude Code: manual update only", "Cursor CLI: manual update only",
+                         "Node.js and npm: manual update only", "acpx: manual update only"):
+            self.assertIn(baseline, result.stdout)
         for tool in ("herdr", "codex", "claude", "cursor-agent", "no-mistakes"):
             self.assertFalse(self.native_updates(tool), tool)
         self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
@@ -3249,29 +3643,60 @@ os.execv(executable, [executable, *args])
         self.assertEqual((self.bundle / "notes.txt").read_text(), "my ignored notes\n")
         self.assert_safe_clone_actions()
 
-    def test_update_checks_only_harnesses_that_setup_provisions(self):
+    def test_update_offers_every_agent_cli_and_acpx_whatever_the_selection(self):
         self.clone_fixture()
         self.install()
         self.native_layouts("claude", "cursor-agent")
-        source = self.bundle / "no-mistakes/config.yaml"
-        original = source.read_text()
-        # Review roles and fallback lists are not provisioned by setup, so update does not inspect them.
-        source.write_text("agent:\n  - claude # first\n  - codex\nauto_fix:\n  review: 3\n"
-                          "review_agents:\n  fixer:\n    agent: cursor\n    model: x\n")
+        # Every role and duty uses Codex, yet the baseline agent CLIs, Node.js, and acpx are all inspected.
         result = self.update()
         self.assert_success(result)
-        for unused in ("Claude Code", "Cursor CLI"):
-            self.assertNotIn(unused, result.stdout)
-        # A scalar pipeline agent is provisioned by setup, so update inspects it.
-        self.log.write_text("")
-        source.write_text(original.replace("agent: codex", "agent: claude", 1))
-        result = self.update()
-        self.assert_success(result)
-        self.assertIn("Claude Code (", result.stdout)
-        self.assertIn("Run claude update yourself", result.stdout)
-        self.assertNotIn("Cursor CLI", result.stdout)
+        for offered in ("Claude Code (2.1.0 (Claude Code)): native installer", "Cursor CLI (2026.10.22-test): native installer",
+                        "Run claude update yourself", "Run cursor-agent update yourself",
+                        "Node.js and npm: manual update only", "acpx: manual update only"):
+            self.assertIn(offered, result.stdout)
+        self.assertIn("Skipped without a terminal: gh-dash claude cursor-agent", result.stdout)
         for tool in ("claude", "cursor-agent"):
             self.assertFalse(self.native_updates(tool), tool)
+        self.assertFalse(self.npm_changes())
+
+    def test_update_offers_node_and_acpx_only_through_their_owning_installation(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("acpx")
+        cellar = self.root / "brew/Cellar"
+        formula = cellar / "node/24.11.0/bin/node"
+        formula.parent.mkdir(parents=True)
+        shutil.copyfile(self.mock / "mock-cli", formula)
+        formula.chmod(0o755)
+        (self.mock / "node").unlink()
+        (self.mock / "node").symlink_to(formula)
+        brew = {"MOCK_BREW_CELLAR": str(cellar)}
+        # Prompt order: gh-dash, then Node.js (Homebrew's node includes npm), then acpx (setup's ~/.local install).
+        result = self.interactive_update(["n", "y", "y"], **brew)
+        self.assert_success(result)
+        self.assertIn("Node.js and npm (v24.11.0): Homebrew formula node", result.stdout)
+        self.assertEqual([c["args"] for c in self.calls("brew") if c["args"][:1] == ["upgrade"]], [["upgrade", "node"]])
+        self.assertEqual([c["args"] for c in self.npm_changes()],
+                         [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
+        self.assertIn("Finished; acpx is still 0.20.0 (already current).", result.stdout)
+        self.assertIn("Updater completed (updated or already current): node acpx", result.stdout)
+        # A version manager's Node.js gets exact guidance; its manager, npm prefix, and shell files stay untouched.
+        fnm = self.root / "fnm/node-versions/v24.11.0/installation/bin/node"
+        fnm.parent.mkdir(parents=True)
+        shutil.copyfile(self.mock / "mock-cli", fnm)
+        fnm.chmod(0o755)
+        (self.mock / "node").unlink()
+        (self.mock / "node").symlink_to(fnm)
+        self.log.write_text("")
+        result = self.interactive_update(["n", "n"], **brew)
+        self.assert_success(result)
+        self.assertIn("Node.js and npm: manual update only: " + str(fnm) + " is managed by fnm; run fnm install --lts",
+                      result.stdout)
+        self.assertIn("make update never changes a Node version manager, npm prefix, or shell configuration", result.stdout)
+        self.assertIn("Declined (left unchanged): gh-dash acpx", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["upgrade"]])
+        self.assertFalse(self.npm_changes())
+        self.assert_no_actions()
 
     def test_update_offers_each_native_upgrade_with_consent_and_reports_decline_and_failure(self):
         self.clone_fixture()
@@ -3360,7 +3785,7 @@ os.execv(executable, [executable, *args])
         self.assertIn("Installation: installed", result.stdout)
         self.assertIn("FAILED optional upgrade (may be partly changed; see setup/doctor above): no-mistakes", result.stdout)
 
-    def test_update_without_terminal_skips_upgrades_and_checks_only_selected_agents(self):
+    def test_update_without_terminal_skips_upgrades_and_gives_guidance(self):
         self.clone_fixture()
         self.install()
         self.native_layouts("herdr", "codex", "claude", "cursor-agent")
@@ -3372,9 +3797,8 @@ os.execv(executable, [executable, *args])
                       result.stdout)
         # A CLI that does not list its updater gets guidance instead of a guessed command.
         self.assertIn("Codex: manual update only: the installed codex does not list an update command", result.stdout)
-        self.assertIn("Skipped without a terminal: gh-dash herdr", result.stdout)
-        for unused in ("Claude Code", "Cursor CLI"):
-            self.assertNotIn(unused, result.stdout)
+        self.assertIn("Claude Code: manual update only: the installed claude does not list an update command", result.stdout)
+        self.assertIn("Skipped without a terminal: gh-dash herdr cursor-agent", result.stdout)
         for tool in ("herdr", "codex", "claude", "cursor-agent", "no-mistakes"):
             self.assertFalse(self.native_updates(tool), tool)
         self.assert_no_actions()

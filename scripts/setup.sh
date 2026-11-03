@@ -16,8 +16,16 @@ nm_template_agent='agent: codex # Initialize to the chosen pipeline agent during
 issue_agent=''
 prepare_agent=''
 implement_agent=''
+review_agent=''
 role_agents=()
-pipeline_agent=''
+duty_agents=()
+# The No-Mistakes daemon runs as a user service started with this fixed PATH (its
+# shellenv.WellKnownBinDirsForHome), then adopts its login shell's PATH with these appended; only these
+# remain when that probe fails. acpx (global acpx_path when set, run verbatim) and the node it starts must
+# run from the resulting daemon_path, which nm-config daemon-path resolves the same way.
+service_path="$bin_directory:$HOME/go/bin:$HOME/.cargo/bin:$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+acpx_path=acpx
+daemon_path="$service_path"
 stage=''
 backup=''
 launcher_stage=''
@@ -141,6 +149,10 @@ check_source_clone() {
 
 select_issue_agent() {
 	local saved=''
+	case "${PR_REVIEW_AGENT:-}" in
+	'' | claude | codex | cursor) ;;
+	*) die 'PR_REVIEW_AGENT must be claude, codex, or cursor' ;;
+	esac
 	if [ -e "$agent_setting" ] || [ -L "$agent_setting" ]; then
 		[ -f "$agent_setting" ] || die "issue agent setting is not a regular file: $agent_setting"
 		IFS= read -r saved <"$agent_setting" || true
@@ -163,11 +175,26 @@ select_issue_agent() {
 	notice "Shared issue agent: $issue_agent (saved in $agent_setting; change it with make setup ISSUE_AGENT=claude|codex|cursor). A per-key mf-config selection takes precedence."
 }
 
-# mf-config resolves each issue key's harness (per-key selection, shared agent, Codex);
-# setup provisions only those harnesses and never rewrites a per-key selection.
+contains() {
+	local item="$1" existing
+	shift
+	for existing in "$@"; do
+		[ "$existing" != "$item" ] || return 0
+	done
+	return 1
+}
+
+# mf-config resolves each gh-dash role's harness (issue keys: per-key selection, shared agent,
+# Codex; PR reviewer: its selection, Codex). PR_REVIEW_AGENT is saved as that selection;
+# setup never rewrites an issue key's selection.
 select_role_agents() {
 	local role output kind
-	for role in issue-prepare issue-implement; do
+	if [ -n "${PR_REVIEW_AGENT:-}" ]; then
+		output="$(python3 -I -B "$bundle/scripts/mf_config.py" set-agent pr-review "$PR_REVIEW_AGENT" 2>&1)" ||
+			die "cannot save PR_REVIEW_AGENT in the mf-config agent profiles: $output"
+		notice "PR reviewer selection $PR_REVIEW_AGENT ${output%%:*} (mf-config profile; Codex is the default)."
+	fi
+	for role in issue-prepare issue-implement pr-review; do
 		output="$(python3 -I -B "$bundle/scripts/mf_config.py" agent "$role" 2>&1)" ||
 			die "cannot read the mf-config agent profiles: $output"
 		kind="${output%%$'\n'*}"
@@ -175,15 +202,14 @@ select_role_agents() {
 		claude | codex | cursor) ;;
 		*) die "unexpected mf-config agent for $role: $output" ;;
 		esac
-		if [ "$role" = issue-prepare ]; then
-			prepare_agent="$kind"
-		else
-			implement_agent="$kind"
-		fi
+		case "$role" in
+		issue-prepare) prepare_agent="$kind" ;;
+		issue-implement) implement_agent="$kind" ;;
+		*) review_agent="$kind" ;;
+		esac
+		contains "$kind" "${role_agents[@]+"${role_agents[@]}"}" || role_agents+=("$kind")
 	done
-	role_agents=("$prepare_agent")
-	[ "$implement_agent" = "$prepare_agent" ] || role_agents[1]="$implement_agent"
-	notice "Issues i preparer: $prepare_agent; Issues I implementer: $implement_agent (see mf-config show)."
+	notice "Issues i preparer: $prepare_agent; Issues I implementer: $implement_agent; PRs I reviewer: $review_agent (see mf-config show)."
 }
 
 # Only first-time linking of an unedited template follows the issue agent. Rewriting the template line
@@ -226,24 +252,38 @@ link_no_mistakes_config() {
 	notice "Linked: $nm_config -> $nm_source"
 }
 
-read_pipeline_agent() {
-	local file="$nm_source"
+# No-Mistakes runs its own agents without Herdr: the pipeline agent and any review roles. nm-config
+# reads them; setup checks login for those that are Codex, Claude Code, or Cursor (including acp:cursor).
+read_duty_agents() {
+	local file="$nm_source" output duty agent kind
 	[ ! -r "$nm_config" ] || file="$nm_config"
-	pipeline_agent="$(awk '/^agent:/ { sub(/^agent:[ \t]*/, ""); sub(/[ \t]*#.*$/, ""); gsub(/["\047]/, ""); print; exit }' "$file")"
-	case "$pipeline_agent" in
-	claude | codex | cursor) ;;
-	*)
-		notice "No-Mistakes pipeline agent: ${pipeline_agent:-unset} (not provisioned by setup; log in through its native CLI, doctor relies on native no-mistakes doctor for it)."
-		pipeline_agent=''
-		;;
-	esac
+	if ! output="$(python3 -I -B "$bundle/scripts/nm_config.py" duties "$file" 2>&1)"; then
+		notice "Remaining action: No-Mistakes agents not checked: ${output#nm-config: }. Write agent and review_agents in block form (as nm-config does) so their login can be checked."
+		pending=1
+		return 0
+	fi
+	while IFS=$'\t' read -r duty agent kind; do
+		if [ "$kind" = - ]; then
+			notice "No-Mistakes $duty: $agent (not provisioned by setup; log in through its native CLI, doctor relies on native no-mistakes doctor for it)."
+		elif [ -n "$kind" ]; then
+			contains "$kind" "${duty_agents[@]+"${duty_agents[@]}"}" || duty_agents+=("$kind")
+		fi
+	done <<<"$output"
+	[ "${#duty_agents[@]}" -eq 0 ] || notice "No-Mistakes agents needing login: ${duty_agents[*]} (no Herdr integration needed)."
 }
 
-agent_command() {
-	case "$1" in
-	cursor) printf 'cursor-agent\n' ;;
-	*) printf '%s\n' "$1" ;;
-	esac
+# No-Mistakes runs its ACP agents (Cursor) with global acpx_path when set, otherwise acpx from its PATH.
+read_acpx_path() {
+	local file="$nm_source" output
+	[ ! -r "$nm_config" ] || file="$nm_config"
+	if ! output="$(python3 -I -B "$bundle/scripts/nm_config.py" acpx-path "$file" 2>&1)"; then
+		notice "Remaining action: No-Mistakes acpx_path not checked: ${output#nm-config: }. Write it as one plain value."
+		acpx_path=''
+		pending=1
+	elif [ "$output" != acpx ]; then
+		acpx_path="$output"
+		notice "No-Mistakes acpx_path: $acpx_path (used instead of acpx from the daemon's PATH; setup never installs over it)."
+	fi
 }
 
 python_is_suitable() {
@@ -339,9 +379,9 @@ install_dependencies() {
 	gh_is_suitable || die 'gh must be version 2.47 or later; fix PATH to the suitable installation and rerun'
 	gum_is_suitable || die "gum still cannot run; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
 	select_role_agents
-	# Codex stays required for PR review; add the issue keys' agents, then No-Mistakes.
-	# The pipeline agent is installed after linking, once its config is known.
-	install_tools codex herdr "$(agent_command "$prepare_agent")" "$(agent_command "$implement_agent")" no-mistakes
+	# All three agent CLIs are baseline, so any role can switch later without another install;
+	# only the agents a role or No-Mistakes duty uses need login.
+	install_tools codex claude cursor-agent herdr no-mistakes
 	# Any installed release with the stable interface is reused, including a newer prerelease; only an older one is updated.
 	if ! no_mistakes_is_suitable; then
 		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
@@ -364,7 +404,7 @@ install_tools() {
 			cursor-agent) installer='https://cursor.com/install'; directory="$HOME/.local/share/cursor-agent (it also links $bin_directory/agent)" ;;
 			no-mistakes) installer='https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh'; directory="$HOME/.no-mistakes and starts its background daemon as a user service" ;;
 			esac
-			if consent "Install $command_name using its upstream native installer ($installer). Commands go in $bin_directory; $command_name also manages its native files under $directory. No Node/npm or shell configuration changes are needed."; then
+			if consent "Install $command_name using its upstream native installer ($installer). Commands go in $bin_directory; $command_name also manages its native files under $directory. No shell configuration changes are needed."; then
 				install_native_tool "$command_name" "$installer"
 			else
 				die "$command_name installation pending"
@@ -592,30 +632,92 @@ node_is_suitable() {
 		node --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, ""); split($0, v, "."); exit !(v[1] > 22 || (v[1] == 22 && v[2] >= 13))}'
 }
 
-# No-Mistakes runs Cursor through the ACP runner acpx, which needs Node.js 22.13+.
-ensure_acp_runner() {
-	local prefix
+# madison lists repository-provided versions only (as for Gum); any configured source counts, such as NodeSource.
+node_in_apt_sources() {
+	apt-cache madison nodejs 2>/dev/null | awk -F '|' '{
+		version = $2; gsub(/[ \t]/, "", version); sub(/^[0-9]+:/, "", version); split(version, v, /[.+~-]/)
+		if (v[1] > 22 || (v[1] == 22 && v[2] >= 13)) found = 1
+	} END { exit !found }'
+}
+
+# Only a missing Node.js is installed; an existing one (system, Homebrew, fnm, nvm, ...) is never replaced.
+install_node() {
+	if [ "$platform" = macos ]; then
+		command -v brew >/dev/null 2>&1 || return 1
+		consent 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+. Install it with brew install node? No general brew update/upgrade or shell edits.' ||
+			return 1
+		HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install node || return 1
+	else
+		command -v sudo >/dev/null 2>&1 && node_in_apt_sources || return 1
+		consent 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+, which your configured apt sources offer. Run sudo apt-get install --no-install-recommends nodejs, then the same for npm only if nodejs does not provide it? This changes system packages.' ||
+			return 1
+		sudo apt-get install -y --no-install-recommends nodejs || return 1
+		hash -r
+		command -v npm >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends npm || return 1
+	fi
+	hash -r
+}
+
+acpx_runs_for_daemon() {
+	[ -n "$acpx_path" ] || return 1
+	# shellcheck disable=SC2016 # Expanded by the child shell with the daemon's PATH.
+	env PATH="$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx_path"
+}
+
+# Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the
+# pipeline agent or any review role) through acpx, so choosing Cursor later needs no new install.
+ensure_node_and_acpx() {
+	local prefix found
 	local npm_arguments=(install -g acpx@latest)
-	[ "$pipeline_agent" = cursor ] || return 0
-	command -v acpx >/dev/null 2>&1 && return 0
-	if command -v npm >/dev/null 2>&1 && node_is_suitable; then
+	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
+	[ -n "$daemon_path" ] || daemon_path="$service_path"
+	command -v node >/dev/null 2>&1 || install_node || true
+	if ! node_is_suitable || ! command -v npm >/dev/null 2>&1; then
+		found='Node.js is missing'
+		if command -v node >/dev/null 2>&1; then
+			found="$(command -v node) is Node.js $(node --version 2>/dev/null || printf 'of unknown version')"
+			command -v npm >/dev/null 2>&1 || found="$found without npm"
+		fi
+		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup."
+		pending=1
+		return 0
+	fi
+	# An existing acpx the daemon can run (from ~/bin, Homebrew, ... or acpx_path) is reused as is.
+	acpx_runs_for_daemon && return 0
+	if [ "$acpx_path" != acpx ]; then
+		# An unreadable acpx_path was already reported.
+		[ -z "$acpx_path" ] || notice "Remaining action: acpx_path $acpx_path in the No-Mistakes config does not run (with the Node.js 22.13+ it needs) from the daemon's PATH $daemon_path. Fix that executable or setting yourself, then rerun make setup."
+		pending=1
+		return 0
+	fi
+	if ! command -v acpx >/dev/null 2>&1; then
 		prefix="$(npm prefix -g 2>/dev/null || true)"
-		# A root-owned global prefix (such as a system Node's /usr) gets a user-owned acpx in $bin_directory, never sudo.
-		[ -n "$prefix" ] && [ -w "$prefix/lib/node_modules" ] && [ -w "$prefix/bin" ] ||
-			npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
-		if consent "The No-Mistakes pipeline agent is cursor, which runs through the ACP runner acpx. Install it with its documented npm ${npm_arguments[*]}?"; then
-			npm "${npm_arguments[@]}" || pending=1
+		# A global prefix that is root-owned (system Node) or outside the daemon's PATH (such as a per-shell
+		# fnm path) gets a user-owned acpx in $bin_directory instead; npm's configured prefix is never changed.
+		case ":$daemon_path:" in
+		*":$prefix/bin:"*) [ -w "$prefix/lib/node_modules" ] && [ -w "$prefix/bin" ] || prefix='' ;;
+		*) prefix='' ;;
+		esac
+		[ -n "$prefix" ] || npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
+		if consent "acpx is the ACP runner No-Mistakes uses for Cursor. Install it with its documented npm ${npm_arguments[*]}?"; then
+			npm "${npm_arguments[@]}" || true
 			PATH="$PATH:$bin_directory"
 			export PATH
+			hash -r
+			acpx_runs_for_daemon && return 0
 		fi
 	fi
-	command -v acpx >/dev/null 2>&1 && return 0
-	notice "Remaining action: put Node.js 22.13+ with npm first on PATH, then npm install -g acpx@latest (needed by agent: cursor in $nm_source)"
-	pending=1
+	if ! command -v acpx >/dev/null 2>&1 || ! acpx --version >/dev/null 2>&1; then
+		notice "Remaining action: npm ${npm_arguments[*]} (acpx, the ACP runner No-Mistakes uses for Cursor), then rerun make setup"
+		pending=1
+	else
+		notice "Remaining action: $(command -v acpx) runs only from your current shell PATH, not from the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories). Make acpx and the Node.js 22.13+ it runs available there (for example from your login shell's startup files, or npm install -g --prefix ~/.local acpx@latest with a Homebrew, apt, or nodejs.org Node.js), then rerun make setup."
+		pending=1
+	fi
 }
 
 configure_native_tools() {
-	local codex_directory integration kind description login_arguments kinds
+	local codex_directory integration kind description login_arguments login_kinds
 	if ! gh auth status --hostname github.com >/dev/null 2>&1; then
 		if consent 'GitHub authentication is pending. Run gh auth login --hostname github.com --web now? Follow its native device-code instructions in a browser on this or another machine. Choose Git transport yourself; setup will not configure Git credentials.'; then
 			login_arguments=(auth login --hostname github.com --web)
@@ -636,28 +738,23 @@ configure_native_tools() {
 			pending=1
 		fi
 	fi
-	# Codex reviews PRs; the issue and pipeline agents authenticate through their own CLIs.
-	login_agent codex
-	for kind in "${role_agents[@]}"; do
-		[ "$kind" = codex ] || login_agent "$kind"
+	# Only agents that a gh-dash role or a No-Mistakes duty uses need login; others may stay logged out.
+	login_kinds=("${role_agents[@]}")
+	for kind in "${duty_agents[@]+"${duty_agents[@]}"}"; do
+		contains "$kind" "${login_kinds[@]}" || login_kinds+=("$kind")
 	done
-	case " codex ${role_agents[*]} " in
-	*" $pipeline_agent "*) ;;
-	*) [ -z "$pipeline_agent" ] || login_agent "$pipeline_agent" ;;
-	esac
-	ensure_acp_runner
+	for kind in "${login_kinds[@]}"; do
+		login_agent "$kind"
+	done
+	ensure_node_and_acpx
 	codex_directory="${CODEX_HOME:-$HOME/.codex}"
 	case "$codex_directory" in
 	/*) ;;
 	*) die 'CODEX_HOME must be an absolute path before integration installation' ;;
 	esac
 	integration="$(herdr integration status 2>/dev/null || true)"
-	# Herdr detects the PR review agent (Codex) and the issue keys' agents through native integrations.
-	kinds=(codex)
+	# Herdr detects the gh-dash roles' agents through native integrations; No-Mistakes needs none.
 	for kind in "${role_agents[@]}"; do
-		[ "$kind" = codex ] || kinds[${#kinds[@]}]="$kind"
-	done
-	for kind in "${kinds[@]}"; do
 		! printf '%s\n' "$integration" | grep -q "^$kind: current " || continue
 		case "$kind" in
 		codex)
@@ -696,8 +793,8 @@ select_issue_agent
 # restart the daemon before the config link is created.
 install_dependencies
 link_no_mistakes_config
-read_pipeline_agent
-[ -z "$pipeline_agent" ] || install_tools "$(agent_command "$pipeline_agent")"
+read_duty_agents
+read_acpx_path
 install_bundle
 install_optional_launcher mf-config
 install_optional_launcher nm-config

@@ -28,7 +28,7 @@ def authenticated(argv):
         return False
 
 
-# The three issue agents keep their own native install and login flows.
+# The three gh-dash agents keep their own native install and login flows; all three are installed.
 AGENTS = {
     "claude": ("claude", "Claude Code", "claude auth login"),
     "codex": ("codex", "Codex", "codex login --device-auth"),
@@ -36,6 +36,13 @@ AGENTS = {
 }
 # Diagnostics stay side-effect free: no background update check or telemetry event.
 NO_MISTAKES_ENVIRONMENT = dict(os.environ, NO_MISTAKES_NO_UPDATE_CHECK="1", NO_MISTAKES_TELEMETRY="0")
+ROLES = (("issue-prepare", "Issues i preparer"), ("issue-implement", "Issues I implementer"),
+         ("pr-review", "PRs I reviewer"))
+# The fixed PATH No-Mistakes gives its daemon service (shellenv.WellKnownBinDirsForHome). The daemon appends it to
+# its login shell's PATH and keeps only it when that probe fails; your current shell's PATH is not assumed.
+SERVICE_PATH = os.pathsep.join([str(Path.home() / name) for name in (".local/bin", "go/bin", ".cargo/bin", "bin")]
+                               + ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin",
+                                  "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 
 
 def agent_authenticated(kind):
@@ -60,10 +67,10 @@ def issue_agent_setting():
 
 
 def role_agents():
-    """Each issue key's effective harness, resolved by the bundled mf-config."""
+    """Each gh-dash role's effective harness, resolved by the bundled mf-config."""
     helper = Path(__file__).resolve().parent / "mf_config.py"
     agents = {}
-    for role in ("issue-prepare", "issue-implement"):
+    for role, _ in ROLES:
         try:
             result = subprocess.run([sys.executable, "-I", "-B", str(helper), "agent", role],
                                     capture_output=True, text=True, timeout=15)
@@ -87,13 +94,47 @@ def managed_launcher(path, target):
         return False
 
 
-def pipeline_agent(config):
-    # Only the top-level scalar is read; native no-mistakes doctor validates the whole file.
+def no_mistakes_duties(config):
+    """[(duty, agent, provisioned harness or None)] read by the bundled nm-config; native doctor validates the file."""
+    helper = Path(__file__).resolve().parent / "nm_config.py"
     try:
-        match = re.search(r"^agent:[ \t]*[\"']?([A-Za-z0-9_:-]+)[\"']?[ \t]*(#.*)?$", config.read_text(), re.M)
-    except OSError:
-        return None
-    return match.group(1) if match else None
+        result = subprocess.run([sys.executable, "-I", "-B", str(helper), "duties", str(config)],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(str(error))
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout).strip().replace("nm-config: ", "", 1) or "no result")
+    duties = [line.split("\t") for line in result.stdout.splitlines()]
+    if not all(len(fields) == 3 and (fields[2] in AGENTS or fields[2] == "-") for fields in duties):
+        raise ValueError("unexpected nm-config duties output")
+    return [(duty, agent, None if kind == "-" else kind) for duty, agent, kind in duties]
+
+
+def acpx_executable(config):
+    """The acpx No-Mistakes runs for ACP agents (global acpx_path, else acpx), read by the bundled nm-config."""
+    if not config.exists():
+        return "acpx"
+    helper = Path(__file__).resolve().parent / "nm_config.py"
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", str(helper), "acpx-path", str(config)],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(str(error))
+    if result.returncode or not result.stdout.strip():
+        raise ValueError((result.stderr or result.stdout).strip().replace("nm-config: ", "", 1) or "no result")
+    return result.stdout.rstrip("\n")
+
+
+def daemon_path():
+    """The PATH the No-Mistakes daemon resolves (login-shell PATH plus SERVICE_PATH), read by the bundled nm-config."""
+    helper = Path(__file__).resolve().parent / "nm_config.py"
+    text = output([sys.executable, "-I", "-B", str(helper), "daemon-path"])
+    return text.strip() if text and text.strip() else SERVICE_PATH
+
+
+def node_version(text):
+    match = re.match(r"v?(\d+)\.(\d+)", (text or "").strip())
+    return tuple(map(int, match.groups())) if match else None
 
 
 def config_link_problem(link, bundle):
@@ -281,20 +322,44 @@ def main():
     try:
         roles, role_problem = role_agents(), None
     except ValueError as error:
-        # Fall back to the shared choice so the remaining checks still run.
+        # Fall back to the shared choice and the Codex reviewer so the remaining checks still run.
         roles, role_problem = {}, str(error)
-    issue_kinds = list(dict.fromkeys(kind for kind, _ in roles.values())) or [issue_agent or "codex"]
+    # gh-dash roles need login, Herdr integration, and detection; No-Mistakes duties need login only.
+    role_kinds = list(dict.fromkeys(kind for kind, _ in roles.values())) or list(dict.fromkeys(
+        (issue_agent or "codex", "codex")))
     no_mistakes_config = Path(os.environ.get("NM_HOME") or str(Path.home() / ".no-mistakes")) / "config.yaml"
-    pipeline = pipeline_agent(no_mistakes_config)
-    # Codex stays required for PR review even when other agents handle issues.
-    agents = list(dict.fromkeys(kind for kind in ("codex", *issue_kinds, pipeline) if kind in AGENTS))
-    commands = [AGENTS[kind][0] for kind in agents] + ["no-mistakes"] + (["acpx"] if pipeline == "cursor" else [])
+    duties, duty_problem = [], None
+    if no_mistakes_config.exists():
+        try:
+            duties = no_mistakes_duties(no_mistakes_config)
+        except ValueError as error:
+            duty_problem = str(error)
+    agents = list(dict.fromkeys([*role_kinds, *(kind for _, _, kind in duties if kind)]))
+    # All three agent CLIs, Node.js/npm, and acpx are baseline, whichever roles use them. Only the daemon runs
+    # acpx, so it is checked below from the daemon's PATH and acpx_path rather than from your shell's PATH.
+    commands = [command for command, _, _ in AGENTS.values()] + ["no-mistakes", "node", "npm"]
     for name in ("bash", "git", "make", "gh", "jq", "python3", "herdr", "curl", "tar", "gum",
                  "env", "tr", "mkdir", "rmdir", "rm", "date", "chmod", "sleep", "nohup", "stat", *commands):
         check(shutil.which(name), name + " available", name + " missing; run make setup")
     for name in ("git", "gh", "jq", "herdr", "gum", *commands):
         text = output([name, "--version"], NO_MISTAKES_ENVIRONMENT)
         check(bool(text and text.strip()), name + " version responds", name + " version check failed")
+    version = node_version(output(["node", "--version"]))
+    check(version is not None and version >= (22, 13), "Node.js 22.13+ for acpx",
+          "Node.js 22.13+ required by acpx (found " + ("v" + ".".join(map(str, version)) if version else "none")
+          + "); upgrade it with the tool that installed it, then run make setup")
+    try:
+        acpx, acpx_problem = acpx_executable(no_mistakes_config), None
+    except ValueError as error:
+        acpx, acpx_problem = None, str(error)
+    path = daemon_path()
+    service = acpx and output(["env", "PATH=" + path, "/bin/sh", "-c",
+                               'command -v "$1" >/dev/null && "$1" --version', "sh", acpx])
+    configured = "" if acpx in (None, "acpx") else " (acpx_path: " + acpx + ")"
+    check(bool(service and service.strip()), "acpx runs from the No-Mistakes daemon's PATH" + configured,
+          "cannot read acpx_path (" + str(acpx_problem) + "); write it as one plain value" if acpx_problem else
+          "acpx" + configured + " or its Node.js does not run from the No-Mistakes daemon's PATH (" + path
+          + "); run make setup for the exact action")
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
     help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
     check(all(flag_available(help_text, flag) for flag in ("--intent", "--yes")),
@@ -314,7 +379,7 @@ def main():
         (["herdr", "worktree", "open", "--help"], ("--cwd", "--path"), "Herdr worktree open"),
         (["herdr", "agent", "start", "--help"], ("--kind", "--pane", "--timeout"), "Herdr agent start"),
         (["herdr", "agent", "prompt", "--help"], ("--wait", "--timeout"), "Herdr agent prompt"),
-        (["herdr", "integration", "install", "--help"], tuple(agents), "Herdr agent integration installer"),
+        (["herdr", "integration", "install", "--help"], tuple(role_kinds), "Herdr agent integration installer"),
         (["gh", "dash", "--help"], ("--config",), "gh-dash extension"),
     ):
         text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
@@ -331,19 +396,28 @@ def main():
     sources = {"override": "mf-config selection", "shared": "shared issue agent", "default": "default"}
     if check(role_problem is None, "agent profiles readable (mf-config show for details)",
              "mf-config agent profiles unreadable (" + str(role_problem) + ")"):
-        for role, label in (("issue-prepare", "Issues i preparer"), ("issue-implement", "Issues I implementer")):
+        for role, label in ROLES:
             kind, source = roles[role]
             print("OK: " + label + ": " + AGENTS[kind][1] + " (" + sources.get(source, source) + ")")
+    for duty, agent, kind in duties:
+        if kind:
+            print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "
+                  "integration needed)")
+        else:
+            # Native doctor only proves the resolved agent is runnable, not logged in.
+            print("NOTE: No-Mistakes " + duty + " " + agent + " login not checked by this doctor; "
+                  "readiness relies on native no-mistakes doctor")
+    # An unreadable file may select a logged-out agent, so its login cannot be reported complete.
+    check(duty_problem is None, "No-Mistakes agents read",
+          "No-Mistakes agent login pending: cannot read their agents (" + str(duty_problem) + "); write "
+          "agent and review_agents in block form (as nm-config does) so their login can be checked")
+    # Installed agents that no role or duty uses may stay logged out.
     for kind in agents:
         _, label, login = AGENTS[kind]
         check(agent_authenticated(kind), label + " authenticated",
               label + " authentication/setup pending: " + login)
-    # Native doctor only proves the resolved agent is runnable, not logged in.
-    if no_mistakes_config.exists() and pipeline not in AGENTS:
-        print("NOTE: No-Mistakes pipeline agent " + (pipeline or "unset/list") + " login not checked by this doctor; "
-              "readiness relies on native no-mistakes doctor")
     integration = output(["herdr", "integration", "status"]) or ""
-    for kind in dict.fromkeys(("codex", *issue_kinds)):
+    for kind in role_kinds:
         lines = [line for line in integration.splitlines() if line.startswith(kind + ":")]
         check(len(lines) == 1 and lines[0].startswith(kind + ": current "),
               "Herdr " + AGENTS[kind][1] + " integration current",
@@ -386,7 +460,7 @@ def main():
         "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"
     )):
         try:
-            route_check(list(dict.fromkeys(("codex", *issue_kinds))))
+            route_check(role_kinds)
             print("OK: inherited Herdr route, compatible server, source repository and agent detection")
         except (OSError, ValueError) as error:
             check(False, "", "runtime context: " + str(error))
