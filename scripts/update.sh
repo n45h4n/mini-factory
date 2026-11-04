@@ -22,6 +22,7 @@ plan_targets=()
 upgraded=()
 declined=()
 skipped=()
+unasked=()
 manual=()
 failed=()
 
@@ -352,8 +353,14 @@ run_plan() {
 	esac
 }
 
+# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
+gum_is_suitable() {
+	command -v gum >/dev/null 2>&1 || return 1
+	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+}
+
 offer_upgrade() {
-	local tool="$1" label="$2" before after status=0 answer
+	local tool="$1" label="$2" before after status=0
 	plan_upgrade "$tool"
 	if [ -n "$plan_manual" ]; then
 		notice "$label: manual update only: $plan_manual."
@@ -362,21 +369,26 @@ offer_upgrade() {
 	fi
 	before="$(tool_version "$tool")"
 	notice "$label (${before:-version unknown}): $plan_detail."
-	if [ ! -t 0 ] || [ ! -t 1 ]; then
+	if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
 		notice "  Skipped without an interactive terminal; no approval was assumed. Run $plan_text yourself, or rerun make update in a terminal."
 		skipped+=("$tool")
 		return 0
 	fi
-	printf '  Run %s now? It decides itself whether a newer release exists. [y/N] ' "$plan_text"
-	IFS= read -r answer || answer=''
-	case "$answer" in
-	y | Y | yes | YES) ;;
-	*)
+	if ! gum_is_suitable; then
+		notice "  Skipped: Gum 0.15 or later is required to ask for consent; no approval was assumed. make setup below offers to repair Gum; then rerun make update, or run $plan_text yourself."
+		unasked+=("$tool")
+		return 0
+	fi
+	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
+	GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
+	if [ "$status" -eq 130 ]; then
+		notice "  Cancelled; $label was left unchanged and make update stopped before rerunning setup."
+		exit 130
+	elif [ "$status" -ne 0 ]; then
 		notice "  Declined; $label was left unchanged."
 		declined+=("$tool")
 		return 0
-		;;
-	esac
+	fi
 	run_plan "$tool" || status=$?
 	if [ "$status" -ne 0 ]; then
 		notice "  FAILED: $plan_text exited with status $status. It may have changed $label before failing; nothing was rolled back. Setup and doctor below check whether $label still works."
@@ -435,6 +447,7 @@ main() {
 	summary_line 'Updater completed (updated or already current)' "${upgraded[@]+"${upgraded[@]}"}"
 	summary_line 'Declined (left unchanged)' "${declined[@]+"${declined[@]}"}"
 	summary_line 'Skipped without a terminal' "${skipped[@]+"${skipped[@]}"}"
+	summary_line 'Skipped without a runnable Gum (no approval assumed)' "${unasked[@]+"${unasked[@]}"}"
 	summary_line 'Manual update only (see above)' "${manual[@]+"${manual[@]}"}"
 	summary_line 'FAILED optional upgrade (may be partly changed; see setup/doctor above)' "${failed[@]+"${failed[@]}"}"
 	if [ "$setup_status" -ne 0 ]; then

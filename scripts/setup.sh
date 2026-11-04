@@ -43,18 +43,30 @@ notice() {
 }
 
 consent() {
-	local answer
+	local answer status=0
 	notice "$1"
-	if [ ! -t 0 ] || [ ! -t 1 ]; then
+	if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
 		notice 'Consent pending: rerun make setup in an interactive terminal. No approval was assumed.'
 		return 1
 	fi
-	printf 'Proceed? [y/N] '
-	IFS= read -r answer || return 1
-	case "$answer" in
-	y | Y | yes | YES) return 0 ;;
-	*) notice 'Declined; existing configuration was preserved.'; return 1 ;;
-	esac
+	if gum_is_suitable; then
+		# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
+		GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false 'Proceed?' || status=$?
+		[ "$status" -ne 0 ] || return 0
+		if [ "$status" -eq 130 ]; then
+			notice 'Cancelled; setup stopped without this change.'
+			exit 130
+		fi
+	else
+		# Bootstrap only: Gum cannot ask before it is installed or repaired.
+		printf 'Proceed? [y/N] '
+		IFS= read -r answer || return 1
+		case "$answer" in
+		y | Y | yes | YES) return 0 ;;
+		esac
+	fi
+	notice 'Declined; existing configuration was preserved.'
+	return 1
 }
 
 cleanup() {
@@ -296,9 +308,10 @@ git_is_suitable() {
 	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
-# Gum provides the mf-config and nm-config editors; no version floor, only a runnable command.
+# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
 gum_is_suitable() {
-	command -v gum >/dev/null 2>&1 && gum --version >/dev/null 2>&1
+	command -v gum >/dev/null 2>&1 || return 1
+	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 gh_is_suitable() {
@@ -364,6 +377,8 @@ install_dependencies() {
 				die "dependencies pending: ${packages[*]}"
 			fi
 		fi
+		# Gum first, so the remaining confirmations use it.
+		gum_is_suitable || install_gum_ubuntu
 		if ! gh_is_suitable; then
 			command -v sudo >/dev/null 2>&1 || die 'sudo is required for the official GitHub CLI apt repository'
 			if consent 'Install GitHub CLI from its official apt repository. This writes /etc/apt/keyrings/githubcli-archive-keyring.gpg and /etc/apt/sources.list.d/github-cli.list, then runs sudo apt-get update and sudo apt-get install gh.'; then
@@ -372,12 +387,11 @@ install_dependencies() {
 				die 'GitHub CLI installation pending'
 			fi
 		fi
-		gum_is_suitable || install_gum_ubuntu
 	fi
 	python_is_suitable || die 'python3 still resolves to a version below 3.9; fix PATH to use the installed Python and rerun'
 	git_is_suitable || die 'git must be version 2.29 or later; fix PATH to the suitable installation and rerun'
 	gh_is_suitable || die 'gh must be version 2.47 or later; fix PATH to the suitable installation and rerun'
-	gum_is_suitable || die "gum still cannot run; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
+	gum_is_suitable || die "gum 0.15 or later is required; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
 	select_role_agents
 	# All three agent CLIs are baseline, so any role can switch later without another install;
 	# only the agents a role or No-Mistakes duty uses need login.
@@ -442,11 +456,18 @@ install_github_cli_ubuntu() {
 	sudo apt-get install -y --no-install-recommends gh
 }
 
-# Newer Ubuntu releases carry Gum in universe; older ones use Charm's official apt repository.
+# Ubuntu archives with Gum below 0.15 use Charm's official apt repository instead.
 # madison lists only repository-provided versions, unlike policy's Candidate, which can be
 # an installed-only version whose repository was removed.
 gum_in_ubuntu_archive() {
-	[ -n "$(apt-cache madison gum 2>/dev/null)" ]
+	local candidate
+	candidate="$(LC_ALL=C apt-cache policy gum 2>/dev/null | awk '/^[ \t]*Candidate:/ { print $2; exit }')" || return 1
+	apt-cache madison gum 2>/dev/null | awk -F '|' -v candidate="$candidate" '{
+		version = $2; gsub(/[ \t]/, "", version)
+		if (version != candidate) next
+		sub(/^[0-9]+:/, "", version); split(version, v, /[.+~-]/)
+		if (v[1] > 0 || (v[1] == 0 && v[2] >= 15)) found = 1
+	} END { exit !found }'
 }
 
 install_gum_ubuntu() {
@@ -461,7 +482,7 @@ install_gum_ubuntu() {
 		sudo "${install_arguments[@]}"
 		return
 	fi
-	consent "Gum provides the mf-config and nm-config editors and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
+	consent "Gum 0.15 or later provides the mf-config and nm-config editors and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
 		die 'Gum installation pending'
 	scratch="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-gum.XXXXXX")"
 	if ! curl -fsSL https://repo.charm.sh/apt/gpg.key -o "$scratch/charm.asc"; then
@@ -474,6 +495,8 @@ install_gum_ubuntu() {
 	sudo install -m 644 "$scratch/charm.list" /etc/apt/sources.list.d/charm.list
 	rm -rf -- "$scratch"
 	sudo apt-get update
+	gum_in_ubuntu_archive ||
+		die 'APT still selects an unavailable or unsuitable Gum candidate after adding Charm; Gum 0.15 or later is required; check apt-cache policy gum and your APT preferences, then rerun make setup'
 	sudo "${install_arguments[@]}"
 }
 
@@ -537,6 +560,8 @@ install_bundle() {
 	done
 	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
+	# ghd update reads this clone path as data; it is published (or rolled back) with the runtime.
+	printf '%s\n' "$bundle" >"$stage/.mini-factory-clone"
 	"$stage/scripts/doctor.sh" --bundle "$stage" --integrity-only || die 'replacement bundle failed validation; existing installation preserved'
 	launcher_stage="$(mktemp "$bin_directory/.mini-factory-launcher.XXXXXX")"
 	printf -v quoted '%q' "$runtime/bin/ghd"

@@ -40,7 +40,8 @@ args = sys.argv[1:]
 root = pathlib.Path(os.environ["MOCK_BIN"])
 entry = {"tool": name, "args": args, "cwd": os.getcwd(),
          "env": {k: v for k, v in os.environ.items()
-                 if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND")}}
+                 if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND",
+                                                            "GUM_CONFIRM_TIMEOUT")}}
 with open(os.environ["MOCK_LOG"], "a") as stream:
     stream.write(json.dumps(entry) + "\n")
 def fail(message="forbidden external action"):
@@ -206,10 +207,32 @@ elif name == "cursor-agent":
     else:
         fail()
 elif name == "gum":
+    version = "0.17.0" if (root / "gum-repaired").exists() else os.environ.get("MOCK_GUM_VERSION", "0.17.0")
     if args == ["--version"]:
         if os.environ.get("MOCK_GUM") == "broken" and not (root / "gum-repaired").exists():
             fail("gum: cannot execute")
-        print("gum version 0.17.0 (test)")
+        print("gum version " + version + " (test)")
+    elif args[:1] == ["confirm"] and "MOCK_GUM_ANSWERS" not in os.environ:
+        # Setup and update confirmations read the key typed at the terminal, as native Gum does.
+        if not os.isatty(0):
+            fail("gum confirm: no terminal")
+        print(args[-1], file=sys.stderr, flush=True)  # rendered on the terminal, as native Gum does
+        typed = os.read(0, 1024)
+        if not typed:
+            sys.exit(1)
+        key = typed.decode().strip()
+        if key == "<cancel>":
+            # Older Gum treats Ctrl+C as No, so callers must check compatibility before asking.
+            sys.exit(1 if tuple(map(int, version.lstrip("v").split("."))) < (0, 15, 0) else 130)
+        if key == "<timeout>":
+            # Model moving to Yes without submitting: an inherited timeout can accept that selection.
+            sys.exit(1 if os.environ.get("GUM_CONFIRM_TIMEOUT") == "0" else 0)
+        if key == "":
+            # Enter takes the default, which native Gum makes Yes unless --default=false.
+            sys.exit(1 if "--default=false" in args else 0)
+        if key not in ("y", "Y", "n", "N"):
+            fail("unexpected gum confirm keystroke: " + key)
+        sys.exit(0 if key in ("y", "Y") else 1)
     elif args[:1] in (["choose"], ["input"], ["confirm"]):
         answers_path = pathlib.Path(os.environ["MOCK_GUM_ANSWERS"])
         answers = json.loads(answers_path.read_text())
@@ -226,18 +249,25 @@ elif name == "gum":
         fail()
 elif name == "apt-cache":
     archive = os.environ.get("MOCK_APT_GUM") == "archive"
+    archive_version = os.environ.get("MOCK_APT_GUM_VERSION", "0.17.0-1")
+    charm = (root / "charm-repository").exists()
     installed = (root / "gum").exists()
     # Newer Ubuntu releases carry gum in universe; older archives list no repository version.
     if args == ["madison", "gum"]:
         if archive:
-            print("       gum |   0.17.0-1 | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
+            print("       gum | " + archive_version + " | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
+        if charm:
+            print("       gum | 0.17.0-1 | https://repo.charm.sh/apt * * Packages")
     elif args == ["madison", "nodejs"]:
         for version in os.environ.get("MOCK_APT_NODE", "18.19.1+dfsg-6ubuntu5").split():
             print("    nodejs | " + version + " | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
     elif args == ["policy", "gum"]:
         # Like APT, policy's Candidate may be an installed-only version whose repository was removed.
+        candidate = archive_version if archive else "0.17.0-1" if installed else "(none)"
+        if charm and os.environ.get("MOCK_APT_GUM_PINNED") != "1":
+            candidate = "0.17.0-1"
         print("gum:\n  Installed: " + ("0.17.0-1" if installed else "(none)") + "\n  Candidate: "
-              + ("0.17.0-1" if archive or installed else "(none)") + "\n  Version table:")
+              + candidate + "\n  Version table:")
     else:
         fail()
 elif name == "acpx":
@@ -531,6 +561,8 @@ elif name in ("brew", "sudo", "apt-get"):
     elif "install" in args or "upgrade" in args or "update" in args or "reinstall" in args:
         if os.environ.get("MOCK_INSTALL_FAIL"):
             fail("simulated interrupted package installation")
+        if name == "sudo" and args[-1:] == ["/etc/apt/sources.list.d/charm.list"]:
+            (root / "charm-repository").touch()
         if "gum" in args:
             (root / "gum-repaired").write_text("yes")
         provided = {"gh": ("gh",), "gum": ("gum",), "node": ("node", "npm"), "nodejs": ("node",), "npm": ("npm",)}
@@ -564,7 +596,16 @@ elif name == "git":
 elif name == "nohup":
     # The existing dispatchers own asynchronous execution; retain their execution
     # route but make the backend reach only its missing-Herdr safety check.
+    # Each detached helper gets its own process group, announced by "<group>.started" and, once the helper has
+    # exited, "<group>.finished", so tests can wait for (or stop) every helper before temporary-directory cleanup.
+    os.setpgid(0, 0)
+    helpers = root.parent / "detached helpers"
+    helpers.mkdir(exist_ok=True)
+    (helpers / f"{os.getpid()}.started").touch()
+    if (helpers / "stopped").exists():
+        sys.exit(1)
     result = subprocess.run(args, check=False)
+    (helpers / f"{os.getpid()}.finished").touch()
     sys.exit(result.returncode)
 elif name == "curl":
     if "-o" not in args:
@@ -696,10 +737,10 @@ class DistributionTests(unittest.TestCase):
         return self.run_in_terminal([str(self.bundle / "scripts/setup.sh")], dict(self.env, **overrides),
                                     ((answer + "\n") * 24).encode())
 
-    def run_in_terminal(self, argv, env, keystrokes=b""):
+    def run_in_terminal(self, argv, env, keystrokes=b"", *, stderr=None):
         master, slave = pty.openpty()
         process = subprocess.Popen(argv, cwd=self.root, env=env, stdin=slave,
-                                   stdout=slave, stderr=slave, close_fds=True)
+                                   stdout=slave, stderr=slave if stderr is None else stderr, close_fds=True)
         os.close(slave)
         output = bytearray()
         deadline = time.monotonic() + 30
@@ -739,6 +780,9 @@ class DistributionTests(unittest.TestCase):
     def npm_changes(self):
         """npm invocations other than read-only version and global-prefix queries."""
         return [call for call in self.calls("npm") if call["args"] not in (["--version"], ["prefix", "-g"])]
+
+    def gum_confirms(self):
+        return [call["args"] for call in self.calls("gum") if call["args"][:1] == ["confirm"]]
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -785,6 +829,57 @@ class DistributionTests(unittest.TestCase):
 
     def notifications(self):
         return [args[args.index("--body") + 1] for args in self.herdr_calls("notification", "show")]
+
+    def wait_for_detached_helpers_without_herdr(self, count):
+        # Each detached helper logs the missing Herdr socket after taking its lock, then still notifies (appending to
+        # calls.jsonl) and releases the lock in its EXIT trap. Only the mock nohup's finished markers prove that every
+        # helper has exited, so those late writes cannot race the temporary directory's cleanup ("Directory not
+        # empty"); an expired wait or an empty lock directory proves nothing.
+        helpers = self.root / "detached helpers"
+        def groups(marker):
+            return {int(path.stem) for path in helpers.glob("*." + marker)}
+        deadline = time.monotonic() + 5
+        while True:
+            started = groups("started")
+            finished = groups("finished")
+            if len(started) >= count and started <= finished:
+                break
+            if time.monotonic() >= deadline:
+                self.stop_detached_helpers()
+                self.fail(f"detached helpers did not finish within 5 seconds: expected {count}, "
+                          f"started {len(started)}, finished {len(started & finished)}; stopped the rest")
+            time.sleep(0.02)
+        self.assertEqual(len(started), count)
+        state = Path(self.env["XDG_STATE_HOME"])
+        logs = list(state.glob("gh-dash-codex-*/*.log"))
+        self.assertEqual(len(logs), count)
+        for file in logs:
+            self.assertIn("HERDR_SOCKET_PATH", file.read_text())
+        self.assertEqual(list(state.glob("gh-dash-codex-*/locks/*.lock")), [])
+        return logs
+
+    def stop_detached_helpers(self):
+        # Mock nohup processes that have not announced themselves see the stop marker and never run their helper;
+        # announced, unfinished ones are killed with their whole process group, which is awaited until it is gone.
+        helpers = self.root / "detached helpers"
+        helpers.mkdir(exist_ok=True)
+        (helpers / "stopped").touch()
+        pending = ({int(path.stem) for path in helpers.glob("*.started")}
+                   - {int(path.stem) for path in helpers.glob("*.finished")})
+        for group in pending:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 5
+        while pending and time.monotonic() < deadline:
+            for group in list(pending):
+                try:
+                    os.killpg(group, 0)
+                except ProcessLookupError:
+                    pending.discard(group)
+            time.sleep(0.02)
+        self.assertFalse(pending, "stopped detached helper process groups did not exit")
 
     def assert_no_actions(self, allow_onboarding=False):
         for record in self.calls():
@@ -1151,13 +1246,7 @@ class DistributionTests(unittest.TestCase):
         repo, _ = self.source_repo()
         self.assert_success(self.run_script(self.wrapper, cwd=repo, env={"MOCK_BINDINGS": "1",
             "DOTFILES_DIR": "/unavailable/dotfiles"}))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 3 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(3)
         self.assertEqual(sorted(file.name.rsplit("-", 2)[-1] for file in logs),
                          ["8.log", "prepare.log", "review.log"])
         for file in logs:
@@ -1172,13 +1261,7 @@ class DistributionTests(unittest.TestCase):
         directory = self.installed / "scripts/integrations/gh-dash"
         for name in ("gh-dash-codex-issue-dispatch.sh", "gh-dash-codex-pr-review-dispatch.sh"):
             self.assert_success(self.run_script(directory / name, "friend/target", "8", cwd=repo))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 2 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(2)
         self.assertEqual(len(logs), 2)
         for file in logs:
             self.assertIn("HERDR_SOCKET_PATH", file.read_text())
@@ -1201,13 +1284,7 @@ class DistributionTests(unittest.TestCase):
         for name in ("gh-dash-codex-issue-dispatch.sh", "gh-dash-codex-pr-review-dispatch.sh"):
             self.assert_success(self.run_script(directory / name, "friend/target", "8", cwd=repo,
                                                 env={"DOTFILES_DIR": str(unrelated)}))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 2 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(2)
         self.assertEqual(len(logs), 2)
         for file in logs:
             self.assertIn("HERDR_SOCKET_PATH", file.read_text())
@@ -1243,13 +1320,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                               ("gh-dash-codex-pr-review.sh",)):
             with self.subTest(script=script, mode=mode):
                 self.assert_success(self.run_script(directory / script, "friend/target", "8", *mode, cwd=repo))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(state.glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 3 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(3)
         self.assertEqual(len(logs), 3)
         for file in logs:
             self.assertNotIn("chmod", file.read_text())
@@ -3142,12 +3213,14 @@ os.execv(executable, [executable, *args])
     def test_mocked_ubuntu_gum_from_archive_or_charm_repository(self):
         if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
             self.skipTest("Ubuntu detection reads the native os-release file")
-        for source in ("archive", "charm"):
-            with self.subTest(source=source):
+        for source, version in (("archive", "0.15.0-1"), ("archive", "1:0.15.0-1"),
+                                ("archive", "1.0.0-1"), ("charm", "0.17.0-1")):
+            with self.subTest(source=source, version=version):
                 if (self.mock / "gum").exists():
                     (self.mock / "gum").unlink()
                 self.log.write_text("")
                 result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64",
+                                                MOCK_APT_GUM_VERSION=version,
                                                 **({"MOCK_APT_GUM": "archive"} if source == "archive" else {}))
                 self.assert_success(result)
                 self.assertTrue((self.mock / "gum").exists())
@@ -3177,6 +3250,192 @@ os.execv(executable, [executable, *args])
         self.assertIn(["apt-get", "update"], actions)
         self.assertEqual(actions[-1], ["apt-get", "install", "-y", "--reinstall", "--no-install-recommends", "gum"])
         self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_old_gum_archive_uses_charm_only_with_consent(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        for installed in (False, True):
+            with self.subTest(installed=installed):
+                (self.mock / "charm-repository").unlink(missing_ok=True)
+                (self.mock / "gum").unlink(missing_ok=True)
+                (self.mock / "gum-repaired").unlink(missing_ok=True)
+                if installed:
+                    (self.mock / "gum").symlink_to("mock-cli")
+                options = dict(MOCK_OS="Linux", MOCK_ARCH="x86_64", MOCK_GUM_VERSION="0.14.4",
+                               MOCK_APT_GUM="archive", MOCK_APT_GUM_VERSION="0.14.4-1")
+                self.log.write_text("")
+                result = self.interactive_setup("n", **options)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Charm's official apt repository", result.stdout)
+                self.assertFalse(self.calls("sudo") or self.calls("curl") or self.gum_confirms())
+                self.log.write_text("")
+                result = self.interactive_setup("y", **options)
+                self.assert_success(result)
+                actions = [c["args"] for c in self.calls("sudo")]
+                self.assertTrue([args for args in actions if "/etc/apt/sources.list.d/charm.list" in args])
+                self.assertIn(["apt-get", "update"], actions)
+                self.assertEqual(actions[-1], ["apt-get", "install", "-y"]
+                                 + (["--reinstall"] if installed else []) + ["--no-install-recommends", "gum"])
+                self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_pinned_old_gum_stops_before_install_or_reinstall(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        for installed in (False, True):
+            with self.subTest(installed=installed):
+                (self.mock / "charm-repository").unlink(missing_ok=True)
+                (self.mock / "gum").unlink(missing_ok=True)
+                if installed:
+                    (self.mock / "gum").symlink_to("mock-cli")
+                self.log.write_text("")
+                result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64",
+                                                MOCK_GUM_VERSION="0.14.4", MOCK_APT_GUM="archive",
+                                                MOCK_APT_GUM_VERSION="0.14.4-1", MOCK_APT_GUM_PINNED="1")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("APT still selects an unavailable or unsuitable Gum candidate after adding Charm",
+                              result.stdout)
+                self.assertIn("check apt-cache policy gum and your APT preferences, then rerun make setup",
+                              result.stdout)
+                actions = [c["args"] for c in self.calls("sudo")]
+                self.assertTrue((self.mock / "charm-repository").exists())
+                self.assertIn(["apt-get", "update"], actions)
+                self.assertFalse([args for args in actions if args[:2] == ["apt-get", "install"]])
+                self.assertFalse((self.mock / "gum-repaired").exists())
+                self.assertFalse(self.installed.exists())
+                self.assert_no_actions()
+
+    def test_setup_confirms_with_gum_defaulting_to_no_and_never_assumes_consent(self):
+        setup = [str(self.bundle / "scripts/setup.sh")]
+        (self.mock / "codex").unlink()
+        # Enter takes Gum's default, No; n declines too. Only the pending installer is reported.
+        for keys in (b"\n", b"n\n"):
+            with self.subTest(keys=keys):
+                self.log.write_text("")
+                result = self.run_in_terminal(setup, self.env, keys)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Declined; existing configuration was preserved.", result.stdout)
+                self.assertIn("codex installation pending", result.stdout)
+                self.assertEqual(self.gum_confirms(), [["confirm", "--default=false", "Proceed?"]])
+                self.assertNotIn("[y/N]", result.stdout)
+                self.assertFalse(self.calls("curl"))
+        # Cancelling Gum (ctrl+c) stops setup without the change.
+        self.log.write_text("")
+        result = self.run_in_terminal(setup, self.env, b"<cancel>\n")
+        self.assertEqual(result.returncode, 130, result.stdout)
+        self.assertIn("Cancelled; setup stopped without this change.", result.stdout)
+        self.assertFalse(self.calls("curl"))
+        self.assertFalse(self.installed.exists())
+        # Without a terminal, Gum is never asked and nothing is approved.
+        self.log.write_text("")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Consent pending: rerun make setup in an interactive terminal. No approval was assumed.",
+                      result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.calls("curl"))
+        # Yes runs the installer; every confirmation used Gum.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertTrue((self.wrapper.parent / "codex").is_file())
+        self.assertIn(["confirm", "--default=false", "Proceed?"], self.gum_confirms())
+        self.assertNotIn("[y/N]", result.stdout)
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_setup_requires_a_visible_prompt_and_disables_inherited_gum_timeouts(self):
+        setup = [str(self.bundle / "scripts/setup.sh")]
+        (self.mock / "codex").unlink()
+        result = self.run_in_terminal(setup, self.env, b"y\n", stderr=subprocess.DEVNULL)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Consent pending", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.calls("curl"))
+        self.log.write_text("")
+        result = self.run_in_terminal(setup, dict(self.env, GUM_CONFIRM_TIMEOUT="1ms"), b"<timeout>\n")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("codex installation pending", result.stdout)
+        confirms = [call for call in self.calls("gum") if call["args"][:1] == ["confirm"]]
+        self.assertEqual(len(confirms), 1)
+        self.assertEqual(confirms[0]["env"]["GUM_CONFIRM_TIMEOUT"], "0")
+        self.assertFalse(self.calls("curl"))
+
+    def test_setup_repairs_old_gum_before_using_it_for_confirmations(self):
+        result = self.interactive_setup("n", MOCK_GUM_VERSION="0.5.0", MOCK_BREW_LISTED="gum")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("brew reinstall gum", result.stdout)
+        self.assertIn("Proceed? [y/N]", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["reinstall"]])
+        (self.mock / "codex").unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_GUM_VERSION="0.5.0", MOCK_BREW_LISTED="gum")
+        self.assert_success(result)
+        self.assertEqual(result.stdout.count("Proceed? [y/N]"), 1, result.stdout)
+        self.assertIn(["reinstall", "gum"], [c["args"] for c in self.calls("brew")])
+        self.assertTrue(self.gum_confirms())
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_setup_compatible_gum_cancellation_stops_before_installation(self):
+        (self.mock / "codex").unlink()
+        for version in ("0.15.0", "v0.15.0", "2.0.2"):
+            with self.subTest(version=version):
+                self.log.write_text("")
+                result = self.run_in_terminal([str(self.bundle / "scripts/setup.sh")],
+                                              dict(self.env, MOCK_GUM_VERSION=version), b"<cancel>\n")
+                self.assertEqual(result.returncode, 130, result.stdout)
+                self.assertEqual(len(self.gum_confirms()), 1)
+                self.assertFalse(self.calls("curl"))
+                self.assertNotIn("[y/N]", result.stdout)
+
+    def test_missing_or_broken_gum_is_bootstrapped_with_a_plain_prompt_that_assumes_nothing(self):
+        setup = [str(self.bundle / "scripts/setup.sh")]
+        (self.mock / "gum").unlink()
+        (self.mock / "codex").unlink()
+        # EOF, Enter, or n at the plain bootstrap prompt installs nothing.
+        for keys in (b"\x04", b"\n", b"n\n"):
+            with self.subTest(keys=keys):
+                self.log.write_text("")
+                result = self.run_in_terminal(setup, self.env, keys)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("brew install gum", result.stdout)
+                self.assertIn("Proceed? [y/N]", result.stdout)
+                self.assertIn("dependencies pending: gum", result.stdout)
+                self.assertFalse([c for c in self.calls("brew") if "install" in c["args"]])
+                self.assertFalse(self.calls("curl"))
+        # A broken Gum cannot ask either: declining its repair changes nothing and asks Gum nothing.
+        self.log.write_text("")
+        (self.mock / "gum").symlink_to("mock-cli")
+        result = self.run_in_terminal(setup, dict(self.env, MOCK_GUM="broken", MOCK_BREW_LISTED="gum"), b"n\n")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("brew reinstall gum", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if "reinstall" in c["args"]])
+        self.assertFalse(self.gum_confirms())
+        (self.mock / "gum").unlink()
+        # Only Gum's own installation uses the plain prompt; the next confirmation (Codex's installer) uses Gum.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertEqual(result.stdout.count("Proceed? [y/N]"), 1, result.stdout)
+        self.assertIn(["install", "gum"], [c["args"] for c in self.calls("brew")])
+        self.assertIn(["confirm", "--default=false", "Proceed?"], self.gum_confirms())
+        self.assertTrue((self.wrapper.parent / "codex").is_file())
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_installs_gum_before_github_cli_so_later_confirmations_use_it(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        (self.mock / "gum").unlink()
+        (self.mock / "gh").unlink()
+        result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64", MOCK_APT_GUM="archive")
+        self.assert_success(result)
+        actions = [c["args"] for c in self.calls("sudo")]
+        self.assertLess(actions.index(["apt-get", "install", "-y", "--no-install-recommends", "gum"]),
+                        actions.index(["apt-get", "install", "-y", "--no-install-recommends", "gh"]))
+        # Gum's own installation is the last plain prompt; GitHub CLI's installation is confirmed with Gum.
+        after_gum = result.stdout[result.stdout.index("Gum provides"):]
+        self.assertEqual(after_gum.count("Proceed? [y/N]"), 1, result.stdout)
+        self.assertIn(["confirm", "--default=false", "Proceed?"], self.gum_confirms())
+        self.assert_no_actions()
 
 
     # nm-config: the No-Mistakes global config editor for the clone file linked from NM_HOME.
@@ -4412,6 +4671,188 @@ os.execv(executable, [executable, *args])
         self.assertIn("Updater completed (updated or already current): gh-dash gum", result.stdout)
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["upgrade"], ["install"])])
         self.assert_no_actions()
+
+    def test_update_confirms_with_gum_defaulting_to_no_and_cancel_or_unrunnable_gum_changes_nothing(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr")
+        upgrades = lambda: ([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]]
+                            + self.native_updates("herdr"))
+        # Prompt order: gh-dash, herdr (the mock GitHub CLI and Gum are not brew- or apt-owned). Enter takes No.
+        self.log.write_text("")
+        result = self.interactive_update(["", ""])
+        self.assert_success(result)
+        self.assertEqual(self.gum_confirms(), [
+            ["confirm", "--default=false", "Run " + command + " now? It decides itself whether a newer release exists."]
+            for command in ("gh extension upgrade dash", "herdr update")])
+        self.assertIn("Declined (left unchanged): gh-dash herdr", result.stdout)
+        self.assertNotIn("[y/N]", result.stdout)
+        self.assertFalse(upgrades())
+        # Cancelling Gum (ctrl+c) stops make update before any upgrade or setup rerun.
+        self.log.write_text("")
+        result = self.interactive_update(["<cancel>"])
+        self.assertEqual(result.returncode, 130, result.stdout)
+        self.assertIn("Cancelled; gh-dash extension was left unchanged and make update stopped before rerunning setup.",
+                      result.stdout)
+        self.assertNotIn("== Refreshing the managed runtime", result.stdout)
+        self.assertFalse(upgrades())
+        # A Gum that cannot run asks nothing and approves nothing; setup then offers its repair with a plain prompt.
+        self.log.write_text("")
+        result = self.interactive_update(["n"], MOCK_GUM="broken")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Skipped: Gum 0.15 or later is required to ask for consent; no approval was assumed.", result.stdout)
+        self.assertIn("Skipped without a runnable Gum (no approval assumed): gh-dash herdr", result.stdout)
+        self.assertIn("dependencies pending: gum", result.stdout)
+        self.assertIn("Runtime: make setup did not pass", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(upgrades())
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["reinstall"], ["upgrade"])])
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_update_requires_a_visible_prompt_and_disables_inherited_gum_timeouts(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr")
+        self.log.write_text("")
+        result = self.run_in_terminal([str(self.bundle / "scripts/update.sh")],
+                                      dict(self.env, MOCK_CLONE_UPDATE="1"), b"y\n" * 24,
+                                      stderr=subprocess.DEVNULL)
+        self.assert_success(result)
+        self.assertIn("Skipped without a terminal: gh-dash herdr", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.native_updates("herdr"))
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.log.write_text("")
+        result = self.interactive_update(["<timeout>", "n"], GUM_CONFIRM_TIMEOUT="1ms")
+        self.assert_success(result)
+        self.assertIn("Declined (left unchanged): gh-dash herdr", result.stdout)
+        confirms = [call for call in self.calls("gum") if call["args"][:1] == ["confirm"]]
+        self.assertEqual(len(confirms), 2)
+        self.assertTrue(all(call["env"]["GUM_CONFIRM_TIMEOUT"] == "0" for call in confirms))
+        self.assertFalse(self.native_updates("herdr"))
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_update_skips_old_gum_and_compatible_gum_cancellation_stops_before_setup(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr")
+        self.log.write_text("")
+        result = self.interactive_update(["n"], MOCK_GUM_VERSION="0.5.0", MOCK_BREW_LISTED="gum")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Gum 0.15 or later is required to ask for consent", result.stdout)
+        self.assertIn("Proceed? [y/N]", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.native_updates("herdr"))
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["reinstall"], ["upgrade"])])
+        for version in ("0.15.0", "v0.15.0", "2.0.2"):
+            with self.subTest(version=version):
+                self.log.write_text("")
+                result = self.interactive_update(["<cancel>"], MOCK_GUM_VERSION=version)
+                self.assertEqual(result.returncode, 130, result.stdout)
+                self.assertEqual(len(self.gum_confirms()), 1)
+                self.assertNotIn("== Refreshing the managed runtime", result.stdout)
+                self.assertFalse(self.native_updates("herdr"))
+                self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_ghd_update_runs_make_update_in_the_recorded_clone_from_any_directory(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        record = self.installed / ".mini-factory-clone"
+        self.assertEqual(record.read_text(), str(self.bundle) + "\n")
+        repo, repo_git = self.source_repo()
+        repo_head = repo_git("rev-parse", "HEAD")
+        elsewhere = self.root / "not a repository"
+        elsewhere.mkdir()
+        upstream = publish("README.md", (self.bundle / "README.md").read_text() + "\nUpstream release note.\n")
+        update = {"MOCK_CLONE_UPDATE": "1"}
+        # From another Git repository: only the recorded clone is fetched, fast-forwarded, and set up.
+        result = self.run_script(self.wrapper, "update", cwd=repo, env=update)
+        self.assert_success(result)
+        self.assertIn("Clone: fast-forwarded main", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertIn("Upstream release note.", (self.installed / "README.md").read_text())
+        self.assertIn("Runtime: make setup passed, including the doctor checks.", result.stdout)
+        self.assertEqual(repo_git("rev-parse", "HEAD"), repo_head)
+        self.assertEqual(repo_git("status", "--porcelain"), "")
+        # In the caller's checkout only ghd's read-only check of the recorded clone runs.
+        self.assertEqual([c["args"] for c in self.calls() if c["cwd"] == str(repo)],
+                         [["-C", str(self.bundle), "rev-parse", "--show-toplevel"]])
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:1] == ["dash"] and "--config" in c["args"]])
+        # Already current: a second run from outside any repository is safe.
+        result = self.run_script(self.wrapper, "update", cwd=elsewhere, env=update)
+        self.assert_success(result)
+        self.assertIn("Clone: already up to date with origin/main", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertEqual(record.read_text(), str(self.bundle) + "\n")
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_ghd_update_refuses_arguments_and_a_missing_moved_or_other_checkout_without_changes(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        record = self.installed / ".mini-factory-clone"
+        repo, _ = self.source_repo()
+        (repo / "subdirectory").mkdir()
+        recovery = "run make setup from your retained mini-factory clone to record it"
+        upstream = publish("README.md", "Upstream rewrite\n")
+        start = git(self.bundle, "rev-parse", "HEAD")
+
+        def refused(message, *args, fetched=False):
+            self.log.write_text("")
+            result = self.run_script(self.wrapper, "update", *args, cwd=repo, env={"MOCK_CLONE_UPDATE": "1"})
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(message, result.stderr)
+            # Only a diverged main is detected after the (read-only) fetch; nothing is ever merged.
+            self.assertEqual(fetched, bool([c for c in self.calls("git") if "fetch" in c["args"]]))
+            self.assertFalse([c for c in self.calls("git") if "merge" in c["args"]])
+            self.assertFalse(self.calls("gh"), "neither gh-dash nor setup ran")
+            return result
+
+        for args in (("now",), ("--force",), ("",)):
+            with self.subTest(args=args):
+                refused("usage: ghd update (no arguments; it runs make update in your retained mini-factory clone)", *args)
+        record.unlink()
+        refused("no recorded mini-factory clone (" + str(record) + "); " + recovery)
+        # The record is data, never shell: a relative path or another checkout is refused, never selected.
+        marker = self.root / "executed"
+        for recorded in ("$(touch " + str(marker) + ")", str(repo), str(repo / "subdirectory")):
+            with self.subTest(recorded=recorded):
+                record.write_text(recorded + "\n")
+                refused(recovery)
+        self.assertFalse(marker.exists())
+        record.write_text(str(self.bundle) + "\n")
+        moved = self.root / "moved clone"
+        self.bundle.rename(moved)
+        refused("the recorded mini-factory clone " + str(self.bundle) + " is missing, moved, or no longer a Git checkout; "
+                + recovery)
+        self.assertEqual(git(moved, "rev-parse", "HEAD"), start)
+        # A failed setup from the moved clone keeps the record; a successful one publishes the new location.
+        worker = moved / "scripts/integrations/gh-dash/gh-dash-codex-issue.sh"
+        content = worker.read_bytes()
+        worker.write_text("#!/usr/bin/env bash\nif\n")
+        self.assertNotEqual(self.run_script(moved / "scripts/setup.sh").returncode, 0)
+        self.assertEqual(record.read_text(), str(self.bundle) + "\n")
+        worker.write_bytes(content)
+        self.assert_success(self.run_in_terminal([str(moved / "scripts/setup.sh")], self.env, b"y\n" * 24))
+        self.assertEqual(record.read_text(), str(moved) + "\n")
+        # The updater's own refusals still apply: another branch, then a diverged main, change nothing.
+        git(moved, "checkout", "-q", "-b", "feature/local")
+        refused("on branch feature/local: make update runs only on main and never switches branches")
+        self.assertEqual(git(moved, "branch", "--show-current"), "feature/local")
+        git(moved, "checkout", "-q", "main")
+        git(moved, "commit", "-q", "--allow-empty", "-m", "Local commit")
+        local = git(moved, "rev-parse", "HEAD")
+        result = refused("have diverged", fetched=True)
+        self.assertIn("Nothing was changed.", result.stderr)
+        self.assertEqual(git(moved, "rev-parse", "HEAD"), local)
+        self.assertNotEqual(local, upstream)
+        self.assert_no_actions(allow_onboarding=True)
 
 
 if __name__ == "__main__":
