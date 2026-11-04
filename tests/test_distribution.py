@@ -596,7 +596,16 @@ elif name == "git":
 elif name == "nohup":
     # The existing dispatchers own asynchronous execution; retain their execution
     # route but make the backend reach only its missing-Herdr safety check.
+    # Each detached helper gets its own process group, announced by "<group>.started" and, once the helper has
+    # exited, "<group>.finished", so tests can wait for (or stop) every helper before temporary-directory cleanup.
+    os.setpgid(0, 0)
+    helpers = root.parent / "detached helpers"
+    helpers.mkdir(exist_ok=True)
+    (helpers / f"{os.getpid()}.started").touch()
+    if (helpers / "stopped").exists():
+        sys.exit(1)
     result = subprocess.run(args, check=False)
+    (helpers / f"{os.getpid()}.finished").touch()
     sys.exit(result.returncode)
 elif name == "curl":
     if "-o" not in args:
@@ -823,19 +832,54 @@ class DistributionTests(unittest.TestCase):
 
     def wait_for_detached_helpers_without_herdr(self, count):
         # Each detached helper logs the missing Herdr socket after taking its lock, then still notifies (appending to
-        # calls.jsonl) and releases the lock in its EXIT trap. Waiting for the release keeps those late writes from
-        # racing the temporary directory's cleanup ("Directory not empty").
-        state = Path(self.env["XDG_STATE_HOME"])
+        # calls.jsonl) and releases the lock in its EXIT trap. Only the mock nohup's finished markers prove that every
+        # helper has exited, so those late writes cannot race the temporary directory's cleanup ("Directory not
+        # empty"); an expired wait or an empty lock directory proves nothing.
+        helpers = self.root / "detached helpers"
+        def groups(marker):
+            return {int(path.stem) for path in helpers.glob("*." + marker)}
         deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(state.glob("gh-dash-codex-*/*.log"))
-            if (len(logs) == count and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs)
-                    and not any(state.glob("gh-dash-codex-*/locks/*.lock"))):
+        while True:
+            started = groups("started")
+            finished = groups("finished")
+            if len(started) >= count and started <= finished:
                 break
+            if time.monotonic() >= deadline:
+                self.stop_detached_helpers()
+                self.fail(f"detached helpers did not finish within 5 seconds: expected {count}, "
+                          f"started {len(started)}, finished {len(started & finished)}; stopped the rest")
             time.sleep(0.02)
+        self.assertEqual(len(started), count)
+        state = Path(self.env["XDG_STATE_HOME"])
+        logs = list(state.glob("gh-dash-codex-*/*.log"))
+        self.assertEqual(len(logs), count)
+        for file in logs:
+            self.assertIn("HERDR_SOCKET_PATH", file.read_text())
         self.assertEqual(list(state.glob("gh-dash-codex-*/locks/*.lock")), [])
         return logs
+
+    def stop_detached_helpers(self):
+        # Mock nohup processes that have not announced themselves see the stop marker and never run their helper;
+        # announced, unfinished ones are killed with their whole process group, which is awaited until it is gone.
+        helpers = self.root / "detached helpers"
+        helpers.mkdir(exist_ok=True)
+        (helpers / "stopped").touch()
+        pending = ({int(path.stem) for path in helpers.glob("*.started")}
+                   - {int(path.stem) for path in helpers.glob("*.finished")})
+        for group in pending:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 5
+        while pending and time.monotonic() < deadline:
+            for group in list(pending):
+                try:
+                    os.killpg(group, 0)
+                except ProcessLookupError:
+                    pending.discard(group)
+            time.sleep(0.02)
+        self.assertFalse(pending, "stopped detached helper process groups did not exit")
 
     def assert_no_actions(self, allow_onboarding=False):
         for record in self.calls():
