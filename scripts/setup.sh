@@ -456,11 +456,18 @@ install_github_cli_ubuntu() {
 	sudo apt-get install -y --no-install-recommends gh
 }
 
-# Newer Ubuntu releases carry Gum in universe; older ones use Charm's official apt repository.
+# Ubuntu archives with Gum below 0.15 use Charm's official apt repository instead.
 # madison lists only repository-provided versions, unlike policy's Candidate, which can be
 # an installed-only version whose repository was removed.
 gum_in_ubuntu_archive() {
-	[ -n "$(apt-cache madison gum 2>/dev/null)" ]
+	local candidate
+	candidate="$(LC_ALL=C apt-cache policy gum 2>/dev/null | awk '/^[ \t]*Candidate:/ { print $2; exit }')" || return 1
+	apt-cache madison gum 2>/dev/null | awk -F '|' -v candidate="$candidate" '{
+		version = $2; gsub(/[ \t]/, "", version)
+		if (version != candidate) next
+		sub(/^[0-9]+:/, "", version); split(version, v, /[.+~-]/)
+		if (v[1] > 0 || (v[1] == 0 && v[2] >= 15)) found = 1
+	} END { exit !found }'
 }
 
 install_gum_ubuntu() {
@@ -475,7 +482,7 @@ install_gum_ubuntu() {
 		sudo "${install_arguments[@]}"
 		return
 	fi
-	consent "Gum provides the mf-config and nm-config editors and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
+	consent "Gum 0.15 or later provides the mf-config and nm-config editors and is not in your configured Ubuntu archive. Install it from Charm's official apt repository? This writes /etc/apt/keyrings/charm.asc and /etc/apt/sources.list.d/charm.list, then runs sudo apt-get update and sudo ${install_arguments[*]}." ||
 		die 'Gum installation pending'
 	scratch="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-gum.XXXXXX")"
 	if ! curl -fsSL https://repo.charm.sh/apt/gpg.key -o "$scratch/charm.asc"; then

@@ -117,7 +117,7 @@ Setup offers apt installation for missing tools and the
 [official GitHub CLI apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
 when GitHub CLI needs installation. Gum (setup's confirmation prompt and the
 `mf-config`/`nm-config` editor; offered before GitHub CLI) comes from your
-configured Ubuntu archive when it offers a `gum` package (newer releases carry it
+configured Ubuntu archive when its `gum` candidate is version 0.15 or later (newer releases carry it
 in universe); otherwise setup offers
 [Charm's official apt repository](https://github.com/charmbracelet/gum#installation),
 which writes `/etc/apt/keyrings/charm.asc` and `/etc/apt/sources.list.d/charm.list`.
