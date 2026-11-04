@@ -632,7 +632,7 @@ NM_MENU = {"agent": "Pipeline agent (agent)", "agent_config": "Harness model/eff
            "save": "Review and save changes", "quit": "Quit without saving"}
 INHERIT_CODEX = "Inherit agent_config.codex (clear)"
 STABLE_DEFAULT = ("agent: codex # Initialized from the issue agent during first setup.\n"
-                  "auto_fix:\n  review: 3\n  ci: 3\n")
+                  "auto_fix:\n  review: 5\n  ci: 3\n")
 
 
 class DistributionTests(unittest.TestCase):
@@ -1705,7 +1705,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertFalse(self.no_mistakes_updates())
         self.assertEqual(os.readlink(link), str(source))
         self.assertEqual(source.read_text(), "agent: codex # Initialized from the issue agent during first setup.\n"
-                                             "auto_fix:\n  review: 3\n  ci: 3\n")
+                                             "auto_fix:\n  review: 5\n  ci: 3\n")
         # The stable loader accepts the linked default; native doctor reports it ready.
         self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
         # The native default written by the first daemon start is preserved, not overwritten.
