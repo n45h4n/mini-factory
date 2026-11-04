@@ -31,11 +31,23 @@ cd /path/to/your/repository
 herdr --session my-project
 ```
 
-Inside its shell pane, confirm you are in that repository and run:
+Inside its shell pane, confirm you are in that repository. Before the first
+issue `i` or PR `I`, stay in that checkout and run the **installed** doctor,
+then `ghd`:
 
 ```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/scripts/doctor.sh"
 ghd
 ```
+
+That doctor run checks this pane's Herdr context and the target repository's
+effective Git fetch URL and authentication with a read-only `git ls-remote`.
+GitHub CLI login alone does not prove Git can fetch the repository. If it
+reports Git transport pending, follow [Git transport](#git-transport-for-pr-reviews-and-issue-preparation)
+and rerun the same command. `make doctor` from the Mini-Factory clone, outside
+Herdr, checks only the installation (it reports Git transport as not checked). In the target
+checkout, `make doctor` would run that repository's own Makefile, and
+`make -C /path/to/mini-factory doctor` changes away from the target.
 
 | View | Key | Action |
 | ---- | --- | ------ |
@@ -193,7 +205,13 @@ server is headless. When setup runs this login it separately offers GitHub's
 optional `project` scope, for GitHub Projects only; ordinary issue and PR
 actions do not need it. To add it later:
 `gh auth refresh --hostname github.com --scopes project`. GitHub CLI's transport
-choice is separate from access needed by Git itself. Setup installs the
+choice is separate from access needed by Git itself. The native login flow may
+offer to set up HTTPS Git credentials; setup never repeats that prompt or
+changes Git credentials. After login it notes that GitHub CLI login alone does
+not prove Git can fetch a target repository. When no Git credential helper is
+configured for `https://github.com`, it also prints `gh auth setup-git --hostname github.com`
+as an optional follow-up for HTTPS users (see
+[Git transport](#git-transport-for-pr-reviews-and-issue-preparation)). Setup installs the
 extension, with consent, when it is missing:
 
 ```sh
@@ -328,7 +346,11 @@ git ls-remote "$(gh repo view --json sshUrl --jq .sshUrl)" HEAD
 If you already use authenticated HTTPS, you can deliberately route this URL
 through Git's native rewriting instead. These optional commands change your Git
 credential configuration and the target repository's local config; review them
-before running:
+before running. Skip `gh auth setup-git` when Git already has a working
+credential helper for GitHub (for example, when the native `gh auth login` flow
+already set up HTTPS Git). It sets GitHub CLI as the `github.com`
+credential helper in your global Git config and can replace a helper previously
+configured for that host:
 
 ```sh
 gh auth setup-git --hostname github.com
@@ -340,12 +362,22 @@ git ls-remote "$(gh repo view --json sshUrl --jq .sshUrl)" HEAD
 
 No SSH key is required when the effective transport is working HTTPS. Setup
 does not change Git credential helpers, Git remotes, URL rewriting, or SSH
-configuration. Doctor checks the effective transport only inside a target
-Herdr context, using bounded, read-only `git ls-remote` and no terminal prompts.
-With default SSH it requires pre-established host trust; it does not accept host
-keys or create them as a side effect. A custom `GIT_SSH`, `GIT_SSH_COMMAND`, or
-Git `core.sshCommand` needs manual transport verification; doctor skips executing
-it and reports pending.
+configuration. After either choice, rerun the installed doctor from the target
+checkout's Herdr pane, staying in that checkout:
+
+```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/scripts/doctor.sh"
+```
+
+Doctor checks the effective transport only inside a target Herdr context, using
+bounded, read-only `git ls-remote` and no terminal prompts. It prints the
+effective URL (hiding any embedded credentials), and a failure names the SSH or
+HTTPS remedy. Outside Herdr, or when the runtime context fails first, it reports
+Git transport as not checked. With default SSH it requires pre-established host
+trust; it does not accept host keys or create them as a side effect. A custom
+`GIT_SSH`, `GIT_SSH_COMMAND`, or Git `core.sshCommand` needs manual transport
+verification; doctor skips executing it and fails with Git transport not
+checked. Doctor never changes remotes, URL rewriting, or the fetch protocol.
 
 ## What the workflows do
 
@@ -764,9 +796,13 @@ stay logged out. Doctor checks No-Mistakes login only for duties set to
 `claude`, `codex`, `cursor`, or `acp:cursor`; for other native selections such
 as `auto` or agent lists it prints a note and relies on native doctor, which
 proves only that the agent runs, so log in to that agent through its own CLI.
-Outside Herdr it skips runtime-context checks and explains how to enter a pane.
+Outside Herdr it skips runtime-context and Git transport checks and explains how to enter a pane.
 Inside Herdr it checks the inherited route, active compatible server, the
-gh-dash roles' detection manifests, target repository, and Git transport. It notes, without
+gh-dash roles' detection manifests, target repository, and Git transport. To
+check a target, run the installed
+`"${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/scripts/doctor.sh"` from
+its Herdr pane, as in the quick start. `make doctor` above checks this
+installation from the clone. It notes, without
 failing, when the optional `mf-config` or `nm-config` launcher is not on `PATH`. It never starts
 agents or pipelines, creates worktrees, sends prompts, writes PR comments, or
 marks PRs ready. It returns nonzero for required failed/pending checks.
@@ -855,7 +891,8 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
 
 1. Fresh clone, `make setup ISSUE_AGENT=<agent>`, complete the native logins,
    then `make doctor` reports ready.
-2. In a Herdr pane of the test repository, run `ghd`, select the issue, press
+2. In a Herdr pane of the test repository, run the installed doctor (as in the
+   quick start) until it reports Git transport authenticated, then run `ghd`, select the issue, press
    `i`: the preparation agent reports the `main` branch/commit it inspected and
    one verdict, and edits only the issue's title/body.
 3. Press `I`: the implementation agent commits on `agent/issue-N`, starts

@@ -737,20 +737,34 @@ ensure_node_and_acpx() {
 	fi
 }
 
+# GitHub CLI login proves API access only. Git transport stays the user's choice and is verified per
+# target by the installed doctor; setup reads (never writes) Git's credential helper for GitHub. The
+# native login flow owns its own HTTPS credential prompt, so setup only names the follow-up command.
+explain_git_transport() {
+	local doctor helper
+	printf -v doctor '%q' "$runtime/scripts/doctor.sh"
+	notice "Git transport: GitHub CLI login covers API access only; it does not by itself prove Git can fetch your target repository (the i preparer and PRs I reviewer fetch its GitHub sshUrl, which Git's insteadOf rules can route over HTTPS). Before the first i or I, run $doctor from the target checkout's Herdr pane, staying in that checkout; it checks the effective fetch URL and authentication (README: Git transport)."
+	helper="$(cd / && git config --get-urlmatch credential.helper https://github.com 2>/dev/null)" || helper=''
+	[ -z "$helper" ] || return 0
+	notice "No Git credential helper is configured for https://github.com. SSH needs none. To choose HTTPS instead, run gh auth setup-git --hostname github.com yourself (it sets GitHub CLI as the github.com credential helper in your global Git config and can replace a helper previously configured for that host), then add the README's target-repository-local insteadOf rewrite."
+}
+
 configure_native_tools() {
-	local codex_directory integration kind description login_arguments login_kinds
+	local codex_directory integration kind description login_arguments login_kinds github_ready=1
 	if ! gh auth status --hostname github.com >/dev/null 2>&1; then
 		if consent 'GitHub authentication is pending. Run gh auth login --hostname github.com --web now? Follow its native device-code instructions in a browser on this or another machine. Choose Git transport yourself; setup will not configure Git credentials.'; then
 			login_arguments=(auth login --hostname github.com --web)
 			if consent "Optional: also request GitHub's project scope (only for GitHub Projects access)? Ordinary issue and PR actions do not need it."; then
 				login_arguments=(auth login --hostname github.com --web --scopes project)
 			fi
-			gh "${login_arguments[@]}" || pending=1
+			gh "${login_arguments[@]}" || { pending=1; github_ready=0; }
 		else
 			notice 'Remaining action: gh auth login --hostname github.com --web'
 			pending=1
+			github_ready=0
 		fi
 	fi
+	[ "$github_ready" -eq 0 ] || explain_git_transport
 	if ! gh dash --version >/dev/null 2>&1; then
 		if consent 'Install the gh-dash extension with gh extension install dlvhdr/gh-dash? Existing gh-dash configuration is preserved; ghd uses the bundled config explicitly.'; then
 			gh extension install dlvhdr/gh-dash || pending=1
@@ -834,4 +848,5 @@ if [ "$pending" -ne 0 ]; then
 	notice 'Installed; authentication/setup actions remain pending. Resolve the actions above and rerun make setup or make doctor.'
 	exit 1
 fi
-notice 'Installation and authentication checks passed. Enter a Herdr pane for your target checkout, then run ghd.'
+printf -v doctor_command '%q' "$runtime/scripts/doctor.sh"
+notice "Installation and authentication checks passed. Enter a Herdr pane for your target checkout, run $doctor_command there to check its Git transport, then run ghd."
