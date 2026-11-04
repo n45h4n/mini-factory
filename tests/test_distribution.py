@@ -673,7 +673,7 @@ NM_MENU = {"agent": "Pipeline agent (agent)", "agent_config": "Harness model/eff
            "save": "Review and save changes", "quit": "Quit without saving"}
 INHERIT_CODEX = "Inherit agent_config.codex (clear)"
 STABLE_DEFAULT = ("agent: codex # Initialized from the issue agent during first setup.\n"
-                  "auto_fix:\n  review: 3\n  ci: 3\n")
+                  "auto_fix:\n  review: 5\n  ci: 3\n")
 
 
 class DistributionTests(unittest.TestCase):
@@ -1655,7 +1655,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assert_success(self.interactive_setup("y", ISSUE_AGENT="codex"))
         self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
         self.assertTrue(source.read_text().startswith("agent: codex "))
-        edited = source.read_text().replace("review: 3", "review: 1")
+        edited = source.read_text().replace("review: 5", "review: 1")
         source.write_text(edited)
         # A missing link (as after moving the clone) is relinked without re-initializing the agent.
         link.unlink()
@@ -1673,7 +1673,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(os.readlink(link), str(source))
         self.assertTrue(source.read_text().startswith("agent: claude "))
         self.assertEqual(setting.read_text(), "claude\n")
-        edited = source.read_text().replace("review: 3", "review: 1") + "# personal note\n"
+        edited = source.read_text().replace("review: 5", "review: 1") + "# personal note\n"
         source.write_text(edited)
         self.assert_success(self.setup(ISSUE_AGENT="cursor"))
         self.assert_success(self.setup())
@@ -1776,7 +1776,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertFalse(self.no_mistakes_updates())
         self.assertEqual(os.readlink(link), str(source))
         self.assertEqual(source.read_text(), "agent: codex # Initialized from the issue agent during first setup.\n"
-                                             "auto_fix:\n  review: 3\n  ci: 3\n")
+                                             "auto_fix:\n  review: 5\n  ci: 3\n")
         # The stable loader accepts the linked default; native doctor reports it ready.
         self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
         # The native default written by the first daemon start is preserved, not overwritten.
@@ -3477,7 +3477,7 @@ os.execv(executable, [executable, *args])
         self.assertIn("  Reviewer: no override - uses the pipeline agent (codex) with its agent_config", lines)
         self.assertIn("  Fixer: no override - uses the pipeline agent (codex) with its agent_config", lines)
         self.assertIn("  Later-round reviewer: none - every round uses the reviewer", lines)
-        self.assertIn("  review: 3", lines)
+        self.assertIn("  review: 5", lines)
         self.assertIn("  test: unset - native default (3 in v1.84.0)", lines)
         self.assertIn("Fixer session reuse (session_reuse): unset - native default (true in v1.84.0)", lines)
         self.assertIn("nm-config does not read target repositories.", result.stdout)
@@ -3673,11 +3673,11 @@ os.execv(executable, [executable, *args])
         self.assert_success(result)
         self.assertEqual(remaining, [])
         self.assertIn("already rejected this config before the edit", result.stdout)
-        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 3", "review: 2"))
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 5", "review: 2"))
         # Inserting an earlier setting moves line numbers in an unchanged native schema rejection.
         config = STABLE_DEFAULT + "ci:\n  review_bot_comments: always\n"
         source.write_text(config)
-        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "1", "3", "", "", "3", NM_MENU["save"], "yes")
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "1", "5", "", "", "3", NM_MENU["save"], "yes")
         self.assert_success(result)
         self.assertEqual(remaining, [])
         self.assertIn("already rejected this config before the edit", result.stdout)
@@ -3797,7 +3797,7 @@ os.execv(executable, [executable, *args])
                                          MOCK_NM_DOCTOR="fail")
         self.assert_success(result)
         self.assertIn("environment readiness, not blocking this save", result.stdout)
-        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 3", "review: 2"))
+        self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("review: 5", "review: 2"))
         self.assertEqual(list(source.parent.glob(".config.yaml.nm-config.*")), [])
         self.assert_no_actions()
 
@@ -4135,7 +4135,7 @@ os.execv(executable, [executable, *args])
         self.assert_success(result)
         self.assertEqual(remaining, [])
         self.assertEqual(source.read_text(), STABLE_DEFAULT.replace("agent: codex", "agent: claude")
-                         .replace("review: 3", "review: 2"))
+                         .replace("review: 5", "review: 2"))
         self.assertEqual((self.installed / "no-mistakes/config.yaml").read_bytes(), runtime_copy)
         self.assertIn("Native check: the installed No-Mistakes loads the edited config.", result.stdout)
         self.assertIn("rerun it after saving if Claude Code is not logged in on this machine", result.stdout)
@@ -4336,7 +4336,7 @@ os.execv(executable, [executable, *args])
         git, publish = self.clone_fixture()
         self.install()
         source = self.bundle / "no-mistakes/config.yaml"
-        edited = source.read_text().replace("review: 3", "review: 1") + "# my local setting\n"
+        edited = source.read_text().replace("review: 5", "review: 1") + "# my local setting\n"
         source.write_text(edited)
         publish("README.md", (self.bundle / "README.md").read_text() + "\nUnrelated upstream change.\n")
         self.assert_success(self.update())
