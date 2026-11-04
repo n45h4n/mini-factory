@@ -3418,7 +3418,7 @@ os.execv(executable, [executable, *args])
         # Inserting an earlier setting moves line numbers in an unchanged native schema rejection.
         config = STABLE_DEFAULT + "ci:\n  review_bot_comments: always\n"
         source.write_text(config)
-        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "1", "3", "", "", "3", NM_MENU["save"], "yes")
+        result, remaining = self.edit_nm(NM_MENU["auto_fix"], "1", "5", "", "", "3", NM_MENU["save"], "yes")
         self.assert_success(result)
         self.assertEqual(remaining, [])
         self.assertIn("already rejected this config before the edit", result.stdout)
