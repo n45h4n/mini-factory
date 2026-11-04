@@ -821,6 +821,22 @@ class DistributionTests(unittest.TestCase):
     def notifications(self):
         return [args[args.index("--body") + 1] for args in self.herdr_calls("notification", "show")]
 
+    def wait_for_detached_helpers_without_herdr(self, count):
+        # Each detached helper logs the missing Herdr socket after taking its lock, then still notifies (appending to
+        # calls.jsonl) and releases the lock in its EXIT trap. Waiting for the release keeps those late writes from
+        # racing the temporary directory's cleanup ("Directory not empty").
+        state = Path(self.env["XDG_STATE_HOME"])
+        deadline = time.monotonic() + 5
+        logs = []
+        while time.monotonic() < deadline:
+            logs = list(state.glob("gh-dash-codex-*/*.log"))
+            if (len(logs) == count and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs)
+                    and not any(state.glob("gh-dash-codex-*/locks/*.lock"))):
+                break
+            time.sleep(0.02)
+        self.assertEqual(list(state.glob("gh-dash-codex-*/locks/*.lock")), [])
+        return logs
+
     def assert_no_actions(self, allow_onboarding=False):
         for record in self.calls():
             args, tool = record["args"], record["tool"]
@@ -1186,13 +1202,7 @@ class DistributionTests(unittest.TestCase):
         repo, _ = self.source_repo()
         self.assert_success(self.run_script(self.wrapper, cwd=repo, env={"MOCK_BINDINGS": "1",
             "DOTFILES_DIR": "/unavailable/dotfiles"}))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 3 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(3)
         self.assertEqual(sorted(file.name.rsplit("-", 2)[-1] for file in logs),
                          ["8.log", "prepare.log", "review.log"])
         for file in logs:
@@ -1207,13 +1217,7 @@ class DistributionTests(unittest.TestCase):
         directory = self.installed / "scripts/integrations/gh-dash"
         for name in ("gh-dash-codex-issue-dispatch.sh", "gh-dash-codex-pr-review-dispatch.sh"):
             self.assert_success(self.run_script(directory / name, "friend/target", "8", cwd=repo))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 2 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(2)
         self.assertEqual(len(logs), 2)
         for file in logs:
             self.assertIn("HERDR_SOCKET_PATH", file.read_text())
@@ -1236,13 +1240,7 @@ class DistributionTests(unittest.TestCase):
         for name in ("gh-dash-codex-issue-dispatch.sh", "gh-dash-codex-pr-review-dispatch.sh"):
             self.assert_success(self.run_script(directory / name, "friend/target", "8", cwd=repo,
                                                 env={"DOTFILES_DIR": str(unrelated)}))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(Path(self.env["XDG_STATE_HOME"]).glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 2 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(2)
         self.assertEqual(len(logs), 2)
         for file in logs:
             self.assertIn("HERDR_SOCKET_PATH", file.read_text())
@@ -1278,13 +1276,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                               ("gh-dash-codex-pr-review.sh",)):
             with self.subTest(script=script, mode=mode):
                 self.assert_success(self.run_script(directory / script, "friend/target", "8", *mode, cwd=repo))
-        deadline = time.monotonic() + 5
-        logs = []
-        while time.monotonic() < deadline:
-            logs = list(state.glob("gh-dash-codex-*/*.log"))
-            if len(logs) == 3 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
-                break
-            time.sleep(0.02)
+        logs = self.wait_for_detached_helpers_without_herdr(3)
         self.assertEqual(len(logs), 3)
         for file in logs:
             self.assertNotIn("chmod", file.read_text())
