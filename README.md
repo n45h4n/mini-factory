@@ -530,7 +530,7 @@ absolute path (never to the runtime copy):
 ```yaml
 agent: codex # Initialize to the chosen pipeline agent during first setup.
 auto_fix:
-  review: 3
+  review: 5
   ci: 3
 ```
 
