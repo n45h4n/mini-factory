@@ -253,7 +253,7 @@ ensure_private_directory() {
 	fi
 	[ ! -L "$directory" ] && [ -d "$directory" ] && [ -O "$directory" ] ||
 		prelock_die "$label changed identity while being validated: $directory"
-	chmod 700 -- "$directory" || prelock_die "unable to protect $label: $directory"
+	chmod -- 700 "$directory" || prelock_die "unable to protect $label: $directory"
 }
 
 refresh_dispatched_diagnostic_log() {
@@ -593,7 +593,7 @@ acquire_pr_lock() {
 	HUP) exit 129 ;;
 	esac
 	[ "$lock_status" -eq 0 ] || pr_locked
-	chmod 700 -- "$pr_lock_directory" || die 'unable to protect the PR review lock'
+	chmod -- 700 "$pr_lock_directory" || die 'unable to protect the PR review lock'
 	now="$(date +%s)" || die 'unable to capture the PR review lock timestamp'
 	case "$now" in
 	'' | *[!0-9]*) die 'the system returned an invalid PR review lock timestamp' ;;

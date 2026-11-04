@@ -44,7 +44,7 @@ ensure_private_state_directory() {
 	else
 		mkdir -p -- "$state_directory" || die "unable to create state directory: $state_directory"
 	fi
-	chmod 700 -- "$state_directory" || die "unable to protect state directory: $state_directory"
+	chmod -- 700 "$state_directory" || die "unable to protect state directory: $state_directory"
 }
 
 ensure_private_log() {
@@ -68,7 +68,7 @@ ensure_private_log() {
 			[ "$links" = 1 ] || die "diagnostic log must have link count 1: $log_path"
 		}
 	fi
-	chmod 600 -- "$log_path" || die "unable to protect diagnostic log: $log_path"
+	chmod -- 600 "$log_path" || die "unable to protect diagnostic log: $log_path"
 }
 
 lock_and_validate_dispatch_log() {

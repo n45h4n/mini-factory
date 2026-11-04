@@ -44,7 +44,7 @@ ensure_private_state_directory() {
 	else
 		mkdir -p -- "$state_directory" || die "unable to create state directory: $state_directory"
 	fi
-	chmod 700 -- "$state_directory" || die "unable to protect state directory: $state_directory"
+	chmod -- 700 "$state_directory" || die "unable to protect state directory: $state_directory"
 }
 
 file_link_count() {
@@ -80,7 +80,7 @@ ensure_private_log() {
 				die "unable to create diagnostic log safely: $log_path"
 		}
 	fi
-	chmod 600 -- "$log_path" || die "unable to protect diagnostic log: $log_path"
+	chmod -- 600 "$log_path" || die "unable to protect diagnostic log: $log_path"
 }
 
 lock_fd_shared() {

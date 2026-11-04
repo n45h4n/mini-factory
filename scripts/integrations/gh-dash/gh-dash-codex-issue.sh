@@ -245,7 +245,7 @@ ensure_private_directory() {
 	fi
 	[ ! -L "$directory" ] && [ -d "$directory" ] && [ -O "$directory" ] ||
 		prelock_die "$label changed identity while being validated: $directory"
-	chmod 700 -- "$directory" || prelock_die "unable to protect $label: $directory"
+	chmod -- 700 "$directory" || prelock_die "unable to protect $label: $directory"
 }
 
 refresh_dispatched_issue_log() {
@@ -612,7 +612,7 @@ acquire_issue_lock() {
 	esac
 	[ "$lock_status" -eq 0 ] || issue_locked
 	[ "$gate_error" -eq 0 ] || die 'unable to enter the issue lock test gate'
-	chmod 700 -- "$issue_lock_directory" || die 'unable to protect the issue lock'
+	chmod -- 700 "$issue_lock_directory" || die 'unable to protect the issue lock'
 	now="$(date +%s)" || die 'unable to capture the issue lock timestamp'
 	case "$now" in
 	'' | *[!0-9]*) die 'the system returned an invalid issue lock timestamp' ;;
