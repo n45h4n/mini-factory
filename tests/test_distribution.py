@@ -1152,6 +1152,59 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assert_no_actions()
 
+    def test_issue_and_pr_routes_use_chmod_operand_order_native_bsd_accepts(self):
+        # Native macOS/BSD chmod stops parsing options at the mode, so "chmod 700 -- path" names a file "--";
+        # GNU chmod permutes arguments and hides that. This chmod follows the BSD rule.
+        chmod = self.mock / "chmod"
+        chmod.unlink()
+        chmod.write_text("""#!/bin/sh
+mode_seen= options_ended=
+for argument do
+	if [ -n "$mode_seen" ]; then
+		[ "$argument" != -- ] || { echo 'chmod: --: No such file or directory' >&2; exit 1; }
+	elif [ -z "$options_ended" ] && [ "$argument" = -- ]; then
+		options_ended=1
+	elif [ -n "$options_ended" ] || [ "${argument#-}" = "$argument" ]; then
+		mode_seen=1
+	fi
+done
+exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
+""")
+        chmod.chmod(0o755)
+        rejected = subprocess.run([str(chmod), "700", "--", str(self.root)], capture_output=True, text=True)
+        self.assertEqual((rejected.returncode, rejected.stderr), (1, "chmod: --: No such file or directory\n"))
+        state = Path(self.env["XDG_STATE_HOME"])
+        directory = self.bundle / "scripts/integrations/gh-dash"
+        repo, git = self.source_repo(base=self.root / "issue")
+        # The gh-dash bindings: issue i, issue I, and PR I (whose launcher execs its dispatcher).
+        for script, *mode in (("gh-dash-codex-issue-dispatch.sh", "prepare"), ("gh-dash-codex-issue-dispatch.sh",),
+                              ("gh-dash-codex-pr-review.sh",)):
+            with self.subTest(script=script, mode=mode):
+                self.assert_success(self.run_script(directory / script, "friend/target", "8", *mode, cwd=repo))
+        deadline = time.monotonic() + 5
+        logs = []
+        while time.monotonic() < deadline:
+            logs = list(state.glob("gh-dash-codex-*/*.log"))
+            if len(logs) == 3 and all("HERDR_SOCKET_PATH" in file.read_text() for file in logs):
+                break
+            time.sleep(0.02)
+        self.assertEqual(len(logs), 3)
+        for file in logs:
+            self.assertNotIn("chmod", file.read_text())
+            self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
+        # The backends protect their state, lock, intent, and review-context directories.
+        self.advance_default_branch(git, "Current default branch")
+        route = self.issue_environment(repo, git, cwd=repo)
+        self.assert_success(self.issue_helper(**route))
+        self.assert_success(self.issue_helper("prepare", **route))
+        pr_repo, pr_git = self.source_repo(base=self.root / "pr")
+        self.assert_success(self.run_pr_review(pr_repo, self.pr_environment(pr_repo, pr_git)))
+        _, context = self.pr_review_paths()
+        for path in (state / "gh-dash-codex-issue", state / "gh-dash-codex-issue/locks",
+                     state / "gh-dash-codex-issue/intents", state / "gh-dash-codex-pr-review",
+                     state / "gh-dash-codex-pr-review/locks", context.parent, context):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700, path)
+
     def test_issue_starts_at_captured_commit_and_reuses_idle_agent(self):
         self.install()
         shutil.rmtree(self.bundle)
