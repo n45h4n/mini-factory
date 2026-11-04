@@ -376,8 +376,8 @@ HTTPS remedy. Outside Herdr, or when the runtime context fails first, it reports
 Git transport as not checked. With default SSH it requires pre-established host
 trust; it does not accept host keys or create them as a side effect. A custom
 `GIT_SSH`, `GIT_SSH_COMMAND`, or Git `core.sshCommand` needs manual transport
-verification; doctor skips executing it and reports pending. Doctor never
-changes remotes, URL rewriting, or the fetch protocol.
+verification; doctor skips executing it and fails with Git transport not
+checked. Doctor never changes remotes, URL rewriting, or the fetch protocol.
 
 ## What the workflows do
 
