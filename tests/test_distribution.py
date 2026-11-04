@@ -210,6 +210,23 @@ elif name == "gum":
         if os.environ.get("MOCK_GUM") == "broken" and not (root / "gum-repaired").exists():
             fail("gum: cannot execute")
         print("gum version 0.17.0 (test)")
+    elif args[:1] == ["confirm"] and "MOCK_GUM_ANSWERS" not in os.environ:
+        # Setup and update confirmations read the key typed at the terminal, as native Gum does.
+        if not os.isatty(0):
+            fail("gum confirm: no terminal")
+        print(args[-1], file=sys.stderr, flush=True)  # rendered on the terminal, as native Gum does
+        typed = os.read(0, 1024)
+        if not typed:
+            sys.exit(1)
+        key = typed.decode().strip()
+        if key == "<cancel>":
+            sys.exit(130)  # ctrl+c
+        if key == "":
+            # Enter takes the default, which native Gum makes Yes unless --default=false.
+            sys.exit(1 if "--default=false" in args else 0)
+        if key not in ("y", "Y", "n", "N"):
+            fail("unexpected gum confirm keystroke: " + key)
+        sys.exit(0 if key in ("y", "Y") else 1)
     elif args[:1] in (["choose"], ["input"], ["confirm"]):
         answers_path = pathlib.Path(os.environ["MOCK_GUM_ANSWERS"])
         answers = json.loads(answers_path.read_text())
@@ -739,6 +756,9 @@ class DistributionTests(unittest.TestCase):
     def npm_changes(self):
         """npm invocations other than read-only version and global-prefix queries."""
         return [call for call in self.calls("npm") if call["args"] not in (["--version"], ["prefix", "-g"])]
+
+    def gum_confirms(self):
+        return [call["args"] for call in self.calls("gum") if call["args"][:1] == ["confirm"]]
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -3178,6 +3198,94 @@ os.execv(executable, [executable, *args])
         self.assertEqual(actions[-1], ["apt-get", "install", "-y", "--reinstall", "--no-install-recommends", "gum"])
         self.assert_no_actions(allow_onboarding=True)
 
+    def test_setup_confirms_with_gum_defaulting_to_no_and_never_assumes_consent(self):
+        setup = [str(self.bundle / "scripts/setup.sh")]
+        (self.mock / "codex").unlink()
+        # Enter takes Gum's default, No; n declines too. Only the pending installer is reported.
+        for keys in (b"\n", b"n\n"):
+            with self.subTest(keys=keys):
+                self.log.write_text("")
+                result = self.run_in_terminal(setup, self.env, keys)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Declined; existing configuration was preserved.", result.stdout)
+                self.assertIn("codex installation pending", result.stdout)
+                self.assertEqual(self.gum_confirms(), [["confirm", "--default=false", "Proceed?"]])
+                self.assertNotIn("[y/N]", result.stdout)
+                self.assertFalse(self.calls("curl"))
+        # Cancelling Gum (ctrl+c) stops setup without the change.
+        self.log.write_text("")
+        result = self.run_in_terminal(setup, self.env, b"<cancel>\n")
+        self.assertEqual(result.returncode, 130, result.stdout)
+        self.assertIn("Cancelled; setup stopped without this change.", result.stdout)
+        self.assertFalse(self.calls("curl"))
+        self.assertFalse(self.installed.exists())
+        # Without a terminal, Gum is never asked and nothing is approved.
+        self.log.write_text("")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Consent pending: rerun make setup in an interactive terminal. No approval was assumed.",
+                      result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.calls("curl"))
+        # Yes runs the installer; every confirmation used Gum.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertTrue((self.wrapper.parent / "codex").is_file())
+        self.assertIn(["confirm", "--default=false", "Proceed?"], self.gum_confirms())
+        self.assertNotIn("[y/N]", result.stdout)
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_missing_or_broken_gum_is_bootstrapped_with_a_plain_prompt_that_assumes_nothing(self):
+        setup = [str(self.bundle / "scripts/setup.sh")]
+        (self.mock / "gum").unlink()
+        (self.mock / "codex").unlink()
+        # EOF, Enter, or n at the plain bootstrap prompt installs nothing.
+        for keys in (b"\x04", b"\n", b"n\n"):
+            with self.subTest(keys=keys):
+                self.log.write_text("")
+                result = self.run_in_terminal(setup, self.env, keys)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("brew install gum", result.stdout)
+                self.assertIn("Proceed? [y/N]", result.stdout)
+                self.assertIn("dependencies pending: gum", result.stdout)
+                self.assertFalse([c for c in self.calls("brew") if "install" in c["args"]])
+                self.assertFalse(self.calls("curl"))
+        # A broken Gum cannot ask either: declining its repair changes nothing and asks Gum nothing.
+        self.log.write_text("")
+        (self.mock / "gum").symlink_to("mock-cli")
+        result = self.run_in_terminal(setup, dict(self.env, MOCK_GUM="broken", MOCK_BREW_LISTED="gum"), b"n\n")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("brew reinstall gum", result.stdout)
+        self.assertFalse([c for c in self.calls("brew") if "reinstall" in c["args"]])
+        self.assertFalse(self.gum_confirms())
+        (self.mock / "gum").unlink()
+        # Only Gum's own installation uses the plain prompt; the next confirmation (Codex's installer) uses Gum.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertEqual(result.stdout.count("Proceed? [y/N]"), 1, result.stdout)
+        self.assertIn(["install", "gum"], [c["args"] for c in self.calls("brew")])
+        self.assertIn(["confirm", "--default=false", "Proceed?"], self.gum_confirms())
+        self.assertTrue((self.wrapper.parent / "codex").is_file())
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_installs_gum_before_github_cli_so_later_confirmations_use_it(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        (self.mock / "gum").unlink()
+        (self.mock / "gh").unlink()
+        result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64", MOCK_APT_GUM="archive")
+        self.assert_success(result)
+        actions = [c["args"] for c in self.calls("sudo")]
+        self.assertLess(actions.index(["apt-get", "install", "-y", "--no-install-recommends", "gum"]),
+                        actions.index(["apt-get", "install", "-y", "--no-install-recommends", "gh"]))
+        # Gum's own installation is the last plain prompt; GitHub CLI's installation is confirmed with Gum.
+        after_gum = result.stdout[result.stdout.index("Gum provides"):]
+        self.assertEqual(after_gum.count("Proceed? [y/N]"), 1, result.stdout)
+        self.assertIn(["confirm", "--default=false", "Proceed?"], self.gum_confirms())
+        self.assert_no_actions()
+
 
     # nm-config: the No-Mistakes global config editor for the clone file linked from NM_HOME.
 
@@ -4412,6 +4520,138 @@ os.execv(executable, [executable, *args])
         self.assertIn("Updater completed (updated or already current): gh-dash gum", result.stdout)
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["upgrade"], ["install"])])
         self.assert_no_actions()
+
+    def test_update_confirms_with_gum_defaulting_to_no_and_cancel_or_unrunnable_gum_changes_nothing(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr")
+        upgrades = lambda: ([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]]
+                            + self.native_updates("herdr"))
+        # Prompt order: gh-dash, herdr (the mock GitHub CLI and Gum are not brew- or apt-owned). Enter takes No.
+        self.log.write_text("")
+        result = self.interactive_update(["", ""])
+        self.assert_success(result)
+        self.assertEqual(self.gum_confirms(), [
+            ["confirm", "--default=false", "Run " + command + " now? It decides itself whether a newer release exists."]
+            for command in ("gh extension upgrade dash", "herdr update")])
+        self.assertIn("Declined (left unchanged): gh-dash herdr", result.stdout)
+        self.assertNotIn("[y/N]", result.stdout)
+        self.assertFalse(upgrades())
+        # Cancelling Gum (ctrl+c) stops make update before any upgrade or setup rerun.
+        self.log.write_text("")
+        result = self.interactive_update(["<cancel>"])
+        self.assertEqual(result.returncode, 130, result.stdout)
+        self.assertIn("Cancelled; gh-dash extension was left unchanged and make update stopped before rerunning setup.",
+                      result.stdout)
+        self.assertNotIn("== Refreshing the managed runtime", result.stdout)
+        self.assertFalse(upgrades())
+        # A Gum that cannot run asks nothing and approves nothing; setup then offers its repair with a plain prompt.
+        self.log.write_text("")
+        result = self.interactive_update(["n"], MOCK_GUM="broken")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Skipped: Gum cannot run to ask for consent; no approval was assumed.", result.stdout)
+        self.assertIn("Skipped without a runnable Gum (no approval assumed): gh-dash herdr", result.stdout)
+        self.assertIn("dependencies pending: gum", result.stdout)
+        self.assertIn("Runtime: make setup did not pass", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(upgrades())
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["reinstall"], ["upgrade"])])
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_ghd_update_runs_make_update_in_the_recorded_clone_from_any_directory(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        record = self.installed / ".mini-factory-clone"
+        self.assertEqual(record.read_text(), str(self.bundle) + "\n")
+        repo, repo_git = self.source_repo()
+        repo_head = repo_git("rev-parse", "HEAD")
+        elsewhere = self.root / "not a repository"
+        elsewhere.mkdir()
+        upstream = publish("README.md", (self.bundle / "README.md").read_text() + "\nUpstream release note.\n")
+        update = {"MOCK_CLONE_UPDATE": "1"}
+        # From another Git repository: only the recorded clone is fetched, fast-forwarded, and set up.
+        result = self.run_script(self.wrapper, "update", cwd=repo, env=update)
+        self.assert_success(result)
+        self.assertIn("Clone: fast-forwarded main", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertIn("Upstream release note.", (self.installed / "README.md").read_text())
+        self.assertIn("Runtime: make setup passed, including the doctor checks.", result.stdout)
+        self.assertEqual(repo_git("rev-parse", "HEAD"), repo_head)
+        self.assertEqual(repo_git("status", "--porcelain"), "")
+        # In the caller's checkout only ghd's read-only check of the recorded clone runs.
+        self.assertEqual([c["args"] for c in self.calls() if c["cwd"] == str(repo)],
+                         [["-C", str(self.bundle), "rev-parse", "--show-toplevel"]])
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:1] == ["dash"] and "--config" in c["args"]])
+        # Already current: a second run from outside any repository is safe.
+        result = self.run_script(self.wrapper, "update", cwd=elsewhere, env=update)
+        self.assert_success(result)
+        self.assertIn("Clone: already up to date with origin/main", result.stdout)
+        self.assertEqual(git(self.bundle, "rev-parse", "HEAD"), upstream)
+        self.assertEqual(record.read_text(), str(self.bundle) + "\n")
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_ghd_update_refuses_arguments_and_a_missing_moved_or_other_checkout_without_changes(self):
+        git, publish = self.clone_fixture()
+        self.install()
+        record = self.installed / ".mini-factory-clone"
+        repo, _ = self.source_repo()
+        (repo / "subdirectory").mkdir()
+        recovery = "run make setup from your retained mini-factory clone to record it"
+        upstream = publish("README.md", "Upstream rewrite\n")
+        start = git(self.bundle, "rev-parse", "HEAD")
+
+        def refused(message, *args, fetched=False):
+            self.log.write_text("")
+            result = self.run_script(self.wrapper, "update", *args, cwd=repo, env={"MOCK_CLONE_UPDATE": "1"})
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(message, result.stderr)
+            # Only a diverged main is detected after the (read-only) fetch; nothing is ever merged.
+            self.assertEqual(fetched, bool([c for c in self.calls("git") if "fetch" in c["args"]]))
+            self.assertFalse([c for c in self.calls("git") if "merge" in c["args"]])
+            self.assertFalse(self.calls("gh"), "neither gh-dash nor setup ran")
+            return result
+
+        for args in (("now",), ("--force",), ("",)):
+            with self.subTest(args=args):
+                refused("usage: ghd update (no arguments; it runs make update in your retained mini-factory clone)", *args)
+        record.unlink()
+        refused("no recorded mini-factory clone (" + str(record) + "); " + recovery)
+        # The record is data, never shell: a relative path or another checkout is refused, never selected.
+        marker = self.root / "executed"
+        for recorded in ("$(touch " + str(marker) + ")", str(repo), str(repo / "subdirectory")):
+            with self.subTest(recorded=recorded):
+                record.write_text(recorded + "\n")
+                refused(recovery)
+        self.assertFalse(marker.exists())
+        record.write_text(str(self.bundle) + "\n")
+        moved = self.root / "moved clone"
+        self.bundle.rename(moved)
+        refused("the recorded mini-factory clone " + str(self.bundle) + " is missing, moved, or no longer a Git checkout; "
+                + recovery)
+        self.assertEqual(git(moved, "rev-parse", "HEAD"), start)
+        # A failed setup from the moved clone keeps the record; a successful one publishes the new location.
+        worker = moved / "scripts/integrations/gh-dash/gh-dash-codex-issue.sh"
+        content = worker.read_bytes()
+        worker.write_text("#!/usr/bin/env bash\nif\n")
+        self.assertNotEqual(self.run_script(moved / "scripts/setup.sh").returncode, 0)
+        self.assertEqual(record.read_text(), str(self.bundle) + "\n")
+        worker.write_bytes(content)
+        self.assert_success(self.run_in_terminal([str(moved / "scripts/setup.sh")], self.env, b"y\n" * 24))
+        self.assertEqual(record.read_text(), str(moved) + "\n")
+        # The updater's own refusals still apply: another branch, then a diverged main, change nothing.
+        git(moved, "checkout", "-q", "-b", "feature/local")
+        refused("on branch feature/local: make update runs only on main and never switches branches")
+        self.assertEqual(git(moved, "branch", "--show-current"), "feature/local")
+        git(moved, "checkout", "-q", "main")
+        git(moved, "commit", "-q", "--allow-empty", "-m", "Local commit")
+        local = git(moved, "rev-parse", "HEAD")
+        result = refused("have diverged", fetched=True)
+        self.assertIn("Nothing was changed.", result.stderr)
+        self.assertEqual(git(moved, "rev-parse", "HEAD"), local)
+        self.assertNotEqual(local, upstream)
+        self.assert_no_actions(allow_onboarding=True)
 
 
 if __name__ == "__main__":

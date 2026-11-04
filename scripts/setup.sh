@@ -43,18 +43,30 @@ notice() {
 }
 
 consent() {
-	local answer
+	local answer status=0
 	notice "$1"
 	if [ ! -t 0 ] || [ ! -t 1 ]; then
 		notice 'Consent pending: rerun make setup in an interactive terminal. No approval was assumed.'
 		return 1
 	fi
-	printf 'Proceed? [y/N] '
-	IFS= read -r answer || return 1
-	case "$answer" in
-	y | Y | yes | YES) return 0 ;;
-	*) notice 'Declined; existing configuration was preserved.'; return 1 ;;
-	esac
+	if gum_is_suitable; then
+		# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
+		gum confirm --default=false 'Proceed?' || status=$?
+		[ "$status" -ne 0 ] || return 0
+		if [ "$status" -eq 130 ]; then
+			notice 'Cancelled; setup stopped without this change.'
+			exit 130
+		fi
+	else
+		# Bootstrap only: Gum cannot ask before it is installed or repaired.
+		printf 'Proceed? [y/N] '
+		IFS= read -r answer || return 1
+		case "$answer" in
+		y | Y | yes | YES) return 0 ;;
+		esac
+	fi
+	notice 'Declined; existing configuration was preserved.'
+	return 1
 }
 
 cleanup() {
@@ -364,6 +376,8 @@ install_dependencies() {
 				die "dependencies pending: ${packages[*]}"
 			fi
 		fi
+		# Gum first, so the remaining confirmations use it.
+		gum_is_suitable || install_gum_ubuntu
 		if ! gh_is_suitable; then
 			command -v sudo >/dev/null 2>&1 || die 'sudo is required for the official GitHub CLI apt repository'
 			if consent 'Install GitHub CLI from its official apt repository. This writes /etc/apt/keyrings/githubcli-archive-keyring.gpg and /etc/apt/sources.list.d/github-cli.list, then runs sudo apt-get update and sudo apt-get install gh.'; then
@@ -372,7 +386,6 @@ install_dependencies() {
 				die 'GitHub CLI installation pending'
 			fi
 		fi
-		gum_is_suitable || install_gum_ubuntu
 	fi
 	python_is_suitable || die 'python3 still resolves to a version below 3.9; fix PATH to use the installed Python and rerun'
 	git_is_suitable || die 'git must be version 2.29 or later; fix PATH to the suitable installation and rerun'
@@ -537,6 +550,8 @@ install_bundle() {
 	done
 	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
+	# ghd update reads this clone path as data; it is published (or rolled back) with the runtime.
+	printf '%s\n' "$bundle" >"$stage/.mini-factory-clone"
 	"$stage/scripts/doctor.sh" --bundle "$stage" --integrity-only || die 'replacement bundle failed validation; existing installation preserved'
 	launcher_stage="$(mktemp "$bin_directory/.mini-factory-launcher.XXXXXX")"
 	printf -v quoted '%q' "$runtime/bin/ghd"

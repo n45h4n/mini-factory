@@ -20,6 +20,27 @@ while [ -L "$launcher" ]; do
 	esac
 done
 bundle="$(cd -P "$(dirname "$launcher")/.." && pwd -P)" || die 'unable to resolve installed bundle'
+
+# ghd update runs make update in the retained clone that setup recorded (read as data), from any directory.
+if [ "${1-}" = update ]; then
+	[ "$#" -eq 1 ] || die 'usage: ghd update (no arguments; it runs make update in your retained mini-factory clone)'
+	recovery='run make setup from your retained mini-factory clone to record it'
+	record="$bundle/.mini-factory-clone"
+	[ -f "$record" ] && [ ! -L "$record" ] || die "no recorded mini-factory clone ($record); $recovery"
+	clone="$(cat -- "$record")" || die "unable to read $record; $recovery"
+	case "$clone" in
+		/*) ;;
+		*) die "the recorded mini-factory clone is not an absolute path ($record); $recovery" ;;
+	esac
+	if ! top="$(git -C "$clone" rev-parse --show-toplevel 2>/dev/null)" ||
+		[ "$(cd -P "$top" && pwd -P)" != "$clone" ] ||
+		[ ! -f "$clone/Makefile" ] || [ ! -x "$clone/scripts/update.sh" ]; then
+		die "the recorded mini-factory clone $clone is missing, moved, or no longer a Git checkout; $recovery"
+	fi
+	command -v make >/dev/null 2>&1 || die 'make is required; run make setup from your retained mini-factory clone'
+	exec make --no-print-directory -C "$clone" update
+fi
+
 [ -r "$bundle/gh-dash/config.yml" ] || die "bundled configuration is missing: $bundle/gh-dash/config.yml"
 
 # Pin both the worker root and config even when the caller has personal defaults.

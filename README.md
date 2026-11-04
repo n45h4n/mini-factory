@@ -20,7 +20,8 @@ new install. **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
 [No-Mistakes](#no-mistakes-configuration-and-unattended-runs); edit it with
 [`nm-config`](#no-mistakes-global-defaults-nm-config)). Update later with
-`make update` from this clone (see [Updating](#updating)).
+`ghd update` from any directory, or `make update` from this clone (see
+[Updating](#updating)).
 
 Complete the native login/integration steps offered by setup. If setup reports a
 PATH action, run `export PATH="$HOME/.local/bin:$PATH"` in your current shell.
@@ -114,7 +115,8 @@ sudo apt-get install --no-install-recommends git make ca-certificates
 These are unavoidable prerequisites for cloning and running `make setup`.
 Setup offers apt installation for missing tools and the
 [official GitHub CLI apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
-when GitHub CLI needs installation. Gum (the `mf-config`/`nm-config` editor) comes from your
+when GitHub CLI needs installation. Gum (setup's confirmation prompt and the
+`mf-config`/`nm-config` editor; offered before GitHub CLI) comes from your
 configured Ubuntu archive when it offers a `gum` package (newer releases carry it
 in universe); otherwise setup offers
 [Charm's official apt repository](https://github.com/charmbracelet/gum#installation),
@@ -188,7 +190,11 @@ repair/update through their own installer; setup does not silently upgrade
 unrelated software.
 
 Every package install, privileged operation, login, and configuration change
-requires explicit consent. With no interactive terminal, setup reports the
+requires explicit consent, asked with a Gum confirmation (`gum confirm`, with No
+as the default; ctrl+c stops setup). Gum cannot ask before it exists, so its own
+installation or repair, together with any missing prerequisites offered in the
+same step, uses a plain `Proceed? [y/N]` prompt; only `y` or `yes` approves.
+With no interactive terminal, setup reports the
 remaining action and exits unsuccessfully instead of waiting or assuming yes.
 A pending login/integration/PATH action can leave a valid runtime installed;
 rerunning setup completes onboarding. It is safe to run outside a target Git
@@ -682,9 +688,18 @@ never bypasses CI or marks checks passed.
 ## Updating
 
 ```sh
+ghd update                 # from any directory, or equivalently:
 cd /path/to/mini-factory   # your retained clone, with main checked out
 make update
 ```
+
+`ghd update` runs exactly `make update` in the retained clone that setup
+recorded, never in the directory or repository you run it from, and takes no
+arguments. The same rules below apply. If that clone is missing, was moved, or
+is no longer a Git checkout, it stops: run `make setup` from your retained
+clone to record its current location. It never clones, searches, or picks
+another repository. **Existing installations** get `ghd update` only after
+running `make update` (or `make setup`) once from their clone.
 
 `make update` runs only from the retained clone, on `main` with an upstream
 configured. It refuses the installed runtime copy, a detached HEAD, or another
@@ -699,7 +714,7 @@ It then:
    one of them (or adds a file where you have an untracked one), or `main` has
    diverged, it stops before changing anything and prints the manual steps. It
    never resets, stashes, force-pulls, or discards configuration.
-2. **Offers optional upgrades**, each with its own `[y/N]` consent, for every
+2. **Offers optional upgrades**, each with its own Gum confirmation (No by default), for every
    installed tool Mini-Factory provisions (including all three agent CLIs and
    `acpx`, whichever roles use them), through the mechanism that matches how
    each one was installed (table below).
@@ -734,9 +749,12 @@ checks.
   refuses while pipeline runs are active; those runs are left alone, so rerun
   `make update` after they finish. Manage beta releases yourself, outside
   `make update`.
-- **Consent.** Declining keeps the installed version. Without an interactive
-  terminal (for example `ssh host 'cd mini-factory && make update'`), upgrade
-  prompts are skipped with the commands to run yourself; no approval is assumed.
+- **Consent.** Declining (`n`, Esc, or Enter on the default No) keeps the
+  installed version; ctrl+c stops `make update` before it reruns setup. Without
+  an interactive terminal (for example `ssh host 'cd mini-factory && make update'`),
+  or when Gum cannot run, upgrade prompts are skipped with the commands to run
+  yourself; no approval is assumed, and the setup run that follows offers to
+  repair Gum.
   A failed updater makes `make update` exit nonzero. It may already have changed
   its tool, so nothing is rolled back; the setup and doctor output shows whether
   the installation still works. A refused fast-forward or a failed setup also
@@ -748,10 +766,12 @@ checks.
 
 Setup copies the runtime into
 `${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/`, with a
-`.mini-factory-install` ownership marker, and installs the managed wrapper
+`.mini-factory-install` ownership marker and a `.mini-factory-clone` record of
+the clone's path (read as data by `ghd update`), and installs the managed wrapper
 `~/.local/bin/ghd`, plus the optional `~/.local/bin/mf-config` and `nm-config` launchers described
 above. The dashboard runtime works on its own, but the clone must
-stay where it is for the No-Mistakes configuration link above; run setup from
+stay where it is for the No-Mistakes configuration link above and for
+`ghd update`; run setup from
 the clone, never from the runtime copy. Updates replace only this project's
 marked runtime and exact managed wrapper after validating the staged bundle. An
 unrelated installation directory or `ghd` command is refused. Do not store
@@ -818,7 +838,8 @@ Preparation keeps its last fetched default-branch commit under
 relevant log path. Herdr's default-session logs are under
 `~/.config/herdr/`; named-session logs live under its `sessions/NAME/` directory.
 
-To update, run `make update` from your retained clone (see [Updating](#updating)).
+To update, run `ghd update` from any directory, or `make update` from your
+retained clone (see [Updating](#updating)).
 
 `make help` lists the five standalone targets. `make test` uses disposable homes
 and Git repositories with mocked external tools; it needs Bash, Git, Make, jq,
@@ -844,8 +865,9 @@ shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/updat
 ```
 
 Commit and push reviewed changes to this repository. Users update with
-`make update` from their clone (a fast-forward, consented tool upgrades, then
-`make setup`). There is no background updater or automatic cross-repository sync.
+`ghd update` from any directory, or `make update` from their clone (a
+fast-forward, consented tool upgrades, then `make setup`). There is no
+background updater or automatic cross-repository sync.
 
 Mini-Factory's own CI, `.github/workflows/ci.yml`, runs `make test` on an Ubuntu
 runner for every pull request and push to `main`, with read-only repository
@@ -907,4 +929,5 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    comment, review, or draft/ready change, and the review worktree stays clean.
 6. From the clone, `make update` fast-forwards (or reports already up to date),
    offers only the native upgrades that match each tool's installation, and
-   ends with setup's doctor report.
+   ends with setup's doctor report. `ghd update` from another directory does
+   the same for the recorded clone.
