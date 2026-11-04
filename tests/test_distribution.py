@@ -250,18 +250,24 @@ elif name == "gum":
 elif name == "apt-cache":
     archive = os.environ.get("MOCK_APT_GUM") == "archive"
     archive_version = os.environ.get("MOCK_APT_GUM_VERSION", "0.17.0-1")
+    charm = (root / "charm-repository").exists()
     installed = (root / "gum").exists()
     # Newer Ubuntu releases carry gum in universe; older archives list no repository version.
     if args == ["madison", "gum"]:
         if archive:
             print("       gum | " + archive_version + " | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
+        if charm:
+            print("       gum | 0.17.0-1 | https://repo.charm.sh/apt * * Packages")
     elif args == ["madison", "nodejs"]:
         for version in os.environ.get("MOCK_APT_NODE", "18.19.1+dfsg-6ubuntu5").split():
             print("    nodejs | " + version + " | http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages")
     elif args == ["policy", "gum"]:
         # Like APT, policy's Candidate may be an installed-only version whose repository was removed.
+        candidate = archive_version if archive else "0.17.0-1" if installed else "(none)"
+        if charm and os.environ.get("MOCK_APT_GUM_PINNED") != "1":
+            candidate = "0.17.0-1"
         print("gum:\n  Installed: " + ("0.17.0-1" if installed else "(none)") + "\n  Candidate: "
-              + (archive_version if archive else "0.17.0-1" if installed else "(none)") + "\n  Version table:")
+              + candidate + "\n  Version table:")
     else:
         fail()
 elif name == "acpx":
@@ -555,6 +561,8 @@ elif name in ("brew", "sudo", "apt-get"):
     elif "install" in args or "upgrade" in args or "update" in args or "reinstall" in args:
         if os.environ.get("MOCK_INSTALL_FAIL"):
             fail("simulated interrupted package installation")
+        if name == "sudo" and args[-1:] == ["/etc/apt/sources.list.d/charm.list"]:
+            (root / "charm-repository").touch()
         if "gum" in args:
             (root / "gum-repaired").write_text("yes")
         provided = {"gh": ("gh",), "gum": ("gum",), "node": ("node", "npm"), "nodejs": ("node",), "npm": ("npm",)}
@@ -3212,6 +3220,7 @@ os.execv(executable, [executable, *args])
             self.skipTest("Ubuntu detection reads the native os-release file")
         for installed in (False, True):
             with self.subTest(installed=installed):
+                (self.mock / "charm-repository").unlink(missing_ok=True)
                 (self.mock / "gum").unlink(missing_ok=True)
                 (self.mock / "gum-repaired").unlink(missing_ok=True)
                 if installed:
@@ -3232,6 +3241,32 @@ os.execv(executable, [executable, *args])
                 self.assertEqual(actions[-1], ["apt-get", "install", "-y"]
                                  + (["--reinstall"] if installed else []) + ["--no-install-recommends", "gum"])
                 self.assert_no_actions(allow_onboarding=True)
+
+    def test_mocked_ubuntu_pinned_old_gum_stops_before_install_or_reinstall(self):
+        if not Path("/etc/os-release").exists() or not re.search(r'^ID=["\']?ubuntu', Path("/etc/os-release").read_text(), re.M):
+            self.skipTest("Ubuntu detection reads the native os-release file")
+        for installed in (False, True):
+            with self.subTest(installed=installed):
+                (self.mock / "charm-repository").unlink(missing_ok=True)
+                (self.mock / "gum").unlink(missing_ok=True)
+                if installed:
+                    (self.mock / "gum").symlink_to("mock-cli")
+                self.log.write_text("")
+                result = self.interactive_setup("y", MOCK_OS="Linux", MOCK_ARCH="x86_64",
+                                                MOCK_GUM_VERSION="0.14.4", MOCK_APT_GUM="archive",
+                                                MOCK_APT_GUM_VERSION="0.14.4-1", MOCK_APT_GUM_PINNED="1")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("APT still selects an unavailable or unsuitable Gum candidate after adding Charm",
+                              result.stdout)
+                self.assertIn("check apt-cache policy gum and your APT preferences, then rerun make setup",
+                              result.stdout)
+                actions = [c["args"] for c in self.calls("sudo")]
+                self.assertTrue((self.mock / "charm-repository").exists())
+                self.assertIn(["apt-get", "update"], actions)
+                self.assertFalse([args for args in actions if args[:2] == ["apt-get", "install"]])
+                self.assertFalse((self.mock / "gum-repaired").exists())
+                self.assertFalse(self.installed.exists())
+                self.assert_no_actions()
 
     def test_setup_confirms_with_gum_defaulting_to_no_and_never_assumes_consent(self):
         setup = [str(self.bundle / "scripts/setup.sh")]

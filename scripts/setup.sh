@@ -495,6 +495,8 @@ install_gum_ubuntu() {
 	sudo install -m 644 "$scratch/charm.list" /etc/apt/sources.list.d/charm.list
 	rm -rf -- "$scratch"
 	sudo apt-get update
+	gum_in_ubuntu_archive ||
+		die 'APT still selects an unavailable or unsuitable Gum candidate after adding Charm; Gum 0.15 or later is required; check apt-cache policy gum and your APT preferences, then rerun make setup'
 	sudo "${install_arguments[@]}"
 }
 
