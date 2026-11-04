@@ -353,6 +353,12 @@ run_plan() {
 	esac
 }
 
+# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
+gum_is_suitable() {
+	command -v gum >/dev/null 2>&1 || return 1
+	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+}
+
 offer_upgrade() {
 	local tool="$1" label="$2" before after status=0
 	plan_upgrade "$tool"
@@ -363,18 +369,18 @@ offer_upgrade() {
 	fi
 	before="$(tool_version "$tool")"
 	notice "$label (${before:-version unknown}): $plan_detail."
-	if [ ! -t 0 ] || [ ! -t 1 ]; then
+	if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
 		notice "  Skipped without an interactive terminal; no approval was assumed. Run $plan_text yourself, or rerun make update in a terminal."
 		skipped+=("$tool")
 		return 0
 	fi
-	if ! gum --version >/dev/null 2>&1; then
-		notice "  Skipped: Gum cannot run to ask for consent; no approval was assumed. make setup below offers to repair Gum; then rerun make update, or run $plan_text yourself."
+	if ! gum_is_suitable; then
+		notice "  Skipped: Gum 0.15 or later is required to ask for consent; no approval was assumed. make setup below offers to repair Gum; then rerun make update, or run $plan_text yourself."
 		unasked+=("$tool")
 		return 0
 	fi
 	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-	gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
+	GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
 	if [ "$status" -eq 130 ]; then
 		notice "  Cancelled; $label was left unchanged and make update stopped before rerunning setup."
 		exit 130

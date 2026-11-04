@@ -45,13 +45,13 @@ notice() {
 consent() {
 	local answer status=0
 	notice "$1"
-	if [ ! -t 0 ] || [ ! -t 1 ]; then
+	if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
 		notice 'Consent pending: rerun make setup in an interactive terminal. No approval was assumed.'
 		return 1
 	fi
 	if gum_is_suitable; then
 		# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-		gum confirm --default=false 'Proceed?' || status=$?
+		GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false 'Proceed?' || status=$?
 		[ "$status" -ne 0 ] || return 0
 		if [ "$status" -eq 130 ]; then
 			notice 'Cancelled; setup stopped without this change.'
@@ -308,9 +308,10 @@ git_is_suitable() {
 	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
-# Gum provides the mf-config and nm-config editors; no version floor, only a runnable command.
+# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
 gum_is_suitable() {
-	command -v gum >/dev/null 2>&1 && gum --version >/dev/null 2>&1
+	command -v gum >/dev/null 2>&1 || return 1
+	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 gh_is_suitable() {
@@ -390,7 +391,7 @@ install_dependencies() {
 	python_is_suitable || die 'python3 still resolves to a version below 3.9; fix PATH to use the installed Python and rerun'
 	git_is_suitable || die 'git must be version 2.29 or later; fix PATH to the suitable installation and rerun'
 	gh_is_suitable || die 'gh must be version 2.47 or later; fix PATH to the suitable installation and rerun'
-	gum_is_suitable || die "gum still cannot run; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
+	gum_is_suitable || die "gum 0.15 or later is required; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
 	select_role_agents
 	# All three agent CLIs are baseline, so any role can switch later without another install;
 	# only the agents a role or No-Mistakes duty uses need login.

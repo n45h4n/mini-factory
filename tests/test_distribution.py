@@ -40,7 +40,8 @@ args = sys.argv[1:]
 root = pathlib.Path(os.environ["MOCK_BIN"])
 entry = {"tool": name, "args": args, "cwd": os.getcwd(),
          "env": {k: v for k, v in os.environ.items()
-                 if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND")}}
+                 if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND",
+                                                            "GUM_CONFIRM_TIMEOUT")}}
 with open(os.environ["MOCK_LOG"], "a") as stream:
     stream.write(json.dumps(entry) + "\n")
 def fail(message="forbidden external action"):
@@ -206,10 +207,11 @@ elif name == "cursor-agent":
     else:
         fail()
 elif name == "gum":
+    version = "0.17.0" if (root / "gum-repaired").exists() else os.environ.get("MOCK_GUM_VERSION", "0.17.0")
     if args == ["--version"]:
         if os.environ.get("MOCK_GUM") == "broken" and not (root / "gum-repaired").exists():
             fail("gum: cannot execute")
-        print("gum version 0.17.0 (test)")
+        print("gum version " + version + " (test)")
     elif args[:1] == ["confirm"] and "MOCK_GUM_ANSWERS" not in os.environ:
         # Setup and update confirmations read the key typed at the terminal, as native Gum does.
         if not os.isatty(0):
@@ -220,7 +222,11 @@ elif name == "gum":
             sys.exit(1)
         key = typed.decode().strip()
         if key == "<cancel>":
-            sys.exit(130)  # ctrl+c
+            # Older Gum treats Ctrl+C as No, so callers must check compatibility before asking.
+            sys.exit(1 if tuple(map(int, version.lstrip("v").split("."))) < (0, 15, 0) else 130)
+        if key == "<timeout>":
+            # Model moving to Yes without submitting: an inherited timeout can accept that selection.
+            sys.exit(1 if os.environ.get("GUM_CONFIRM_TIMEOUT") == "0" else 0)
         if key == "":
             # Enter takes the default, which native Gum makes Yes unless --default=false.
             sys.exit(1 if "--default=false" in args else 0)
@@ -713,10 +719,10 @@ class DistributionTests(unittest.TestCase):
         return self.run_in_terminal([str(self.bundle / "scripts/setup.sh")], dict(self.env, **overrides),
                                     ((answer + "\n") * 24).encode())
 
-    def run_in_terminal(self, argv, env, keystrokes=b""):
+    def run_in_terminal(self, argv, env, keystrokes=b"", *, stderr=None):
         master, slave = pty.openpty()
         process = subprocess.Popen(argv, cwd=self.root, env=env, stdin=slave,
-                                   stdout=slave, stderr=slave, close_fds=True)
+                                   stdout=slave, stderr=slave if stderr is None else stderr, close_fds=True)
         os.close(slave)
         output = bytearray()
         deadline = time.monotonic() + 30
@@ -3236,6 +3242,51 @@ os.execv(executable, [executable, *args])
         self.assertNotIn("[y/N]", result.stdout)
         self.assert_no_actions(allow_onboarding=True)
 
+    def test_setup_requires_a_visible_prompt_and_disables_inherited_gum_timeouts(self):
+        setup = [str(self.bundle / "scripts/setup.sh")]
+        (self.mock / "codex").unlink()
+        result = self.run_in_terminal(setup, self.env, b"y\n", stderr=subprocess.DEVNULL)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Consent pending", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.calls("curl"))
+        self.log.write_text("")
+        result = self.run_in_terminal(setup, dict(self.env, GUM_CONFIRM_TIMEOUT="1ms"), b"<timeout>\n")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("codex installation pending", result.stdout)
+        confirms = [call for call in self.calls("gum") if call["args"][:1] == ["confirm"]]
+        self.assertEqual(len(confirms), 1)
+        self.assertEqual(confirms[0]["env"]["GUM_CONFIRM_TIMEOUT"], "0")
+        self.assertFalse(self.calls("curl"))
+
+    def test_setup_repairs_old_gum_before_using_it_for_confirmations(self):
+        result = self.interactive_setup("n", MOCK_GUM_VERSION="0.5.0", MOCK_BREW_LISTED="gum")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("brew reinstall gum", result.stdout)
+        self.assertIn("Proceed? [y/N]", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] == ["reinstall"]])
+        (self.mock / "codex").unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_GUM_VERSION="0.5.0", MOCK_BREW_LISTED="gum")
+        self.assert_success(result)
+        self.assertEqual(result.stdout.count("Proceed? [y/N]"), 1, result.stdout)
+        self.assertIn(["reinstall", "gum"], [c["args"] for c in self.calls("brew")])
+        self.assertTrue(self.gum_confirms())
+        self.assert_no_actions(allow_onboarding=True)
+
+    def test_setup_compatible_gum_cancellation_stops_before_installation(self):
+        (self.mock / "codex").unlink()
+        for version in ("0.15.0", "v0.15.0", "2.0.2"):
+            with self.subTest(version=version):
+                self.log.write_text("")
+                result = self.run_in_terminal([str(self.bundle / "scripts/setup.sh")],
+                                              dict(self.env, MOCK_GUM_VERSION=version), b"<cancel>\n")
+                self.assertEqual(result.returncode, 130, result.stdout)
+                self.assertEqual(len(self.gum_confirms()), 1)
+                self.assertFalse(self.calls("curl"))
+                self.assertNotIn("[y/N]", result.stdout)
+
     def test_missing_or_broken_gum_is_bootstrapped_with_a_plain_prompt_that_assumes_nothing(self):
         setup = [str(self.bundle / "scripts/setup.sh")]
         (self.mock / "gum").unlink()
@@ -4549,13 +4600,63 @@ os.execv(executable, [executable, *args])
         self.log.write_text("")
         result = self.interactive_update(["n"], MOCK_GUM="broken")
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("Skipped: Gum cannot run to ask for consent; no approval was assumed.", result.stdout)
+        self.assertIn("Skipped: Gum 0.15 or later is required to ask for consent; no approval was assumed.", result.stdout)
         self.assertIn("Skipped without a runnable Gum (no approval assumed): gh-dash herdr", result.stdout)
         self.assertIn("dependencies pending: gum", result.stdout)
         self.assertIn("Runtime: make setup did not pass", result.stdout)
         self.assertFalse(self.gum_confirms())
         self.assertFalse(upgrades())
         self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["reinstall"], ["upgrade"])])
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_update_requires_a_visible_prompt_and_disables_inherited_gum_timeouts(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr")
+        self.log.write_text("")
+        result = self.run_in_terminal([str(self.bundle / "scripts/update.sh")],
+                                      dict(self.env, MOCK_CLONE_UPDATE="1"), b"y\n" * 24,
+                                      stderr=subprocess.DEVNULL)
+        self.assert_success(result)
+        self.assertIn("Skipped without a terminal: gh-dash herdr", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.native_updates("herdr"))
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.log.write_text("")
+        result = self.interactive_update(["<timeout>", "n"], GUM_CONFIRM_TIMEOUT="1ms")
+        self.assert_success(result)
+        self.assertIn("Declined (left unchanged): gh-dash herdr", result.stdout)
+        confirms = [call for call in self.calls("gum") if call["args"][:1] == ["confirm"]]
+        self.assertEqual(len(confirms), 2)
+        self.assertTrue(all(call["env"]["GUM_CONFIRM_TIMEOUT"] == "0" for call in confirms))
+        self.assertFalse(self.native_updates("herdr"))
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assert_safe_clone_actions()
+        self.assert_no_actions()
+
+    def test_update_skips_old_gum_and_compatible_gum_cancellation_stops_before_setup(self):
+        self.clone_fixture()
+        self.install()
+        self.native_layouts("herdr")
+        self.log.write_text("")
+        result = self.interactive_update(["n"], MOCK_GUM_VERSION="0.5.0", MOCK_BREW_LISTED="gum")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Gum 0.15 or later is required to ask for consent", result.stdout)
+        self.assertIn("Proceed? [y/N]", result.stdout)
+        self.assertFalse(self.gum_confirms())
+        self.assertFalse(self.native_updates("herdr"))
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assertFalse([c for c in self.calls("brew") if c["args"][:1] in (["install"], ["reinstall"], ["upgrade"])])
+        for version in ("0.15.0", "v0.15.0", "2.0.2"):
+            with self.subTest(version=version):
+                self.log.write_text("")
+                result = self.interactive_update(["<cancel>"], MOCK_GUM_VERSION=version)
+                self.assertEqual(result.returncode, 130, result.stdout)
+                self.assertEqual(len(self.gum_confirms()), 1)
+                self.assertNotIn("== Refreshing the managed runtime", result.stdout)
+                self.assertFalse(self.native_updates("herdr"))
+                self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
         self.assert_safe_clone_actions()
         self.assert_no_actions()
 

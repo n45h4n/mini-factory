@@ -133,7 +133,7 @@ default `ctrl+b`, then `q`, and reattach with `herdr --session my-project`.
 ## Installation and authentication
 
 Setup checks tools first and reuses suitable installations. The runtime needs
-Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Gum, Herdr,
+Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Gum 0.15+, Herdr,
 No-Mistakes (its stable `axi run --intent`/`--yes` interface), **all three
 agent CLIs (Codex, Claude Code, and Cursor)**, Node.js 22.13+ with npm, `acpx`,
 and the standard system utilities used by the dispatchers. These are installed
@@ -191,9 +191,11 @@ unrelated software.
 
 Every package install, privileged operation, login, and configuration change
 requires explicit consent, asked with a Gum confirmation (`gum confirm`, with No
-as the default; ctrl+c stops setup). Gum cannot ask before it exists, so its own
-installation or repair, together with any missing prerequisites offered in the
-same step, uses a plain `Proceed? [y/N]` prompt; only `y` or `yes` approves.
+as the default; ctrl+c stops setup). Confirmations require stdin, stdout, and
+stderr to be terminals and disable inherited Gum timeouts. Gum 0.15+ is required
+to distinguish ctrl+c from a decline. Installing or repairing missing, broken,
+or older Gum, together with any missing prerequisites offered in the same step,
+uses a plain `Proceed? [y/N]` prompt; only `y` or `yes` approves.
 With no interactive terminal, setup reports the
 remaining action and exits unsuccessfully instead of waiting or assuming yes.
 A pending login/integration/PATH action can leave a valid runtime installed;
@@ -752,9 +754,9 @@ checks.
 - **Consent.** Declining (`n`, Esc, or Enter on the default No) keeps the
   installed version; ctrl+c stops `make update` before it reruns setup. Without
   an interactive terminal (for example `ssh host 'cd mini-factory && make update'`),
-  or when Gum cannot run, upgrade prompts are skipped with the commands to run
-  yourself; no approval is assumed, and the setup run that follows offers to
-  repair Gum.
+  or when Gum cannot run or is older than 0.15, upgrade prompts are skipped with
+  the commands to run yourself; no approval is assumed, and the setup run that
+  follows offers to repair Gum.
   A failed updater makes `make update` exit nonzero. It may already have changed
   its tool, so nothing is rolled back; the setup and doctor output shows whether
   the installation still works. A refused fast-forward or a failed setup also
