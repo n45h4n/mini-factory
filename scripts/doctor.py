@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -271,28 +272,64 @@ def route_check(kinds):
             raise ValueError()
     except (TypeError, ValueError, KeyError):
         raise ValueError("cannot resolve the target GitHub repository and PR fetch URL")
+    return fetch_url
+
+
+SSH_GUIDE = "https://docs.github.com/en/authentication/connecting-to-github-with-ssh"
+# Choosing HTTPS is the user's deliberate, documented step; doctor only names it.
+HTTPS_CHOICE = ("choose HTTPS deliberately: gh auth setup-git --hostname github.com (skip it when a working credential "
+                "helper already exists; it sets GitHub CLI as the github.com credential helper and can replace a "
+                "previously configured one), then in this target checkout git config url.\"https://github.com/\""
+                ".insteadOf 'git@github.com:' (README: Git transport)")
+
+
+def redacted(url):
+    # An insteadOf rewrite may embed credentials in the URL; never print them.
+    return re.sub(r"^(https?://)[^/]*@", r"\1***@", url, flags=re.I)
+
+
+def transport_check(fetch_url, rerun):
+    """Read-only check of the effective Git transport for the target's GitHub sshUrl from this checkout."""
     # The canonical PR worker requests sshUrl. Git's configured insteadOf rules
     # may route it over HTTPS; inspect that effective URL before requiring SSH.
-    effective_url = output(["git", "ls-remote", "--get-url", fetch_url])
+    effective_url = (output(["git", "ls-remote", "--get-url", fetch_url]) or "").strip()
     if not effective_url:
-        raise ValueError("cannot inspect the PR Git transport")
+        raise ValueError("not checked: cannot inspect the effective Git URL for " + fetch_url + "; rerun " + rerun)
+    shown = redacted(effective_url)
+    origin = "" if effective_url == fetch_url else "; Git insteadOf rewrote GitHub sshUrl " + fetch_url
     environment = os.environ.copy()
     environment["GIT_TERMINAL_PROMPT"] = "0"
     if effective_url.startswith(("git@", "ssh://")):
         if shutil.which("ssh") is None:
-            raise ValueError("PR Git transport requires ssh; install OpenSSH or configure HTTPS rewriting as in README")
+            raise ValueError("not checked: " + shown + " uses SSH, but ssh is missing; install OpenSSH, or "
+                             + HTTPS_CHOICE + "; then rerun " + rerun)
         if ("GIT_SSH_COMMAND" in environment or "GIT_SSH" in environment
                 or output(["git", "config", "--get", "core.sshCommand"])):
-            raise ValueError("custom SSH transport requires manual verification; doctor will not execute a custom command that could change host trust")
+            raise ValueError("not checked: custom SSH transport (GIT_SSH_COMMAND, GIT_SSH, or core.sshCommand) "
+                             "requires manual verification; doctor will not execute a custom command that could "
+                             "change host trust. Verify git ls-remote " + fetch_url + " HEAD yourself in this "
+                             "checkout, or " + HTTPS_CHOICE + "; then rerun " + rerun)
         # Freeze existing host trust during this diagnostic; native SSH can add
         # address/key records even after a strictly authenticated connection.
         environment["GIT_SSH_COMMAND"] = (
             "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
             " -o UpdateHostKeys=no -o CheckHostIP=no"
         )
+        transport = "SSH"
+        remedy = ("to use SSH, add an SSH key to your GitHub account and verify GitHub's host key fingerprint "
+                  "yourself, following " + SSH_GUIDE + " (doctor never accepts host keys); or " + HTTPS_CHOICE)
+    elif effective_url.lower().startswith("https://"):
+        transport = "HTTPS"
+        remedy = ("give Git a credential helper with access to this repository, for example gh auth setup-git "
+                  "--hostname github.com (it sets GitHub CLI as the github.com credential helper and can replace a "
+                  "previously configured one), or remove the insteadOf rewrite to use SSH (README: Git transport)")
+    else:
+        transport = "a rewritten URL"
+        remedy = "fix the Git insteadOf rewrite that produces this URL (README: Git transport)"
     if output(["git", "ls-remote", fetch_url, "HEAD"], environment) is None:
-        raise ValueError("PR Git transport authentication/trust pending; follow README and verify git ls-remote yourself")
-    print("OK: PR Git transport authenticated (read-only ls-remote)")
+        raise ValueError("authentication/trust pending: read-only git ls-remote of " + shown + " failed over "
+                         + transport + " without prompts" + origin + "; " + remedy + "; then rerun " + rerun)
+    print("OK: Git transport authenticated over " + transport + ": " + shown + " (read-only ls-remote" + origin + ")")
 
 
 def main():
@@ -467,21 +504,34 @@ def main():
     setup_pending = bool(failures) and not installation_failed
     print("Authentication/setup: " + ("pending" if setup_pending or installation_failed else "complete"))
 
+    # The installed doctor, run from the target checkout's Herdr pane, is what checks that target.
+    rerun = shlex.quote(str(bundle / "scripts/doctor.sh"))
     if any(os.environ.get(name) for name in (
         "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"
     )):
+        fetch_url = None
         try:
-            route_check(role_kinds)
+            fetch_url = route_check(role_kinds)
             print("OK: inherited Herdr route, compatible server, source repository and agent detection")
         except (OSError, ValueError) as error:
             check(False, "", "runtime context: " + str(error))
+            print("NOTE: Git transport not checked; fix the runtime context above, then rerun " + rerun
+                  + " from the target checkout in its Herdr pane")
+        if fetch_url:
+            try:
+                transport_check(fetch_url, rerun)
+            except (OSError, ValueError) as error:
+                check(False, "", "Git transport " + str(error))
         if not failures:
             print("Runtime: ready to launch from this context")
         else:
             print("Runtime: context checks failed or setup pending")
     else:
-        print("Runtime-context checks not performed: outside Herdr. In a target checkout run herdr, then run ghd in its pane.")
-    print("Git transport authentication is separate from CLI login; see README before the first PR review fetch.")
+        print("Runtime-context checks not performed: outside Herdr. In a target checkout run herdr, then in its "
+              "pane run " + rerun + " before ghd.")
+        print("NOTE: Git transport not checked: only that command, run from the target checkout's Herdr pane, checks "
+              "the target's effective fetch URL and authentication (make doctor in the Mini-Factory clone checks "
+              "only this installation).")
     return int(bool(failures))
 
 

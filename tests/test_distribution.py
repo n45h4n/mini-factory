@@ -12,6 +12,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -541,7 +542,8 @@ elif name in ("brew", "sudo", "apt-get"):
         fail()
 elif name == "git":
     if "ls-remote" in args:
-        if os.environ.get("MOCK_TRANSPORT") == "pending":
+        # Like native Git, --get-url only resolves configured rewrites locally; authentication happens on lookup.
+        if os.environ.get("MOCK_TRANSPORT") == "pending" and "--get-url" not in args:
             fail("mock Git transport authentication failure")
         print(os.environ.get("MOCK_EFFECTIVE_URL", "git@github.com:friend/target.git")
               if "--get-url" in args else "0123456789abcdef0123456789abcdef01234567\tHEAD")
@@ -970,6 +972,66 @@ class DistributionTests(unittest.TestCase):
         self.assertIn(["login", "--device-auth"], [c["args"] for c in self.calls("codex")])
         self.assertIn(["integration", "install", "codex"], [c["args"] for c in self.calls("herdr")])
         self.assert_no_actions(allow_onboarding=True)
+
+    def test_setup_guides_git_transport_without_prompting_for_or_changing_git_credentials(self):
+        (self.home / ".codex").mkdir()
+        gitconfig = self.home / ".gitconfig"
+        # Only the disposable home's Git configuration decides whether a GitHub credential helper exists.
+        isolated = {"GIT_CONFIG_NOSYSTEM": "1", "MOCK_GH_AUTH": "pending"}
+        doctor = subprocess.run(["bash", "-c", 'printf %q "$1"', "quote", str(self.installed / "scripts/doctor.sh")],
+                                capture_output=True, text=True, check=True).stdout
+        follow_up = "No Git credential helper is configured for https://github.com"
+
+        def assert_no_git_credential_change():
+            self.assertFalse([c["args"] for c in self.calls("gh") if c["args"][:2] == ["auth", "setup-git"]])
+            for call in self.calls("git"):
+                if "config" in call["args"]:
+                    self.assertTrue(any(arg.startswith("--get") for arg in call["args"]), call["args"])
+
+        # Declined login: a useful next step, no transport changes, and nothing to verify yet.
+        result = self.interactive_setup("n", **isolated)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: gh auth login --hostname github.com --web", result.stdout)
+        self.assertNotIn(follow_up, result.stdout)
+        self.assertFalse(gitconfig.exists())
+        assert_no_git_credential_change()
+        # Consented login: the native flow owns its HTTPS credential prompt; setup adds no second prompt.
+        self.log.write_text("")
+        result = self.interactive_setup("y", **isolated)
+        self.assert_success(result)
+        self.assertIn(["auth", "login", "--hostname", "github.com", "--web", "--scopes", "project"],
+                      [c["args"] for c in self.calls("gh")])
+        text = " ".join(result.stdout.split())
+        self.assertIn("does not by itself prove Git can fetch your target repository", text)
+        self.assertIn("run " + doctor + " from the target checkout's Herdr pane, staying in that checkout", text)
+        self.assertIn(follow_up, text)
+        self.assertIn("gh auth setup-git --hostname github.com yourself", text)
+        self.assertIn("can replace a helper previously configured for that host", text)
+        self.assertNotRegex(result.stdout, r"setup-git[^\n]*\r?\n?Proceed\?")
+        self.assertIn("run " + doctor + " there to check its Git transport, then run ghd", text)
+        self.assertFalse(gitconfig.exists())
+        assert_no_git_credential_change()
+        # Noninteractive rerun: the same guidance, no prompt, no approval inferred, and no change.
+        self.log.write_text("")
+        result = self.setup(**isolated)
+        self.assert_success(result)
+        self.assertIn(follow_up, result.stdout)
+        self.assertNotIn("Consent pending", result.stdout)
+        self.assertNotIn(["auth", "login", "--hostname", "github.com", "--web"],
+                         [c["args"][:5] for c in self.calls("gh")])
+        self.assertFalse(gitconfig.exists())
+        assert_no_git_credential_change()
+        # An existing HTTPS helper (as native gh auth login or gh auth setup-git writes it) is left alone.
+        existing = '[credential "https://github.com"]\n\thelper = \n\thelper = !/usr/bin/gh auth git-credential\n'
+        gitconfig.write_text(existing)
+        self.log.write_text("")
+        result = self.interactive_setup("y", **isolated)
+        self.assert_success(result)
+        self.assertIn("does not by itself prove Git can fetch", " ".join(result.stdout.split()))
+        self.assertNotIn(follow_up, result.stdout)
+        self.assertEqual(existing, gitconfig.read_text())
+        assert_no_git_credential_change()
+        self.assert_no_actions()
 
     def test_replacement_validation_preserves_working_install(self):
         self.install()
@@ -2011,6 +2073,12 @@ class DistributionTests(unittest.TestCase):
         self.assert_success(result)
         self.assertIn("runtime-context checks not performed", result.stdout.lower())
         self.assertNotIn("ready to launch from this context", result.stdout.lower())
+        # The installation check names the target-context command instead of implying transport was verified.
+        self.assertIn("NOTE: Git transport not checked", result.stdout)
+        self.assertIn("pane run " + shlex.quote(str(self.installed / "scripts/doctor.sh")) + " before ghd",
+                      result.stdout)
+        self.assertIn("make doctor in the Mini-Factory clone checks only this installation", result.stdout)
+        self.assertFalse([c for c in self.calls("git") if "ls-remote" in c["args"]])
         self.assert_no_actions()
 
     def test_doctor_without_installation_reports_incomplete_outside_herdr(self):
@@ -2049,17 +2117,74 @@ class DistributionTests(unittest.TestCase):
         result = self.run_script(self.installed / "scripts/doctor.sh", cwd=repo, env=route)
         self.assert_success(result)
         self.assertIn("ready to launch from this context", result.stdout.lower())
+        self.assertIn("OK: Git transport authenticated over SSH: git@github.com:friend/target.git (read-only ls-remote)",
+                      result.stdout)
         transports = [call for call in self.calls("git")
                       if "ls-remote" in call["args"] and "--get-url" not in call["args"]]
         self.assertTrue(transports)
         command = transports[-1]["env"].get("GIT_SSH_COMMAND", "")
         for option in ("BatchMode=yes", "StrictHostKeyChecking=yes", "UpdateHostKeys=no", "CheckHostIP=no"):
             self.assertIn(option, command, "doctor SSH check could prompt or modify host trust")
+        # The README's quick-start command, run from the target checkout's pane, checks that target's transport.
+        quick_start = (self.bundle / "README.md").read_text().split("## Bootstrap on macOS")[0]
+        documented = '"${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory/scripts/doctor.sh"'
+        self.assertIn(documented + "\nghd\n", quick_start)
+        self.log.write_text("")
+        result = subprocess.run(["bash", "-c", documented], cwd=repo, env=dict(self.env, **route),
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assert_success(result)
+        self.assertIn("OK: Git transport authenticated over SSH", result.stdout)
+        lookups = [call for call in self.calls("git") if "ls-remote" in call["args"]]
+        self.assertEqual(len(lookups), 2)
+        self.assertTrue(all(call["cwd"] == str(repo) for call in lookups), lookups)
         for flag in ("MOCK_SERVER", "MOCK_ROUTE", "MOCK_MANIFEST", "MOCK_TRANSPORT"):
             result = self.run_script(self.installed / "scripts/doctor.sh", cwd=repo,
                 env=dict(route, **{flag: "incompatible" if flag == "MOCK_SERVER" else "wrong" if flag == "MOCK_ROUTE" else "pending" if flag == "MOCK_TRANSPORT" else "missing"}))
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("ready to launch from this context", result.stdout.lower())
+            # A context failure stops before transport, and says so.
+            self.assertEqual("NOTE: Git transport not checked" in result.stdout, flag != "MOCK_TRANSPORT",
+                             result.stdout)
+        self.assert_no_actions()
+
+    def test_doctor_transport_failures_name_the_ssh_or_https_remedy_and_change_nothing(self):
+        self.install()
+        repo, _ = self.source_repo()
+        route = {"HERDR_SOCKET_PATH": str(self.home / "test.sock"), "HERDR_WORKSPACE_ID": "ws",
+                 "HERDR_TAB_ID": "tab", "HERDR_PANE_ID": "pane", "MOCK_TRANSPORT": "pending"}
+        rerun = "then rerun " + shlex.quote(str(self.installed / "scripts/doctor.sh"))
+        local_config = (repo / ".git/config").read_text()
+        ssh_guide = "https://docs.github.com/en/authentication/connecting-to-github-with-ssh"
+        result = self.run_script(self.installed / "scripts/doctor.sh", cwd=repo, env=route)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("ready to launch from this context", result.stdout.lower())
+        self.assertIn("FAIL: Git transport authentication/trust pending: read-only git ls-remote of "
+                      "git@github.com:friend/target.git", result.stdout)
+        for text in ("over SSH", ssh_guide, "verify GitHub's host key fingerprint yourself",
+                     "doctor never accepts host keys", "choose HTTPS deliberately: gh auth setup-git --hostname "
+                     "github.com", "can replace a previously configured one",
+                     "in this target checkout git config url.\"https://github.com/\".insteadOf 'git@github.com:'",
+                     rerun):
+            self.assertIn(text, result.stdout)
+        # An HTTPS rewrite gets the HTTPS remedy; credentials embedded in the URL are never shown.
+        result = self.run_script(self.installed / "scripts/doctor.sh", cwd=repo, env=dict(
+            route, MOCK_EFFECTIVE_URL="https://friend:TOKEN_SENTINEL@github.com/friend/target.git"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("TOKEN_SENTINEL", result.stdout + result.stderr)
+        self.assertIn("read-only git ls-remote of https://***@github.com/friend/target.git", result.stdout)
+        for text in ("over HTTPS without prompts; Git insteadOf rewrote GitHub sshUrl git@github.com:friend/target.git",
+                     "give Git a credential helper with access to this repository",
+                     "gh auth setup-git --hostname github.com", "remove the insteadOf rewrite to use SSH", rerun):
+            self.assertIn(text, result.stdout)
+        self.assertNotIn(ssh_guide, result.stdout)
+        # Diagnostics only read Git configuration: no remote, rewrite, helper, or host-trust change.
+        self.assertEqual(local_config, (repo / ".git/config").read_text())
+        self.assertFalse((self.home / ".gitconfig").exists())
+        self.assertFalse((self.home / ".ssh").exists())
+        for call in self.calls("git"):
+            if "config" in call["args"]:
+                self.assertTrue(any(arg.startswith("--get") for arg in call["args"]), call["args"])
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["auth", "setup-git"]])
         self.assert_no_actions()
 
     def test_doctor_custom_ssh_is_pending_but_working_https_requires_no_ssh(self):
@@ -2077,7 +2202,8 @@ class DistributionTests(unittest.TestCase):
                 self.log.write_text("")
                 result = self.run_script(self.installed / "scripts/doctor.sh", cwd=repo, env=overrides)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("custom SSH", result.stdout)
+                self.assertIn("FAIL: Git transport not checked: custom SSH", result.stdout)
+                self.assertIn("choose HTTPS deliberately", result.stdout)
                 self.assertFalse(any("ls-remote" in call["args"] and "--get-url" not in call["args"]
                                      for call in self.calls("git")), "doctor executed custom SSH transport")
                 self.assert_no_actions()
@@ -2090,6 +2216,8 @@ class DistributionTests(unittest.TestCase):
                      GIT_SSH_COMMAND="/nonexistent/custom-ssh"))
         self.assert_success(result)
         self.assertIn("ready to launch from this context", result.stdout.lower())
+        self.assertIn("OK: Git transport authenticated over HTTPS: https://github.com/friend/target.git (read-only "
+                      "ls-remote; Git insteadOf rewrote GitHub sshUrl git@github.com:friend/target.git)", result.stdout)
         self.assertTrue(any("ls-remote" in call["args"] and "--get-url" not in call["args"]
                             for call in self.calls("git")))
         self.assertFalse(self.calls("ssh"))
