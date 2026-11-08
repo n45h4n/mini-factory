@@ -134,7 +134,7 @@ default `ctrl+b`, then `q`, and reattach with `herdr --session my-project`.
 
 Setup checks tools first and reuses suitable installations. The runtime needs
 Bash, Git 2.29+, Make, GitHub CLI 2.47+, jq, Python 3.9+, Gum 0.15+, Herdr,
-No-Mistakes (its stable `axi run --intent`/`--yes` interface), **all three
+No-Mistakes (its stable `axi run --intent`/`--base-branch`/`--yes` interface), **all three
 agent CLIs (Codex, Claude Code, and Cursor)**, Node.js 22.13+ with npm, `acpx`,
 and the standard system utilities used by the dispatchers. These are installed
 whichever agents the roles currently select, so a later `mf-config` or
@@ -422,7 +422,7 @@ real PR-check expectations (see the
 [CI prerequisite](#ci-prerequisite-for-each-target-repository)), and start:
 
 ```sh
-no-mistakes axi run --yes --intent "$(cat -- "$intent_file")"
+no-mistakes axi run --yes --base-branch <captured-branch> --intent "$(cat -- "$intent_file")"
 ```
 
 The full issue title and body are untrusted data: the quoted command
@@ -432,6 +432,18 @@ dropped. These are the stable CLI's documented flags. Stable No-Mistakes has
 no `--intent-file` or `--closes`, so **closing the issue is not automated**:
 Mini-Factory passes no closing metadata, and the agent reports this rather than
 adding any. After merging, check the issue and close it yourself if needed.
+
+The PR targets the branch `ghd` had checked out when the issue was first
+started. That target is recorded privately beside the captured intent, passed
+shell-quoted as data, and shown in the prompt and notification. Pressing **I**
+again keeps it, even from a `ghd` opened on another branch and even when only
+the `agent/issue-N` branch remains. A retained branch with no trustworthy record
+(for example, one started before this binding existed, or from another clone) is
+never guessed: a running agent can still be focused, but otherwise its work is
+kept, no prompt is sent, and the notification gives the options. Reattaching
+with `no-mistakes axi run --yes` keeps the target saved on the run. If that
+target is invalid, unpublished, or conflicts with an existing run or PR, the
+agent reports the native blocker and never falls back to another branch.
 
 The agent then drives that run with the installed No-Mistakes skill and reports
 the actual outcome and PR URL. A dispatch notification only means the prompt was
@@ -510,10 +522,10 @@ bundled config and refuses config override flags; ordinary flags such as
 ## No-Mistakes configuration and unattended runs
 
 A **stable No-Mistakes release is enough**; no beta is needed. This
-distribution targets the stable `no-mistakes axi run --intent ... --yes`
+distribution targets the stable `no-mistakes axi run --intent ... --base-branch ... --yes`
 interface (latest stable v1.84.0 when this was written). Setup installs
 No-Mistakes with its native script (stable channel) if it is missing. It reuses
-any installed release whose `axi run --help` offers `--intent` and `--yes`,
+any installed release whose `axi run --help` offers `--intent`, `--base-branch`, and `--yes`,
 including a newer prerelease you installed deliberately, so it never downgrades
 one. Only when those flags are missing does setup offer the native stable
 updater `no-mistakes update`, with your consent. That updater restarts the
@@ -831,8 +843,8 @@ marks PRs ready. It returns nonzero for required failed/pending checks.
 
 Dispatcher diagnostics live in
 `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-issue/` (preparation logs
-end in `-prepare.log`; captured intents are in its private `intents/`
-directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`
+end in `-prepare.log`; captured intents and each issue's bound PR target are in
+its private `intents/` directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`
 (review diffs are in its private `contexts/` directory, one
 `pr-MERGE_BASE-HEAD.diff` per reviewed commit pair).
 Preparation keeps its last fetched default-branch commit under
@@ -920,7 +932,7 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    `i`: the preparation agent reports the `main` branch/commit it inspected and
    one verdict, and edits only the issue's title/body.
 3. Press `I`: the implementation agent commits on `agent/issue-N`, starts
-   `no-mistakes axi run --yes --intent ...` with the captured issue, and drives it.
+   `no-mistakes axi run --yes --base-branch ... --intent ...` with the captured branch and issue, and drives it.
 4. Confirm the agent's final report gives the actual No-Mistakes outcome and the
    open PR URL, including any skips, overrides, or blockers, and that the PR was
    not merged.

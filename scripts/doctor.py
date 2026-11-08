@@ -410,9 +410,9 @@ def main():
           + "); run make setup for the exact action")
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
     help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
-    check(all(flag_available(help_text, flag) for flag in ("--intent", "--yes")),
-          "No-Mistakes unattended AXI run (--intent, --yes) available",
-          "No-Mistakes axi run --intent/--yes capability missing; run make setup (offers the native stable no-mistakes update)")
+    check(all(flag_available(help_text, flag) for flag in ("--intent", "--base-branch", "--yes")),
+          "No-Mistakes unattended AXI run (--intent, --base-branch, --yes) available",
+          "No-Mistakes axi run --intent/--base-branch/--yes capability missing; run make setup (offers the native stable no-mistakes update)")
     git_version = output(["git", "--version"]) or ""
     match = re.search(r"git version (\d+)\.(\d+)", git_version)
     check(match and tuple(map(int, match.groups())) >= (2, 29),
