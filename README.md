@@ -518,7 +518,7 @@ never restarts or replaces it. Exit it in its pane and press `I` again to start
 a fresh reviewer with the configured read-only options.
 
 `ghd` captures the physical source root, canonical GitHub repository, branch,
-commit SHA, and dirty status **before** opening gh-dash. New implementation
+commit SHA, and dirty status **before** opening gh-dash. New issue preparation and implementation
 worktrees contain the captured committed snapshot; uncommitted/untracked changes stay in
 your source checkout. A dirty checkout produces a warning. Detached HEAD and
 repositories without a commit are rejected. Later changes in the source checkout
