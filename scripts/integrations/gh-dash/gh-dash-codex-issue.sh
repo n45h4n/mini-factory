@@ -723,8 +723,8 @@ else
 	issue_branch="agent/issue-$issue_number"
 	workspace_label="$repository_name#$issue_number"
 	agent_alias="$(sanitize_agent_alias "$repository_name" "$issue_number")"
-	branch_base_sha="$GH_DASH_SOURCE_SHA"
 fi
+branch_base_sha="$GH_DASH_SOURCE_SHA"
 issue_branch_ref="refs/heads/$issue_branch"
 case "$agent_alias" in
 '' | [!a-z]* | *[!a-z0-9_-]*) die "unable to derive a valid Herdr agent alias: $agent_alias" ;;
@@ -826,13 +826,9 @@ if [ "$issue_mode" = prepare ]; then
 	validate_fetch_url "$fetch_url" "$current_repo_lower"
 	# The full ref, so a tag sharing the branch's name cannot change what is compared.
 	source_branch_ref="refs/heads/$GH_DASH_SOURCE_BRANCH"
-	git -C "$source_root" check-ref-format "$source_branch_ref" >/dev/null 2>&1 ||
-		die "invalid captured source branch: $GH_DASH_SOURCE_BRANCH"
 	preparation_ref="refs/gh-dash-issue-prepare/$lock_identity"
 	git -C "$source_root" check-ref-format "$preparation_ref" >/dev/null 2>&1 ||
 		die 'unable to derive a valid preparation base ref'
-	branch_base_sha="$(git -C "$source_root" rev-parse --verify "${GH_DASH_SOURCE_SHA}^{commit}" 2>/dev/null)" ||
-		die "captured source commit is unavailable: $GH_DASH_SOURCE_SHA"
 	source_snapshot="$GH_DASH_SOURCE_BRANCH@${branch_base_sha:0:12}"
 	verification_failure='preparation not started, no older snapshot was used, and no other branch was substituted'
 
@@ -1392,7 +1388,7 @@ prepare_issue_prompt() {
 	printf 'INFO: %s: %s\n' "$PROGRAM" "$prompt_summary" >&2
 	printf -v quoted_intent_path '%q' "$intent_path"
 	printf -v quoted_base_branch '%q' "$pr_base_branch"
-	prompt="Use the title and body of issue ${selected_repo}#${issue_number} captured in the private file $quoted_intent_path as the implementation prompt; that captured text is authoritative for the implementation scope. You may fetch the issue for context, but a later issue revision must not change the implementation scope; if it differs materially from the captured text, report the difference instead of implementing it. Implement it in this worktree on branch $issue_branch, which $base_description. That base can differ from the default-branch commit a preparation run inspected; do not assume they are the same. Follow the target repository's instructions and keep to the issue's intended scope.
+	prompt="Use the title and body of issue ${selected_repo}#${issue_number} captured in the private file $quoted_intent_path as the implementation prompt; that captured text is authoritative for the implementation scope. You may fetch the issue for context, but a later issue revision must not change the implementation scope; if it differs materially from the captured text, report the difference instead of implementing it. Implement it in this worktree on branch $issue_branch, which $base_description. That base can differ from the commit a preparation run inspected; do not assume they are the same. Follow the target repository's instructions and keep to the issue's intended scope.
 
 When the implementation is ready, deliver it through No-Mistakes unattended:
 1. Run the relevant checks, then commit only the task changes on $issue_branch. No-Mistakes needs a non-default branch and a clean, committed worktree to start a run.
