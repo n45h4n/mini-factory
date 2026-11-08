@@ -52,7 +52,7 @@ checkout, `make doctor` would run that repository's own Makefile, and
 
 | View | Key | Action |
 | ---- | --- | ------ |
-| Issues | `i` | Prepare the issue with the selected agent: check it against freshly fetched `main` (the default branch), then edit only its title/body into an executable prompt and report **ready to dispatch**, **needs a decision**, or **already satisfied**. |
+| Issues | `i` | Prepare the issue with the selected agent: check it against the branch and commit captured when `ghd` launched (verified against that branch on GitHub), then edit only its title/body into an executable prompt and report **ready to dispatch**, **needs a decision**, or **already satisfied**. |
 | Issues | `I` | Implement the issue with the selected agent, commit it, and run No-Mistakes unattended (`--yes`) to an open PR. Never merges. |
 | PRs | `I` | Review the PR **read-only** with the selected agent (Codex by default, or Claude Code or Cursor). Findings appear only in the reviewer's Herdr pane; nothing is posted to GitHub (see [What the workflows do](#what-the-workflows-do)). |
 
@@ -341,7 +341,7 @@ pane), then press the key again.
 
 ## Git transport for PR reviews and issue preparation
 
-The existing PR worker, and issue preparation's default-branch fetch, use
+The existing PR worker, and issue preparation's captured-branch verification, use
 GitHub's `sshUrl`, including when `origin` uses HTTPS. With the default SSH transport, configure your own GitHub SSH key and
 verify GitHub's host key using
 [GitHub's SSH instructions](https://docs.github.com/en/authentication/connecting-to-github-with-ssh).
@@ -398,23 +398,34 @@ changed `ISSUE_AGENT` or an `mf-config` profile while an agent still exists,
 that agent is kept and reused with its original options; the new choice applies
 once it is closed.
 
-Issue **i** fetches the repository's default branch from GitHub immediately and
-creates or reuses a separate `agent/prepare-issue-N` worktree, Herdr workspace,
-and agent; it never touches the implementation session. A new preparation
-branch starts at the fetched commit. A retained preparation worktree is reused
-(fast-forwarded to it when behind) only when its agent is not working or
-blocked, it has no local changes, and it has not diverged; otherwise nothing is
-refreshed or sent,
-and the notification explains how to start fresh (close the agent, run
-`herdr worktree remove --workspace ID`, delete the branch). If the fetch fails,
-preparation does not start rather than analysing an older snapshot. The prompt
-names the branch and commit inspected and allows only title/body edits of that
-issue.
+Issue **i** prepares against the branch and commit `ghd` captured at launch (the
+same source **I** uses), not the default branch, that branch's upstream, or
+whatever is checked out later. It creates or reuses a separate
+`agent/prepare-issue-N` worktree, Herdr workspace, and agent at that committed
+snapshot; it never touches the source checkout or the implementation session,
+and uncommitted checkout changes are not included. Before anything starts, it
+compares the captured commit with the same named branch
+(`refs/heads/<captured-branch>`) on GitHub:
+
+| GitHub's branch | Result |
+| --- | --- |
+| Matches the captured commit | Prepares normally. |
+| Absent, or behind the captured commit | Prepares from the captured commit, labelled local/unpublished; it does not claim GitHub is current. |
+| Ahead of the captured commit, or diverged | Stops before creating or prompting anything. Sync the checkout with GitHub and relaunch `ghd`. |
+| Cannot be read, fetched, or compared | Preparation does not start. It never reuses an older snapshot or substitutes another branch. |
+
+A new preparation branch starts at the captured commit. A retained preparation
+worktree is reused (fast-forwarded to it when behind) only when its agent is not
+working or blocked, it has no local changes, and it has not diverged; otherwise
+nothing is refreshed or sent, and the notification explains how to start fresh
+(close the agent, run `herdr worktree remove --workspace ID`, delete the
+branch). The prompt and notification name the captured branch and commit and
+its GitHub status, and the prompt allows only title/body edits of that issue.
 
 Issue **I** creates or reuses an `agent/issue-N` implementation worktree. A new
-branch starts at the commit `ghd` captured (below), which can be older than the
-`main` commit a preparation inspected; the prompt and notification show the
-starting branch and SHA, or the retained branch's current SHA. The helper
+branch starts at the commit `ghd` captured (below), which can differ from the
+commit an earlier preparation inspected under another `ghd` launch; the prompt
+and notification show the starting branch and SHA, or the retained branch's current SHA. The helper
 captures the issue title and body into a private file outside the worktree, and
 the prompt asks the agent to implement and commit the change, run
 `no-mistakes init` if the repository is not initialized, check the target's
@@ -507,7 +518,7 @@ never restarts or replaces it. Exit it in its pane and press `I` again to start
 a fresh reviewer with the configured read-only options.
 
 `ghd` captures the physical source root, canonical GitHub repository, branch,
-commit SHA, and dirty status **before** opening gh-dash. New implementation
+commit SHA, and dirty status **before** opening gh-dash. New issue preparation and implementation
 worktrees contain the captured committed snapshot; uncommitted/untracked changes stay in
 your source checkout. A dirty checkout produces a warning. Detached HEAD and
 repositories without a commit are rejected. Later changes in the source checkout
@@ -847,7 +858,8 @@ end in `-prepare.log`; captured intents and each issue's bound PR target are in
 its private `intents/` directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`
 (review diffs are in its private `contexts/` directory, one
 `pr-MERGE_BASE-HEAD.diff` per reviewed commit pair).
-Preparation keeps its last fetched default-branch commit under
+Preparation keeps the last commit it fetched from the captured branch, used
+only for its freshness comparison, under
 `refs/gh-dash-issue-prepare/` in the target repository. Dispatch reports the
 relevant log path. Herdr's default-session logs are under
 `~/.config/herdr/`; named-session logs live under its `sessions/NAME/` directory.
@@ -929,7 +941,7 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    then `make doctor` reports ready.
 2. In a Herdr pane of the test repository, run the installed doctor (as in the
    quick start) until it reports Git transport authenticated, then run `ghd`, select the issue, press
-   `i`: the preparation agent reports the `main` branch/commit it inspected and
+   `i`: the preparation agent reports the captured branch/commit it inspected and
    one verdict, and edits only the issue's title/body.
 3. Press `I`: the implementation agent commits on `agent/issue-N`, starts
    `no-mistakes axi run --yes --base-branch ... --intent ...` with the captured branch and issue, and drives it.
