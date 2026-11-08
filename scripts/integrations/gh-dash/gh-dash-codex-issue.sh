@@ -918,9 +918,11 @@ load_worktree_state() {
 	fi
 }
 
-# An implementation's PR target is bound once, beside its private intent, so a retained
+# An implementation's PR target is bound once per clone, beside its private intent, so a retained
 # branch keeps the target of its first dispatch whatever a later ghd has checked out.
-pr_target_path="$state_directory/intents/$lock_identity.pr-target.json"
+source_clone_identity="$(printf '%s' "$source_common_directory" | git -C "$source_root" hash-object --stdin)" ||
+	die 'unable to derive the source clone identity'
+pr_target_path="$state_directory/intents/$lock_identity.$source_clone_identity.pr-target.json"
 pr_base_branch=
 
 record_pr_target() {
@@ -928,16 +930,14 @@ record_pr_target() {
 
 	ensure_private_directory "$state_directory/intents" 'issue intent directory'
 	if ! (umask 077 && jq -n \
-		--arg git_common_directory "$source_common_directory" \
 		--arg base_branch "$pr_base_branch" \
-		'{git_common_directory: $git_common_directory, base_branch: $base_branch}' >"$target_stage") ||
+		'{base_branch: $base_branch}' >"$target_stage") ||
 		! mv -f -- "$target_stage" "$pr_target_path"; then
 		rm -f -- "$target_stage"
 		die 'unable to record the PR target outside the worktree; issue branch not created'
 	fi
 }
 
-# Issue identity spans clones of a repository, so only this clone's record is trustworthy.
 load_pr_target() {
 	local target_json recorded_base
 
@@ -945,9 +945,7 @@ load_pr_target() {
 	target_json="$(cat -- "$pr_target_path" 2>/dev/null)" || return 1
 	is_single_json_object "$target_json" || return 1
 	recorded_base="$(printf '%s\n' "$target_json" | jq -er \
-		--arg git_common_directory "$source_common_directory" \
-		'select(.git_common_directory == $git_common_directory) | .base_branch | select(type == "string" and length > 0)' \
-		2>/dev/null)" || return 1
+		'.base_branch | select(type == "string" and length > 0)' 2>/dev/null)" || return 1
 	[ "$recorded_base" != "$issue_branch" ] || return 1
 	[ "$(git -C "$source_root" check-ref-format --branch "$recorded_base" 2>/dev/null)" = "$recorded_base" ] || return 1
 	pr_base_branch="$recorded_base"

@@ -1590,9 +1590,11 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(len(argv), 7)
         return argv[4]
 
-    def pr_target_path(self):
+    def pr_target_path(self, repo):
+        clone = subprocess.run([REAL_GIT, "hash-object", "--stdin"], input=str((repo / ".git").resolve()),
+                               capture_output=True, text=True, check=True).stdout.strip()
         return (Path(self.env["XDG_STATE_HOME"])
-                / "gh-dash-codex-issue/intents/repo-6-friend-6-target-issue-8.pr-target.json")
+                / f"gh-dash-codex-issue/intents/repo-6-friend-6-target-issue-8.{clone}.pr-target.json")
 
     def ghd_snapshot(self, repo):
         self.assert_success(self.run_script(self.wrapper, cwd=repo))
@@ -1619,7 +1621,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 prompt = self.herdr_calls("agent", "prompt")[-1][3]
                 self.assertIn("The pull request targets " + branch + ",", prompt)
                 self.assertIn("PR target " + branch + ";", self.notifications()[-1])
-                self.assertEqual(stat.S_IMODE(self.pr_target_path().stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(self.pr_target_path(repo).stat().st_mode), 0o600)
         # Reattachment keeps the saved base, and an unusable target is reported, never replaced.
         for requirement in ("Reattach without --base-branch; the run keeps the target saved on it",
                             "invalid or unpublished", "conflicts with an existing run or pull request",
@@ -1688,6 +1690,19 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(git("rev-parse", "agent/issue-8"), issue_head)
         self.assertEqual((worktree / "source.txt").read_text(), "retained issue work\n")
 
+    def test_clones_of_one_repository_keep_their_own_base_for_the_same_issue(self):
+        routes = []
+        for clone, branch in (("clone a", "dev"), ("clone b", "main")):
+            repo, git = self.source_repo(base=self.root / clone)
+            routes.append((branch, self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH=branch)))
+            self.assert_success(self.issue_helper(**routes[-1][1]))
+            self.assertEqual(self.latest_base_branch(), branch)
+        for branch, route in routes:
+            with self.subTest(branch=branch):
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**dict(route, GH_DASH_SOURCE_BRANCH="later", MOCK_AGENT_STATUS="idle")))
+                self.assertEqual(self.latest_base_branch(), branch)
+
     def test_legacy_branch_without_a_recorded_target_is_refused_and_preserved(self):
         repo, git = self.source_repo()
         route = self.issue_environment(repo, git, cwd=repo)
@@ -1703,7 +1718,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start")
                          or self.herdr_calls("agent", "prompt"))
         self.assertEqual(git("rev-parse", "agent/issue-8"), issue_head)
-        self.assertFalse(self.pr_target_path().exists())
+        self.assertFalse(self.pr_target_path(repo).exists())
 
     def test_legacy_worktree_still_focuses_its_running_agent_but_gets_no_new_prompt(self):
         repo, git = self.source_repo()
@@ -1711,11 +1726,9 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assert_success(self.issue_helper(**route))
         worktree = repo.parent / "issue worktree with spaces"
         (worktree / "notes.txt").write_text("keep me\n")
-        target = self.pr_target_path()
-        common = str((repo / ".git").resolve())
-        records = {"absent": None, "another clone": json.dumps({"git_common_directory": "/elsewhere/.git", "base_branch": "dev"}),
-                   "corrupt": "{", "not a branch": json.dumps({"git_common_directory": common, "base_branch": "--force"}),
-                   "its own branch": json.dumps({"git_common_directory": common, "base_branch": "agent/issue-8"})}
+        target = self.pr_target_path(repo)
+        records = {"absent": None, "corrupt": "{", "not a branch": json.dumps({"base_branch": "--force"}),
+                   "its own branch": json.dumps({"base_branch": "agent/issue-8"})}
         for label, record in records.items():
             with self.subTest(record=label):
                 target.unlink(missing_ok=True)
