@@ -77,9 +77,10 @@ elif name == "gh":
                           "baseRefOid": os.environ.get("MOCK_PR_BASE", head),
                           "baseRefName": "main", "isCrossRepository": False}))
     elif args[:2] == ["issue", "view"]:
-        if "GH_REPO" in os.environ or args != ["issue", "view", "8", "--repo", "friend/target", "--json", "number,title,body"]:
+        if ("GH_REPO" in os.environ or args[2:3] not in (["8"], ["9"])
+                or args[:2] + args[3:] != ["issue", "view", "--repo", "friend/target", "--json", "number,title,body"]):
             fail("unexpected issue lookup")
-        print(json.dumps({"number": 8, "title": "Add 'quoted' $(title)", "body": ISSUE_BODY}))
+        print(json.dumps({"number": int(args[2]), "title": "Add 'quoted' $(title)", "body": ISSUE_BODY}))
     elif args[:2] == ["auth", "status"]:
         if os.environ.get("MOCK_GH_AUTH") == "pending" and not (root / "gh-authenticated").exists():
             fail("AUTH_SECRET_SENTINEL should never be displayed")
@@ -343,11 +344,17 @@ elif name == "no-mistakes":
         if numeric < (1, 50, 0):
             # An older fixture without the stable interface; its --intent-file alone must not count.
             print("      --intent-file string   file containing the run intent\n      --wait duration")
-        elif numeric < (1, 105, 0):
+        elif numeric < (1, 84, 0):
+            # The run flags without a per-run PR target; --intent and --yes alone must not count.
             print("      --intent string   what the user set out to accomplish\n"
                   "  -y, --yes   auto-resolve eligible gates\n      --wait duration")
+        elif numeric < (1, 105, 0):
+            print("      --base-branch string   integration branch to open the PR against for this run only\n"
+                  "      --intent string   what the user set out to accomplish\n"
+                  "  -y, --yes   auto-resolve eligible gates\n      --wait duration")
         else:
-            print("      --intent string\n      --intent-file string\n  -y, --yes\n      --closes int\n      --wait duration")
+            print("      --base-branch string\n      --intent string\n      --intent-file string\n  -y, --yes\n"
+                  "      --closes int\n      --wait duration")
     elif args == ["doctor"]:
         if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
             fail("doctor diagnostics must not send telemetry or check for updates")
@@ -432,6 +439,8 @@ elif name == "herdr":
     sessions = {
         "agent/issue-8": {"alias": "target-8", "ws": "issue-ws", "tab": "issue-tab", "pane": "issue-pane",
                           "directory": "issue worktree with spaces"},
+        "agent/issue-9": {"alias": "target-9", "ws": "issue-9-ws", "tab": "issue-9-tab", "pane": "issue-9-pane",
+                          "directory": "issue 9 worktree"},
         "agent/prepare-issue-8": {"alias": "target-prep-8", "ws": "prep-ws", "tab": "prep-tab", "pane": "prep-pane",
                                   "directory": "prepare worktree with spaces"},
     }
@@ -1461,7 +1470,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertEqual(git("rev-parse", "agent/issue-8"), captured)
                 self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
                 self.assertNotEqual(captured, main)
-                self.assertIn('no-mistakes axi run --yes --intent "$(cat -- "$intent_file")"', implement)
+                self.assertIn('no-mistakes axi run --yes --base-branch feature/friend --intent "$(cat -- "$intent_file")"', implement)
                 for unsupported in ("--intent-file", "--closes"):
                     self.assertNotIn(unsupported, implement)
                 self.assertIn("starts from feature/friend at " + captured, implement)
@@ -1534,7 +1543,8 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertFalse(list(self.root.rglob("*-marker")), "issue prose was evaluated as shell source")
         # Executing the prompt's start command passes the full captured issue as one --intent argument.
         command = prompt.split("Start the run with exactly:\n", 1)[1].split("\nStable No-Mistakes", 1)[0]
-        self.assertEqual(command.splitlines()[1], 'no-mistakes axi run --yes --intent "$(cat -- "$intent_file")"')
+        self.assertEqual(command.splitlines()[1],
+                         'no-mistakes axi run --yes --base-branch feature/friend --intent "$(cat -- "$intent_file")"')
         capture = self.root / "argv capture"
         capture.mkdir()
         (capture / "no-mistakes").write_text("#!" + sys.executable + "\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
@@ -1547,7 +1557,8 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                                            env={"PATH": str(capture) + os.pathsep + REAL_PATH}, check=True)
                 invoked = json.loads(completed.stdout)
                 # Command substitution drops only trailing newlines; the multiline title/body stay intact.
-                self.assertEqual(invoked, ["axi", "run", "--yes", "--intent", content.rstrip("\n")])
+                self.assertEqual(invoked, ["axi", "run", "--yes", "--base-branch", "feature/friend",
+                                           "--intent", content.rstrip("\n")])
                 self.assertIn(ISSUE_BODY.rstrip("\n"), invoked[-1])
                 self.assertEqual(list(scratch.iterdir()), [])
         self.assertFalse(list(self.root.rglob("*-marker")), "issue prose was executed by the start command")
@@ -1561,6 +1572,186 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         # Dispatch reports only a launch; the agent reports the actual No-Mistakes outcome.
         self.assertIn("No-Mistakes outcome pending", self.notifications()[-1])
         self.assertNotIn("passed", self.notifications()[-1])
+
+    def no_mistakes_argv(self, prompt, shell="bash"):
+        # Runs the prompt's exact start command against an argv recorder.
+        capture = self.root / "argv capture"
+        capture.mkdir(exist_ok=True)
+        (capture / "no-mistakes").write_text("#!" + sys.executable + "\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        (capture / "no-mistakes").chmod(0o755)
+        command = prompt.split("Start the run with exactly:\n", 1)[1].split("\nStable No-Mistakes", 1)[0]
+        completed = subprocess.run([shell, "-c", command], cwd=self.root, capture_output=True, text=True,
+                                   env={"PATH": str(capture) + os.pathsep + REAL_PATH}, check=True)
+        return json.loads(completed.stdout)
+
+    def latest_base_branch(self):
+        argv = self.no_mistakes_argv(self.herdr_calls("agent", "prompt")[-1][3])
+        self.assertEqual(argv[:4] + argv[5:6], ["axi", "run", "--yes", "--base-branch", "--intent"])
+        self.assertEqual(len(argv), 7)
+        return argv[4]
+
+    def pr_target_path(self, repo):
+        clone = subprocess.run([REAL_GIT, "hash-object", "--stdin"], input=str((repo / ".git").resolve()),
+                               capture_output=True, text=True, check=True).stdout.strip()
+        return (Path(self.env["XDG_STATE_HOME"])
+                / f"gh-dash-codex-issue/intents/repo-6-friend-6-target-issue-8.{clone}.pr-target.json")
+
+    def ghd_snapshot(self, repo):
+        self.assert_success(self.run_script(self.wrapper, cwd=repo))
+        dash = [c for c in self.calls("gh") if c["args"][:1] == ["dash"] and "--config" in c["args"]][-1]
+        return {key: value for key, value in dash["env"].items() if key.startswith("GH_DASH_SOURCE_")}
+
+    def test_ghd_checkout_becomes_the_exact_no_mistakes_base_of_a_new_issue(self):
+        self.install()
+        # A tag sharing the branch's name must not turn the target into heads/NAME.
+        for branch, tagged in (("main", False), ("dev", False), ("feat/topic", False), ("release-1", True)):
+            with self.subTest(branch=branch):
+                repo, git = self.source_repo(base=self.root / branch.replace("/", "-"))
+                git("checkout", "-q", "-b", branch)
+                if tagged:
+                    git("tag", branch)
+                snapshot = self.ghd_snapshot(repo)
+                self.assertEqual(snapshot["GH_DASH_SOURCE_BRANCH"], branch)
+                route = self.issue_environment(repo, git, cwd=repo, **snapshot)
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**route))
+                base = self.latest_base_branch()
+                self.assertEqual(base, branch)
+                self.assertNotEqual(base, "agent/issue-8")
+                prompt = self.herdr_calls("agent", "prompt")[-1][3]
+                self.assertIn("The pull request targets " + branch + ",", prompt)
+                self.assertIn("PR target " + branch + ";", self.notifications()[-1])
+                self.assertEqual(stat.S_IMODE(self.pr_target_path(repo).stat().st_mode), 0o600)
+        # Reattachment keeps the saved base, and an unusable target is reported, never replaced.
+        for requirement in ("Reattach without --base-branch; the run keeps the target saved on it",
+                            "invalid or unpublished", "conflicts with an existing run or pull request",
+                            "report that native blocker", "never fall back to another base such as main",
+                            "change Git branches", "retarget an unrelated pull request", "abort a run",
+                            "replay an uncertain execution"):
+            self.assertIn(requirement, prompt)
+
+    def test_unusual_captured_branch_reaches_no_mistakes_as_one_exact_argument(self):
+        repo, git = self.source_repo()
+        branch = "feat/$(touch${IFS}base-marker)`touch${IFS}tick-marker`;'q"
+        git("check-ref-format", "--branch", branch)
+        self.assert_success(self.issue_helper(**self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH=branch)))
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        for shell in ("bash", "sh"):
+            with self.subTest(shell=shell):
+                self.assertEqual(self.no_mistakes_argv(prompt, shell)[3:5], ["--base-branch", branch])
+        self.assertFalse(list(self.root.rglob("*-marker")), "the captured branch was evaluated as shell source")
+
+    def test_independent_issues_keep_their_own_base_despite_later_checkout_changes(self):
+        repo, git = self.source_repo()
+        launcher = self.bundle / "scripts/integrations/gh-dash/gh-dash-codex-issue.sh"
+        first = self.issue_environment(repo, git, GH_DASH_SOURCE_BRANCH="release/one")
+        second = self.issue_environment(repo, git, GH_DASH_SOURCE_BRANCH="release/two")
+        captured = first["GH_DASH_SOURCE_SHA"]
+        # The checkout moves after both snapshots were taken; neither snapshot follows it.
+        git("checkout", "-q", "-b", "later/elsewhere")
+        (repo / "source.txt").write_text("later source\n")
+        git("commit", "-qam", "Advance source after dashboard launch")
+        def dispatch(number, route, **overrides):
+            self.log.write_text("")
+            self.assert_success(self.run_script(launcher, "friend/target", number, cwd=repo, env=dict(route, **overrides)))
+            return self.latest_base_branch()
+        self.assertEqual(dispatch(8, first), "release/one")
+        self.assertEqual(dispatch(9, second), "release/two")
+        self.assertEqual(git("rev-parse", "agent/issue-8"), captured)
+        self.assertEqual(git("rev-parse", "agent/issue-9"), captured)
+        # Each issue keeps its own target even when dispatched from the other's snapshot.
+        self.assertEqual(dispatch(8, second, MOCK_AGENT_STATUS="idle"), "release/one")
+        self.assertEqual(dispatch(9, first, MOCK_AGENT_STATUS="idle"), "release/two")
+
+    def test_repeated_issue_keeps_its_original_base_even_when_only_its_branch_remains(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH="dev")
+        self.assert_success(self.issue_helper(**route))
+        self.assertEqual(self.latest_base_branch(), "dev")
+        worktree = repo.parent / "issue worktree with spaces"
+        (worktree / "source.txt").write_text("retained issue work\n")
+        git("-C", str(worktree), "commit", "-qam", "Retained work")
+        issue_head = git("rev-parse", "agent/issue-8")
+        # Neither a later ghd nor the branch's upstream can choose the target.
+        git("config", "branch.agent/issue-8.remote", "origin")
+        git("config", "branch.agent/issue-8.merge", "refs/heads/upstream-elsewhere")
+        later_ghd = dict(route, GH_DASH_SOURCE_BRANCH="main", GH_DASH_SOURCE_SHA=git("rev-parse", "HEAD"))
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**dict(later_ghd, MOCK_AGENT_STATUS="idle")))
+        self.assertEqual(self.latest_base_branch(), "dev")
+        self.assertIn("original PR target dev kept", self.notifications()[-1])
+        # Only the branch remains: Herdr has lost the worktree and its agent.
+        git("worktree", "remove", "--force", str(worktree))
+        (repo.parent / "issue-workflow.json").write_text("{}")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**later_ghd))
+        self.assertEqual(len(self.herdr_calls("worktree", "create")), 1)
+        self.assertEqual(self.latest_base_branch(), "dev")
+        self.assertEqual(git("rev-parse", "agent/issue-8"), issue_head)
+        self.assertEqual((worktree / "source.txt").read_text(), "retained issue work\n")
+
+    def test_clones_of_one_repository_keep_their_own_base_for_the_same_issue(self):
+        routes = []
+        for clone, branch in (("clone a", "dev"), ("clone b", "main")):
+            repo, git = self.source_repo(base=self.root / clone)
+            routes.append((branch, self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH=branch)))
+            self.assert_success(self.issue_helper(**routes[-1][1]))
+            self.assertEqual(self.latest_base_branch(), branch)
+        for branch, route in routes:
+            with self.subTest(branch=branch):
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**dict(route, GH_DASH_SOURCE_BRANCH="later", MOCK_AGENT_STATUS="idle")))
+                self.assertEqual(self.latest_base_branch(), branch)
+
+    def test_legacy_branch_without_a_recorded_target_is_refused_and_preserved(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        git("branch", "agent/issue-8", route["GH_DASH_SOURCE_SHA"])
+        issue_head = git("rev-parse", "agent/issue-8")
+        self.log.write_text("")
+        result = self.issue_helper(**route)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        for guidance in ("no recorded PR target", "was not assumed", "work was preserved", "--base-branch BRANCH",
+                         "remove its worktree and branch"):
+            self.assertIn(guidance, result.stderr)
+        self.assertIn("no recorded PR target", self.notifications()[-1])
+        self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start")
+                         or self.herdr_calls("agent", "prompt"))
+        self.assertEqual(git("rev-parse", "agent/issue-8"), issue_head)
+        self.assertFalse(self.pr_target_path(repo).exists())
+
+    def test_legacy_worktree_still_focuses_its_running_agent_but_gets_no_new_prompt(self):
+        repo, git = self.source_repo()
+        route = self.issue_environment(repo, git, cwd=repo)
+        self.assert_success(self.issue_helper(**route))
+        worktree = repo.parent / "issue worktree with spaces"
+        (worktree / "notes.txt").write_text("keep me\n")
+        target = self.pr_target_path(repo)
+        records = {"absent": None, "corrupt": "{", "not a branch": json.dumps({"base_branch": "--force"}),
+                   "its own branch": json.dumps({"base_branch": "agent/issue-8"})}
+        for label, record in records.items():
+            with self.subTest(record=label):
+                target.unlink(missing_ok=True)
+                if record is not None:
+                    target.write_text(record)
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**dict(route, MOCK_AGENT_STATUS="working")))
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "issue-pane"]])
+                self.assertFalse(self.herdr_calls("agent", "prompt"))
+                self.log.write_text("")
+                result = self.issue_helper(**dict(route, MOCK_AGENT_STATUS="idle"))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("no recorded PR target", result.stderr)
+                self.assertFalse(self.herdr_calls("agent", "prompt"))
+                self.assertEqual((worktree / "notes.txt").read_text(), "keep me\n")
+
+    def test_preparation_stays_on_the_fetched_default_branch_without_a_pr_target(self):
+        repo, git = self.source_repo()
+        main = self.advance_default_branch(git, "Current default branch")
+        self.assert_success(self.issue_helper("prepare", **self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH="dev")))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
+        self.assertNotIn("--base-branch", self.herdr_calls("agent", "prompt")[0][3])
+        self.assertEqual(list(Path(self.env["XDG_STATE_HOME"]).rglob("*.pr-target.json")), [])
 
     def test_implementation_handoff_checks_target_ci_and_stops_on_an_empty_check_list(self):
         repo, git = self.source_repo()
@@ -1732,19 +1923,30 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
     def test_no_mistakes_without_stable_interface_requires_consented_native_stable_update(self):
         result = self.setup(MOCK_NM_VERSION="v1.40.0")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("axi run --intent and --yes", result.stdout + result.stderr)
+        self.assertIn("axi run --intent, --base-branch, and --yes", result.stdout + result.stderr)
         self.assertNotEqual(self.interactive_setup("n", MOCK_NM_VERSION="v1.40.0").returncode, 0)
         self.assertFalse(self.no_mistakes_updates())
         self.assertFalse(self.installed.exists())
         doctor = self.run_script(self.bundle / "scripts/doctor.sh", env={"MOCK_NM_VERSION": "v1.40.0"})
-        self.assertIn("FAIL: No-Mistakes axi run --intent/--yes capability missing", doctor.stdout)
+        self.assertIn("FAIL: No-Mistakes axi run --intent/--base-branch/--yes capability missing", doctor.stdout)
         self.assertFalse(self.no_mistakes_updates(), "doctor must stay read-only")
         result = self.interactive_setup("y", MOCK_NM_VERSION="v1.40.0")
         self.assert_success(result)
         self.assertIn("no-mistakes update", result.stdout)
         # The stable channel only: never a prerelease or a forced restart.
         self.assertEqual(self.no_mistakes_updates(), [["update"]])
-        self.assertIn("OK: No-Mistakes unattended AXI run (--intent, --yes) available", result.stdout)
+        self.assertIn("OK: No-Mistakes unattended AXI run (--intent, --base-branch, --yes) available", result.stdout)
+
+    def test_no_mistakes_help_without_base_branch_is_reported_unsupported(self):
+        # This help offers --intent and --yes, which alone no longer satisfy issue I.
+        result = self.setup(MOCK_NM_VERSION="v1.70.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("axi run --intent, --base-branch, and --yes", result.stdout + result.stderr)
+        self.assertFalse(self.no_mistakes_updates())
+        self.assertFalse(self.installed.exists())
+        doctor = self.run_script(self.bundle / "scripts/doctor.sh", env={"MOCK_NM_VERSION": "v1.70.0"})
+        self.assertIn("FAIL: No-Mistakes axi run --intent/--base-branch/--yes capability missing", doctor.stdout)
+        self.assertFalse(self.no_mistakes_updates(), "doctor must stay read-only")
 
     def test_stable_update_refusal_for_active_runs_is_reported_without_forcing(self):
         link = self.home / ".no-mistakes/config.yaml"
@@ -1761,7 +1963,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
         result = self.run_script(self.installed / "scripts/doctor.sh", env={"MOCK_NM_VERSION": "v1.107.0"})
         self.assert_success(result)
-        self.assertIn("OK: No-Mistakes unattended AXI run (--intent, --yes) available", result.stdout)
+        self.assertIn("OK: No-Mistakes unattended AXI run (--intent, --base-branch, --yes) available", result.stdout)
         self.assertFalse(self.no_mistakes_updates())
         self.assert_no_actions(allow_onboarding=True)
 

@@ -54,7 +54,9 @@ done
 
 source_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die 'not inside a Git repository'
 source_root="$(cd -P "$source_root" && pwd -P)" || die 'unable to resolve the source root'
-source_branch="$(git -C "$source_root" symbolic-ref --quiet --short HEAD 2>/dev/null)" || die 'detached HEAD is not supported'
+# The full ref, because --short renders a branch that shares a tag's name as heads/NAME.
+source_branch="$(git -C "$source_root" symbolic-ref --quiet HEAD 2>/dev/null)" || die 'detached HEAD is not supported'
+source_branch="${source_branch#refs/heads/}"
 source_sha="$(git -C "$source_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || die 'unable to resolve the current commit'
 source_repo="$(
 	cd "$source_root"

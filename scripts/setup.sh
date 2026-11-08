@@ -398,12 +398,12 @@ install_dependencies() {
 	install_tools codex claude cursor-agent herdr no-mistakes
 	# Any installed release with the stable interface is reused, including a newer prerelease; only an older one is updated.
 	if ! no_mistakes_is_suitable; then
-		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
+		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--base-branch/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
 			no-mistakes update || die 'no-mistakes update did not complete; resolve its reported blocker (for example wait for active runs to finish) and rerun make setup'
 		else
-			die 'No-Mistakes with axi run --intent and --yes is required; rerun make setup to update it natively'
+			die 'No-Mistakes with axi run --intent, --base-branch, and --yes is required; rerun make setup to update it natively'
 		fi
-		no_mistakes_is_suitable || die 'No-Mistakes still lacks axi run --intent and --yes; fix PATH or update it natively and rerun'
+		no_mistakes_is_suitable || die 'No-Mistakes still lacks axi run --intent, --base-branch, and --yes; fix PATH or update it natively and rerun'
 	fi
 }
 
@@ -428,11 +428,11 @@ install_tools() {
 	done
 }
 
-# A capability check, not a version floor: stable releases document axi run --intent and --yes.
+# A capability check, not a version floor: stable releases document axi run --intent, --base-branch, and --yes.
 no_mistakes_is_suitable() {
 	local help flag pattern
 	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 no-mistakes axi run --help 2>/dev/null)" || return 1
-	for flag in --intent --yes; do
+	for flag in --intent --base-branch --yes; do
 		# An exact flag: --intent-file alone is not the stable interface.
 		pattern="${flag}([^[:alnum:]_-]|\$)"
 		[[ "$help" =~ $pattern ]] || return 1
