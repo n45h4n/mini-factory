@@ -811,36 +811,80 @@ load_manager_manifests
 [ "$GH_DASH_SOURCE_BRANCH" != "$issue_branch" ] ||
 	worktree_conflict "source checkout already uses $issue_branch; refusing to create another worktree"
 
-# Preparation always inspects a fresh fetch of the remote default branch, never a stale snapshot.
+# Preparation inspects the exact commit ghd captured, and only when GitHub's same-named branch does not contradict it.
 if [ "$issue_mode" = prepare ]; then
 	view_source_repository() {
-		cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner,sshUrl,defaultBranchRef
+		cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner,sshUrl
 	}
 	repository_json=
 	capture_json repository_json view_source_repository
 	printf '%s\n' "$repository_json" | jq -e --arg repository "$current_repo" \
 		'.nameWithOwner == $repository and
-		 (.sshUrl | type == "string" and length > 0) and
-		 (.defaultBranchRef.name | type == "string" and length > 0)' >/dev/null 2>&1 ||
-		die 'the source GitHub repository response has no usable default branch'
-	default_branch="$(printf '%s\n' "$repository_json" | jq -r '.defaultBranchRef.name')"
+		 (.sshUrl | type == "string" and length > 0)' >/dev/null 2>&1 ||
+		die 'the source GitHub repository response has no usable SSH URL'
 	fetch_url="$(printf '%s\n' "$repository_json" | jq -r '.sshUrl')"
-	git -C "$source_root" check-ref-format --branch "$default_branch" >/dev/null 2>&1 ||
-		die "invalid default branch name: $default_branch"
 	validate_fetch_url "$fetch_url" "$current_repo_lower"
+	# The full ref, so a tag sharing the branch's name cannot change what is compared.
+	source_branch_ref="refs/heads/$GH_DASH_SOURCE_BRANCH"
+	git -C "$source_root" check-ref-format "$source_branch_ref" >/dev/null 2>&1 ||
+		die "invalid captured source branch: $GH_DASH_SOURCE_BRANCH"
 	preparation_ref="refs/gh-dash-issue-prepare/$lock_identity"
 	git -C "$source_root" check-ref-format "$preparation_ref" >/dev/null 2>&1 ||
 		die 'unable to derive a valid preparation base ref'
-	git -C "$source_root" fetch \
-		--no-tags \
-		--no-write-fetch-head \
-		--no-auto-maintenance \
-		--force \
-		"$fetch_url" \
-		"+refs/heads/$default_branch:$preparation_ref" ||
-		die "unable to fetch $default_branch from $current_repo; preparation not started and no older snapshot was used"
-	branch_base_sha="$(git -C "$source_root" rev-parse --verify "${preparation_ref}^{commit}" 2>/dev/null)" ||
-		die "the fetched $default_branch commit is unavailable"
+	branch_base_sha="$(git -C "$source_root" rev-parse --verify "${GH_DASH_SOURCE_SHA}^{commit}" 2>/dev/null)" ||
+		die "captured source commit is unavailable: $GH_DASH_SOURCE_SHA"
+	source_snapshot="$GH_DASH_SOURCE_BRANCH@${branch_base_sha:0:12}"
+	verification_failure='preparation not started, no older snapshot was used, and no other branch was substituted'
+
+	commit_is_ancestor() {
+		local status=0
+
+		git -C "$source_root" merge-base --is-ancestor "$1" "$2" 2>/dev/null || status=$?
+		[ "$status" -le 1 ] ||
+			die "unable to compare $source_snapshot with $GH_DASH_SOURCE_BRANCH on $current_repo; $verification_failure"
+		return "$status"
+	}
+
+	# ls-remote reports an absent branch as success with no match; a failed fetch could not tell that from a transport error.
+	remote_listing="$(git -C "$source_root" ls-remote --refs "$fetch_url" "$source_branch_ref")" ||
+		die "unable to read $GH_DASH_SOURCE_BRANCH from $current_repo; $verification_failure"
+	remote_branch_found=0
+	# A listing pattern also matches longer refs that merely end in this path.
+	while IFS=$'\t' read -r _ listed_ref; do
+		if [ "$listed_ref" = "$source_branch_ref" ]; then
+			remote_branch_found=1
+		fi
+	done <<<"$remote_listing"
+
+	if [ "$remote_branch_found" -eq 0 ]; then
+		source_freshness='local/unpublished: not on GitHub'
+		source_freshness_note="LOCAL/UNPUBLISHED: $current_repo has no branch named $GH_DASH_SOURCE_BRANCH, so this snapshot has not been published there; do not describe it as the current remote state."
+	else
+		git -C "$source_root" fetch \
+			--no-tags \
+			--no-write-fetch-head \
+			--no-auto-maintenance \
+			--force \
+			"$fetch_url" \
+			"+$source_branch_ref:$preparation_ref" ||
+			die "unable to fetch $GH_DASH_SOURCE_BRANCH from $current_repo; $verification_failure"
+		remote_branch_sha="$(git -C "$source_root" rev-parse --verify "${preparation_ref}^{commit}" 2>/dev/null)" ||
+			die "the fetched $GH_DASH_SOURCE_BRANCH commit is unavailable; $verification_failure"
+		if [ "$remote_branch_sha" = "$branch_base_sha" ]; then
+			source_freshness='matches GitHub'
+			source_freshness_note="$current_repo's $GH_DASH_SOURCE_BRANCH branch was verified at this same commit just before this preparation."
+		elif commit_is_ancestor "$remote_branch_sha" "$branch_base_sha"; then
+			source_freshness="local/unpublished: ahead of GitHub's ${remote_branch_sha:0:12}"
+			source_freshness_note="LOCAL/UNPUBLISHED: this snapshot is ahead of $current_repo's $GH_DASH_SOURCE_BRANCH branch (at $remote_branch_sha), so it includes unpublished commits; do not describe it as the current remote state."
+		else
+			if commit_is_ancestor "$branch_base_sha" "$remote_branch_sha"; then
+				remote_relation='is ahead of'
+			else
+				remote_relation='has diverged from'
+			fi
+			finish_without_action "$GH_DASH_SOURCE_BRANCH on GitHub (${remote_branch_sha:0:12}) $remote_relation the commit ghd captured ($source_snapshot); preparation not started and prompt not sent. Sync that checkout with GitHub, then relaunch ghd."
+		fi
+	fi
 fi
 
 load_worktree_state() {
@@ -1282,18 +1326,18 @@ require_manager_manifest
 refresh_preparation_worktree() {
 	local head_sha="$1" status_output
 
-	# Local changes would be presented as current-default-branch evidence, even at the fetched HEAD.
+	# Local changes would be presented as evidence of the captured snapshot, even at its exact commit.
 	status_output="$(git -C "$worktree_root" status --porcelain --untracked-files=normal 2>/dev/null)" ||
 		die 'unable to inspect the preparation worktree state'
 	[ -n "$status_output" ] || [ "$head_sha" != "$branch_base_sha" ] || return 0
 	if [ -n "$status_output" ] ||
 		! git -C "$worktree_root" merge-base --is-ancestor "$head_sha" "$branch_base_sha" 2>/dev/null; then
-		printf 'WARNING: %s: preparation worktree %s has local work or diverged from %s\n' \
-			"$PROGRAM" "$worktree_root" "$default_branch" >&2
-		finish_without_action "Preparation worktree has local work or diverged from $default_branch; not refreshed and prompt not sent. To start fresh, remove it with herdr worktree remove --workspace $workspace_id, then delete branch $issue_branch."
+		printf 'WARNING: %s: preparation worktree %s has local work or diverged from captured %s\n' \
+			"$PROGRAM" "$worktree_root" "$source_snapshot" >&2
+		finish_without_action "Preparation worktree has local work or diverged from captured $source_snapshot; not refreshed and prompt not sent. To start fresh, remove it with herdr worktree remove --workspace $workspace_id, then delete branch $issue_branch."
 	fi
 	git -C "$worktree_root" merge --ff-only --quiet "$branch_base_sha" >&2 ||
-		die "unable to fast-forward the preparation worktree to $default_branch; existing work was preserved"
+		die "unable to fast-forward the preparation worktree to captured $source_snapshot; existing work was preserved"
 }
 
 capture_issue_intent() {
@@ -1324,10 +1368,11 @@ prepare_issue_prompt() {
 		die "unable to inspect the $issue_branch worktree"
 	if [ "$issue_mode" = prepare ]; then
 		refresh_preparation_worktree "$head_sha"
-		prompt_summary="Preparation of #$issue_number at $default_branch ${branch_base_sha:0:12}."
-		prompt="Prepare issue ${selected_repo}#${issue_number} for dispatch; do not implement it. This separate preparation worktree is on branch $issue_branch at $default_branch commit $branch_base_sha, freshly fetched from $current_repo for this preparation.
+		prompt_summary="Preparation of #$issue_number at captured $source_snapshot ($source_freshness); uncommitted checkout changes are not included."
+		printf 'INFO: %s: %s\n' "$PROGRAM" "$prompt_summary" >&2
+		prompt="Prepare issue ${selected_repo}#${issue_number} for dispatch; do not implement it. This separate preparation worktree is on branch $issue_branch at commit $branch_base_sha, the committed snapshot of branch $GH_DASH_SOURCE_BRANCH that ghd captured at launch. $source_freshness_note Uncommitted changes in the source checkout are not included.
 
-1. Fetch the issue, for example with gh issue view $issue_number --repo $selected_repo --comments. Inspect the relevant code, repository instructions, tests, and documentation in this worktree. Report the branch and commit you inspected. If HEAD is no longer $branch_base_sha or you cannot confirm it is the current $default_branch, say so instead of presenting it as a current $default_branch check.
+1. Fetch the issue, for example with gh issue view $issue_number --repo $selected_repo --comments. Inspect the relevant code, repository instructions, tests, and documentation in this worktree. Report the captured branch and commit you inspected and whether GitHub matched it or it is local/unpublished. If HEAD is no longer $branch_base_sha, say so instead of presenting it as that snapshot.
 2. Verify the issue's premise, assess whether an agent could implement it as written, flag overengineering, and prefer the smallest justified scope.
 3. When useful, edit only this issue's title and body (gh issue edit $issue_number --repo $selected_repo) so it becomes an executable prompt with the relevant constraints, acceptance criteria, and validation. Do not implement it, commit, push, comment, or make any other repository or GitHub change.
 4. Make reasonable decisions from repository evidence. If an essential product decision is still unknown, report it concisely instead of inventing requirements.

@@ -586,13 +586,16 @@ elif name == "git":
         # Like native Git, --get-url only resolves configured rewrites locally; authentication happens on lookup.
         if os.environ.get("MOCK_TRANSPORT") == "pending" and "--get-url" not in args:
             fail("mock Git transport authentication failure")
-        print(os.environ.get("MOCK_EFFECTIVE_URL", "git@github.com:friend/target.git")
-              if "--get-url" in args else "0123456789abcdef0123456789abcdef01234567\tHEAD")
-        sys.exit(0)
-    if "fetch" in args and os.environ.get("MOCK_REMOTE"):
-        # Preparation fetches GitHub's sshUrl; route it to a disposable local fixture.
-        if os.environ.get("MOCK_FETCH") == "fail":
-            fail("mock default-branch fetch failure")
+        if "--refs" not in args or not os.environ.get("MOCK_REMOTE"):
+            print(os.environ.get("MOCK_EFFECTIVE_URL", "git@github.com:friend/target.git")
+                  if "--get-url" in args else "0123456789abcdef0123456789abcdef01234567\tHEAD")
+            sys.exit(0)
+    if "merge-base" in args and os.environ.get("MOCK_MERGE_BASE") == "fail":
+        fail("mock ancestry comparison failure")
+    if ("fetch" in args or "ls-remote" in args) and os.environ.get("MOCK_REMOTE"):
+        # Preparation reads and fetches GitHub's sshUrl; route it to a disposable local fixture.
+        if "fetch" in args and os.environ.get("MOCK_FETCH") == "fail":
+            fail("mock branch fetch failure")
         args = [os.environ["MOCK_REMOTE"] if arg == "git@github.com:friend/target.git" else arg for arg in args]
     elif (os.environ.get("MOCK_PR_WORKFLOW") == "1" and "worktree" in args
           and args[args.index("worktree") + 1:args.index("worktree") + 3] == ["add", "--detach"]):
@@ -824,6 +827,23 @@ class DistributionTests(unittest.TestCase):
         commit = git("commit-tree", parent + "^{tree}", "-p", parent, "-m", message)
         git("update-ref", "refs/heads/main", commit)
         return commit
+
+    def advance_branch(self, git, branch, message):
+        # A new commit with the same tree, so the checkout and the preparation worktree stay clean.
+        parent = git("rev-parse", "refs/heads/" + branch)
+        commit = git("commit-tree", parent + "^{tree}", "-p", parent, "-m", message)
+        git("update-ref", "refs/heads/" + branch, commit)
+        return commit
+
+    def github_fixture(self, repo, git, branches):
+        # A separate bare repository plays GitHub, so its branches can differ from the captured checkout.
+        remote = repo.parent / "github fixture.git"
+        git("init", "-q", "--bare", str(remote))
+        def remote_git(*args):
+            return git("-C", str(remote), "-c", "user.name=Remote Test", "-c", "user.email=remote@example.invalid", *args)
+        for branch, commit in branches.items():
+            git("push", "-q", str(remote), commit + ":refs/heads/" + branch)
+        return remote, remote_git
 
     def issue_environment(self, repo, git, **overrides):
         return {"HERDR_SOCKET_PATH": str(self.home / "test.sock"), "HERDR_WORKSPACE_ID": "ws",
@@ -1466,43 +1486,42 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 prompts = self.herdr_calls("agent", "prompt")
                 self.assertEqual([args[2] for args in prompts], ["issue-pane", "prep-pane"])
                 implement, prepare = (args[3] for args in prompts)
-                # Implementation keeps the captured base; preparation inspects freshly fetched main.
+                # Implementation and preparation share the captured source, whatever the default branch does.
                 self.assertEqual(git("rev-parse", "agent/issue-8"), captured)
-                self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
+                self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), captured)
                 self.assertNotEqual(captured, main)
                 self.assertIn('no-mistakes axi run --yes --base-branch feature/friend --intent "$(cat -- "$intent_file")"', implement)
                 for unsupported in ("--intent-file", "--closes"):
                     self.assertNotIn(unsupported, implement)
                 self.assertIn("starts from feature/friend at " + captured, implement)
                 self.assertTrue(prepare.startswith("Prepare issue friend/target#8 for dispatch; do not implement it."))
-                self.assertIn("main commit " + main, prepare)
+                self.assertIn("at commit " + captured, prepare)
+                self.assertNotIn(main, prepare)
                 self.assertIn("ready to dispatch, needs a decision, or already satisfied", prepare)
                 self.assertNotIn("no-mistakes", prepare)
 
     def test_preparation_refreshes_only_when_safe_and_never_uses_a_stale_snapshot(self):
         repo, git = self.source_repo()
-        main = self.advance_default_branch(git, "main 1")
+        self.advance_default_branch(git, "A newer default branch never moves preparation")
         route = self.issue_environment(repo, git, cwd=repo)
-        result = self.issue_helper("prepare", **dict(route, MOCK_FETCH="fail"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no older snapshot was used", result.stderr)
-        self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start")
-                         or self.herdr_calls("agent", "prompt"))
+        captured = route["GH_DASH_SOURCE_SHA"]
         self.assert_success(self.issue_helper("prepare", **route))
-        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), captured)
         self.assertEqual(git("branch", "--list", "agent/issue-8"), "")
         worktree = repo.parent / "prepare worktree with spaces"
 
-        newer = self.advance_default_branch(git, "main 2")
+        # A relaunched ghd on a newer commit fast-forwards the clean retained worktree.
+        newer = self.advance_branch(git, "feature/friend", "source 2")
+        route = self.issue_environment(repo, git, cwd=repo)
         self.log.write_text("")
         self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="idle")))
         self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), newer)
         self.assertFalse(self.herdr_calls("agent", "start"))
         prompts = self.herdr_calls("agent", "prompt")
         self.assertEqual(len(prompts), 1)
-        self.assertIn("main commit " + newer, prompts[0][3])
+        self.assertIn("at commit " + newer, prompts[0][3])
 
-        # Local changes block reuse even when the fetched default branch is unchanged.
+        # Local changes block reuse even when the captured commit is unchanged.
         (worktree / "source.txt").write_text("local change\n")
         self.log.write_text("")
         self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="idle")))
@@ -1511,11 +1530,16 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertIn("herdr worktree remove", self.notifications()[-1])
         (worktree / "source.txt").write_text("committed content\n")
 
-        self.advance_default_branch(git, "main 3")
-        self.log.write_text("")
-        self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="working")))
-        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), newer)
-        self.assertFalse(self.herdr_calls("agent", "prompt"))
+        # Busy or uncertain agents are never prompted, restarted, or moved to a newer capture.
+        latest = self.advance_branch(git, "feature/friend", "source 3")
+        route = self.issue_environment(repo, git, cwd=repo)
+        for status in ("working", "blocked", "unexpected-status"):
+            with self.subTest(status=status):
+                self.log.write_text("")
+                self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS=status)))
+                self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), newer)
+                self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start"))
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "prep-pane"]])
 
         (worktree / "notes.txt").write_text("keep me\n")
         self.log.write_text("")
@@ -1525,6 +1549,152 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertFalse(self.herdr_calls("agent", "prompt"))
         self.assertTrue(any("not refreshed" in body and "herdr worktree remove" in body
                             for body in self.notifications()))
+        (worktree / "notes.txt").unlink()
+
+        # Committed preparation work is diverged from the capture: kept, and never overwritten.
+        git("-C", str(worktree), "commit", "-q", "--allow-empty", "-m", "Local preparation commit")
+        preparation_head = git("rev-parse", "agent/prepare-issue-8")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper("prepare", **dict(route, MOCK_AGENT_STATUS="idle")))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), preparation_head)
+        self.assertNotEqual(preparation_head, latest)
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
+        self.assertIn("diverged from captured feature/friend@" + latest[:12], self.notifications()[-1])
+
+        # Preparation never starts the implementation pipeline or its branch.
+        self.assertFalse(self.calls("no-mistakes"))
+        self.assertEqual(git("branch", "--list", "agent/issue-8"), "")
+
+    def assert_nothing_prepared(self, git):
+        self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("worktree", "open")
+                         or self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+        self.assertEqual(git("branch", "--list", "agent/prepare-issue-8", "agent/issue-8"), "")
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["issue", "edit"]])
+        self.assertFalse(self.calls("no-mistakes"))
+
+    def test_preparation_uses_the_exact_branch_and_commit_ghd_captured(self):
+        self.install()
+        # A same-named tag at another commit must not change which remote ref is compared.
+        for branch, tagged in (("main", False), ("dev", False), ("feat/topic", False), ("release-1", True)):
+            with self.subTest(branch=branch):
+                repo, git = self.source_repo(base=self.root / branch.replace("/", "-"))
+                git("checkout", "-q", "-b", branch)
+                snapshot = self.ghd_snapshot(repo)
+                captured = snapshot["GH_DASH_SOURCE_SHA"]
+                self.assertEqual(snapshot["GH_DASH_SOURCE_BRANCH"], branch)
+                remote, remote_git = self.github_fixture(repo, git, {branch: captured})
+                if branch != "main":
+                    # GitHub's default branch has moved on, and preparation must not follow it.
+                    remote_git("update-ref", "refs/heads/main",
+                               remote_git("commit-tree", captured + "^{tree}", "-p", captured, "-m", "Newer default"))
+                if tagged:
+                    other = remote_git("commit-tree", captured + "^{tree}", "-m", "Unrelated tagged commit")
+                    remote_git("tag", branch, other)
+                    git("tag", branch, captured)
+                # Later checkout activity is not what ghd captured.
+                git("checkout", "-q", "-b", "later/elsewhere")
+                (repo / "source.txt").write_text("later source\n")
+                git("commit", "-qam", "Advance source after dashboard launch")
+                (repo / "source.txt").write_text("uncommitted later source\n")
+                route = self.issue_environment(repo, git, cwd=repo, MOCK_REMOTE=str(remote), **snapshot)
+                self.log.write_text("")
+                self.assert_success(self.issue_helper("prepare", **route))
+                self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), captured)
+                worktree = repo.parent / "prepare worktree with spaces"
+                self.assertEqual((worktree / "source.txt").read_text(), "committed content\n")
+                # The source checkout is left exactly as the user had it.
+                self.assertEqual(git("symbolic-ref", "--short", "HEAD"), "later/elsewhere")
+                self.assertEqual((repo / "source.txt").read_text(), "uncommitted later source\n")
+                prompt = self.herdr_calls("agent", "prompt")[-1][3]
+                self.assertIn("at commit " + captured + ", the committed snapshot of branch " + branch, prompt)
+                self.assertIn("friend/target's " + branch + " branch was verified at this same commit", prompt)
+                self.assertIn("Uncommitted changes in the source checkout are not included", prompt)
+                self.assertNotIn("LOCAL/UNPUBLISHED", prompt)
+                summary = self.notifications()[-1]
+                self.assertIn("captured " + branch + "@" + captured[:12] + " (matches GitHub)", summary)
+                self.assertIn("uncommitted checkout changes are not included", summary)
+                # The remote is addressed by full branch refs only, and no default branch is looked up.
+                ref = "refs/heads/" + branch
+                git_calls = [c["args"] for c in self.calls("git")]
+                self.assertIn(["ls-remote", "--refs", "git@github.com:friend/target.git", ref], [args[2:] for args in git_calls])
+                fetches = [args for args in git_calls if "fetch" in args]
+                self.assertEqual(len(fetches), 1)
+                self.assertIn("--no-tags", fetches[0])
+                self.assertEqual(fetches[0][-1], "+" + ref + ":refs/gh-dash-issue-prepare/repo-6-friend-6-target-issue-8-prepare")
+                self.assertFalse([c for c in self.calls("gh") if any("defaultBranchRef" in arg for arg in c["args"])])
+
+    def test_preparation_labels_a_local_or_unpublished_capture_without_claiming_freshness(self):
+        for label, published in (("branch missing", None), ("captured ahead", "older")):
+            with self.subTest(label):
+                repo, git = self.source_repo(base=self.root / label)
+                git("checkout", "-q", "-b", "dev")
+                older = git("rev-parse", "HEAD")
+                captured = self.advance_branch(git, "dev", "Unpublished work")
+                # Only an exact ref counts: this longer name also matches the refs/heads/dev listing pattern.
+                branches = {"main": captured, "decoy/refs/heads/dev": captured}
+                if published:
+                    branches["dev"] = older
+                remote, _ = self.github_fixture(repo, git, branches)
+                route = self.issue_environment(repo, git, cwd=repo, MOCK_REMOTE=str(remote), GH_DASH_SOURCE_BRANCH="dev")
+                self.log.write_text("")
+                self.assert_success(self.issue_helper("prepare", **route))
+                self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), captured)
+                prompt = self.herdr_calls("agent", "prompt")[-1][3]
+                self.assertIn("at commit " + captured, prompt)
+                self.assertIn("LOCAL/UNPUBLISHED", prompt)
+                self.assertIn("do not describe it as the current remote state", prompt)
+                self.assertIn("Uncommitted changes in the source checkout are not included", prompt)
+                self.assertNotIn("was verified at this same commit", prompt)
+                summary = self.notifications()[-1]
+                self.assertIn("captured dev@" + captured[:12] + " (local/unpublished", summary)
+                self.assertNotIn("matches GitHub", summary)
+                # Nothing listed the exact branch, so a missing branch is never fetched.
+                self.assertEqual(bool([c for c in self.calls("git") if "fetch" in c["args"]]), bool(published))
+
+    def test_preparation_refuses_a_capture_that_github_has_overtaken_or_contradicted(self):
+        for label, parent, relation in (("remote ahead", "captured", "is ahead of"), ("diverged", "older", "has diverged from")):
+            with self.subTest(label):
+                repo, git = self.source_repo(base=self.root / label)
+                git("checkout", "-q", "-b", "dev")
+                older = git("rev-parse", "HEAD")
+                captured = self.advance_branch(git, "dev", "Captured work")
+                base = {"captured": captured, "older": older}[parent]
+                remote, remote_git = self.github_fixture(repo, git, {"dev": base, "main": captured})
+                # This commit exists only on GitHub, as it would before the verification fetch.
+                github_only = remote_git("commit-tree", base + "^{tree}", "-p", base, "-m", "Only on GitHub")
+                remote_git("update-ref", "refs/heads/dev", github_only)
+                route = self.issue_environment(repo, git, cwd=repo, MOCK_REMOTE=str(remote), GH_DASH_SOURCE_BRANCH="dev")
+                self.log.write_text("")
+                result = self.issue_helper("prepare", **route)
+                self.assert_success(result)
+                self.assert_nothing_prepared(git)
+                message = "dev on GitHub (" + github_only[:12] + ") " + relation + " the commit ghd captured (dev@" + captured[:12] + ")"
+                self.assertIn(message, result.stderr)
+                self.assertIn(message, self.notifications()[-1])
+                self.assertIn("Sync that checkout with GitHub, then relaunch ghd", self.notifications()[-1])
+                self.assertEqual(git("rev-parse", "dev"), captured)
+
+    def test_preparation_fails_informatively_and_never_reuses_an_earlier_verification(self):
+        for label, failure, expected in (("listing", {"MOCK_TRANSPORT": "pending"}, "unable to read dev from friend/target"),
+                                         ("fetch", {"MOCK_FETCH": "fail"}, "unable to fetch dev from friend/target"),
+                                         ("comparison", {"MOCK_MERGE_BASE": "fail"}, "unable to compare dev@")):
+            with self.subTest(label):
+                repo, git = self.source_repo(base=self.root / label)
+                git("checkout", "-q", "-b", "dev")
+                older = git("rev-parse", "HEAD")
+                captured = self.advance_branch(git, "dev", "Captured work")
+                remote, _ = self.github_fixture(repo, git, {"dev": older})
+                # An earlier verification left the captured commit here; trusting it would claim a false match.
+                git("update-ref", "refs/gh-dash-issue-prepare/repo-6-friend-6-target-issue-8-prepare", captured)
+                route = self.issue_environment(repo, git, cwd=repo, MOCK_REMOTE=str(remote), GH_DASH_SOURCE_BRANCH="dev")
+                self.log.write_text("")
+                result = self.issue_helper("prepare", **dict(route, **failure))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                for fragment in (expected, "preparation not started", "no older snapshot was used",
+                                 "no other branch was substituted"):
+                    self.assertIn(fragment, result.stderr)
+                self.assertIn(expected, self.notifications()[-1])
+                self.assert_nothing_prepared(git)
 
     def test_implementation_handoff_passes_captured_intent_as_data(self):
         repo, git = self.source_repo()
@@ -1745,11 +1915,13 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertFalse(self.herdr_calls("agent", "prompt"))
                 self.assertEqual((worktree / "notes.txt").read_text(), "keep me\n")
 
-    def test_preparation_stays_on_the_fetched_default_branch_without_a_pr_target(self):
+    def test_preparation_stays_on_the_captured_commit_without_a_pr_target(self):
         repo, git = self.source_repo()
         main = self.advance_default_branch(git, "Current default branch")
-        self.assert_success(self.issue_helper("prepare", **self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH="dev")))
-        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), main)
+        route = self.issue_environment(repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH="dev")
+        self.assert_success(self.issue_helper("prepare", **route))
+        self.assertEqual(git("rev-parse", "agent/prepare-issue-8"), route["GH_DASH_SOURCE_SHA"])
+        self.assertNotEqual(git("rev-parse", "agent/prepare-issue-8"), main)
         self.assertNotIn("--base-branch", self.herdr_calls("agent", "prompt")[0][3])
         self.assertEqual(list(Path(self.env["XDG_STATE_HOME"]).rglob("*.pr-target.json")), [])
 
