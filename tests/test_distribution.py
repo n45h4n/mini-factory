@@ -1917,6 +1917,21 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         for shell in ("bash", "sh"):
             with self.subTest(shell=shell):
                 self.assertEqual(self.no_mistakes_argv(prompt, shell)[3:5], ["--base-branch", branch])
+        # Missing retained intent offers a recovery command with the same literal target.
+        self.intent_path(repo).unlink()
+        self.log.write_text("")
+        result = self.issue_helper(**self.issue_environment(
+            repo, git, cwd=repo, GH_DASH_SOURCE_BRANCH=branch, MOCK_AGENT_STATUS="idle"))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        command = result.stderr.split("From its worktree, run ", 1)[1].split(" with the intended scope", 1)[0]
+        for shell in ("bash", "sh"):
+            with self.subTest(recovery_shell=shell):
+                completed = subprocess.run(
+                    [shell, "-c", command], cwd=self.root, capture_output=True, text=True,
+                    env={"PATH": str(self.root / "argv capture") + os.pathsep + REAL_PATH}, check=True)
+                self.assertEqual(json.loads(completed.stdout),
+                                 ["axi", "run", "--yes", "--base-branch", branch, "--intent", "TEXT"])
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
         self.assertFalse(list(self.root.rglob("*-marker")), "the captured branch was evaluated as shell source")
 
     def test_independent_issues_keep_their_own_base_despite_later_checkout_changes(self):

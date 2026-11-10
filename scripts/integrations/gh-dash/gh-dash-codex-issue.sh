@@ -1016,12 +1016,15 @@ usable_intent() {
 # a later issue revision is never fetched into it. Earlier releases kept it at $lock_identity.md,
 # which is then used in place.
 load_retained_intent() {
+	local quoted_target
+
 	intent_path="$state_directory/intents/$lock_identity.$source_clone_identity.md"
 	usable_intent "$intent_path" ||
 		! usable_intent "$state_directory/intents/$lock_identity.md" ||
 		intent_path="$state_directory/intents/$lock_identity.md"
+	printf -v quoted_target '%q' "$pr_base_branch"
 	usable_intent "$intent_path" ||
-		die "$issue_branch has no usable retained issue intent at $intent_path. The current issue text was not substituted, its work and PR target $pr_base_branch were preserved, and no prompt was sent. From its worktree, run no-mistakes axi run --yes --base-branch $pr_base_branch --intent TEXT with the intended scope yourself; or save its work, remove its worktree and branch, and press $issue_key to start fresh."
+		die "$issue_branch has no usable retained issue intent at $intent_path. The current issue text was not substituted, its work and PR target $pr_base_branch were preserved, and no prompt was sent. From its worktree, run no-mistakes axi run --yes --base-branch $quoted_target --intent TEXT with the intended scope yourself; or save its work, remove its worktree and branch, and press $issue_key to start fresh."
 }
 
 refuse_untargeted_issue_branch() {
