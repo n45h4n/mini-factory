@@ -813,15 +813,14 @@ else
 fi
 verification_failure="$verification_failure and no local, older, or other-branch commit was used"
 
-view_source_repository() {
-	cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner,sshUrl
-}
-
 # Only new work needs the canonical repository; retained work is checked against the captured identity alone.
 resolve_source_repository() {
-	current_repo="$(
-		cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner --jq '.nameWithOwner'
+	repository_json="$(
+		cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner,sshUrl
 	)" || die "unable to resolve the source GitHub repository; $verification_failure. Check GitHub access, then press $issue_key again."
+	is_single_json_object "$repository_json" ||
+		die "the source GitHub repository response is not one JSON object; $verification_failure"
+	current_repo="$(printf '%s\n' "$repository_json" | jq -r '.nameWithOwner | strings')"
 	[ -n "$current_repo" ] || die "the canonical source GitHub repository is empty; $verification_failure"
 	current_repo_lower="$(printf '%s' "$current_repo" | lowercase)"
 	[ "$selected_repo_lower" = "$current_repo_lower" ] ||
@@ -836,10 +835,7 @@ pin_published_tip() {
 
 	[ -z "$branch_base_sha" ] || return 0
 	resolve_source_repository
-	capture_json repository_json view_source_repository
-	printf '%s\n' "$repository_json" | jq -e --arg repository "$current_repo" \
-		'.nameWithOwner == $repository and
-		 (.sshUrl | type == "string" and length > 0)' >/dev/null 2>&1 ||
+	printf '%s\n' "$repository_json" | jq -e '.sshUrl | type == "string" and length > 0' >/dev/null 2>&1 ||
 		die 'the source GitHub repository response has no usable SSH URL'
 	fetch_url="$(printf '%s\n' "$repository_json" | jq -r '.sshUrl')"
 	validate_fetch_url "$fetch_url" "$current_repo_lower"
