@@ -724,22 +724,14 @@ else
 	workspace_label="$repository_name#$issue_number"
 	agent_alias="$(sanitize_agent_alias "$repository_name" "$issue_number")"
 fi
-branch_base_sha="$GH_DASH_SOURCE_SHA"
+# Set only by pin_published_tip; ghd's launch commit identifies the branch and is never a base.
+branch_base_sha=
+published_snapshot=
 issue_branch_ref="refs/heads/$issue_branch"
 case "$agent_alias" in
 '' | [!a-z]* | *[!a-z0-9_-]*) die "unable to derive a valid Herdr agent alias: $agent_alias" ;;
 esac
 [ "${#agent_alias}" -le 32 ] || die "Herdr agent alias is too long: $agent_alias"
-
-current_repo="$(
-	cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner --jq '.nameWithOwner'
-)" || die 'unable to resolve the source GitHub repository'
-[ -n "$current_repo" ] || die 'the canonical source GitHub repository is empty'
-current_repo_lower="$(printf '%s' "$current_repo" | lowercase)"
-[ "$selected_repo_lower" = "$current_repo_lower" ] ||
-	die "selected issue repository $selected_repo does not match source repository $current_repo"
-[ "$captured_repo_lower" = "$current_repo_lower" ] ||
-	die "captured repository $GH_DASH_SOURCE_REPO does not match source repository $current_repo"
 
 status_json=
 capture_json status_json herdr status --json
@@ -811,77 +803,81 @@ load_manager_manifests
 [ "$GH_DASH_SOURCE_BRANCH" != "$issue_branch" ] ||
 	worktree_conflict "source checkout already uses $issue_branch; refusing to create another worktree"
 
-# Preparation inspects the exact commit ghd captured, and only when GitHub's same-named branch does not contradict it.
+# New preparation and a first implementation branch start from the published tip of the branch ghd
+# captured, observed once per dispatch. The full ref, so a tag sharing the branch's name cannot change it.
+source_branch_ref="refs/heads/$GH_DASH_SOURCE_BRANCH"
 if [ "$issue_mode" = prepare ]; then
-	view_source_repository() {
+	verification_failure='preparation not started'
+else
+	verification_failure="$issue_branch not created"
+fi
+verification_failure="$verification_failure and no local, older, or other-branch commit was used"
+
+# Only new work needs the canonical repository; retained work is checked against the captured identity alone.
+resolve_source_repository() {
+	repository_json="$(
 		cd "$source_root" && env -u GH_REPO gh repo view --json nameWithOwner,sshUrl
-	}
-	repository_json=
-	capture_json repository_json view_source_repository
-	printf '%s\n' "$repository_json" | jq -e --arg repository "$current_repo" \
-		'.nameWithOwner == $repository and
-		 (.sshUrl | type == "string" and length > 0)' >/dev/null 2>&1 ||
+	)" || die "unable to resolve the source GitHub repository; $verification_failure. Check GitHub access, then press $issue_key again."
+	is_single_json_object "$repository_json" ||
+		die "the source GitHub repository response is not one JSON object; $verification_failure"
+	current_repo="$(printf '%s\n' "$repository_json" | jq -r '.nameWithOwner | strings')"
+	[ -n "$current_repo" ] || die "the canonical source GitHub repository is empty; $verification_failure"
+	current_repo_lower="$(printf '%s' "$current_repo" | lowercase)"
+	[ "$selected_repo_lower" = "$current_repo_lower" ] ||
+		die "selected issue repository $selected_repo does not match source repository $current_repo; $verification_failure"
+	[ "$captured_repo_lower" = "$current_repo_lower" ] ||
+		die "captured repository $GH_DASH_SOURCE_REPO does not match source repository $current_repo; $verification_failure"
+}
+
+pin_published_tip() {
+	local repository_json fetch_url published_ref listing listed_sha listed_ref fetched_sha
+	local published_sha=
+
+	[ -z "$branch_base_sha" ] || return 0
+	resolve_source_repository
+	printf '%s\n' "$repository_json" | jq -e '.sshUrl | type == "string" and length > 0' >/dev/null 2>&1 ||
 		die 'the source GitHub repository response has no usable SSH URL'
 	fetch_url="$(printf '%s\n' "$repository_json" | jq -r '.sshUrl')"
 	validate_fetch_url "$fetch_url" "$current_repo_lower"
-	# The full ref, so a tag sharing the branch's name cannot change what is compared.
-	source_branch_ref="refs/heads/$GH_DASH_SOURCE_BRANCH"
-	preparation_ref="refs/gh-dash-issue-prepare/$lock_identity"
-	git -C "$source_root" check-ref-format "$preparation_ref" >/dev/null 2>&1 ||
-		die 'unable to derive a valid preparation base ref'
-	source_snapshot="$GH_DASH_SOURCE_BRANCH@${branch_base_sha:0:12}"
-	verification_failure='preparation not started, no older snapshot was used, and no other branch was substituted'
-
-	commit_is_ancestor() {
-		local status=0
-
-		git -C "$source_root" merge-base --is-ancestor "$1" "$2" 2>/dev/null || status=$?
-		[ "$status" -le 1 ] ||
-			die "unable to compare $source_snapshot with $GH_DASH_SOURCE_BRANCH on $current_repo; $verification_failure"
-		return "$status"
-	}
+	published_ref="refs/gh-dash-issue-$issue_mode/$lock_identity"
+	git -C "$source_root" check-ref-format "$published_ref" >/dev/null 2>&1 ||
+		die 'unable to derive a valid published-tip ref'
 
 	# ls-remote reports an absent branch as success with no match; a failed fetch could not tell that from a transport error.
-	remote_listing="$(git -C "$source_root" ls-remote --refs "$fetch_url" "$source_branch_ref")" ||
-		die "unable to read $GH_DASH_SOURCE_BRANCH from $current_repo; $verification_failure"
-	remote_branch_found=0
+	listing="$(git -C "$source_root" ls-remote --refs "$fetch_url" "$source_branch_ref")" ||
+		die "unable to read $GH_DASH_SOURCE_BRANCH from $current_repo; $verification_failure. Check Git access to GitHub, then press $issue_key again."
 	# A listing pattern also matches longer refs that merely end in this path.
-	while IFS=$'\t' read -r _ listed_ref; do
-		if [ "$listed_ref" = "$source_branch_ref" ]; then
-			remote_branch_found=1
-		fi
-	done <<<"$remote_listing"
-
-	if [ "$remote_branch_found" -eq 0 ]; then
-		source_freshness='local/unpublished: not on GitHub'
-		source_freshness_note="LOCAL/UNPUBLISHED: $current_repo has no branch named $GH_DASH_SOURCE_BRANCH, so this snapshot has not been published there; do not describe it as the current remote state."
-	else
-		git -C "$source_root" fetch \
-			--no-tags \
-			--no-write-fetch-head \
-			--no-auto-maintenance \
-			--force \
-			"$fetch_url" \
-			"+$source_branch_ref:$preparation_ref" ||
-			die "unable to fetch $GH_DASH_SOURCE_BRANCH from $current_repo; $verification_failure"
-		remote_branch_sha="$(git -C "$source_root" rev-parse --verify "${preparation_ref}^{commit}" 2>/dev/null)" ||
-			die "the fetched $GH_DASH_SOURCE_BRANCH commit is unavailable; $verification_failure"
-		if [ "$remote_branch_sha" = "$branch_base_sha" ]; then
-			source_freshness='matches GitHub'
-			source_freshness_note="$current_repo's $GH_DASH_SOURCE_BRANCH branch was verified at this same commit just before this preparation."
-		elif commit_is_ancestor "$remote_branch_sha" "$branch_base_sha"; then
-			source_freshness="local/unpublished: ahead of GitHub's ${remote_branch_sha:0:12}"
-			source_freshness_note="LOCAL/UNPUBLISHED: this snapshot is ahead of $current_repo's $GH_DASH_SOURCE_BRANCH branch (at $remote_branch_sha), so it includes unpublished commits; do not describe it as the current remote state."
-		else
-			if commit_is_ancestor "$branch_base_sha" "$remote_branch_sha"; then
-				remote_relation='is ahead of'
-			else
-				remote_relation='has diverged from'
-			fi
-			finish_without_action "$GH_DASH_SOURCE_BRANCH on GitHub (${remote_branch_sha:0:12}) $remote_relation the commit ghd captured ($source_snapshot); preparation not started and prompt not sent. Sync that checkout with GitHub, then relaunch ghd."
-		fi
-	fi
-fi
+	while IFS=$'\t' read -r listed_sha listed_ref; do
+		[ "$listed_ref" = "$source_branch_ref" ] || continue
+		[ -z "$published_sha" ] ||
+			die "$current_repo listed $GH_DASH_SOURCE_BRANCH more than once; $verification_failure"
+		published_sha="$(printf '%s' "$listed_sha" | lowercase)"
+	done <<<"$listing"
+	[ -n "$published_sha" ] ||
+		die "$GH_DASH_SOURCE_BRANCH is not published on $current_repo; $verification_failure. Push it, or relaunch ghd on a published branch, then press $issue_key again."
+	case "$published_sha" in
+	*[!0-9a-f]*) die "$current_repo listed an invalid commit for $GH_DASH_SOURCE_BRANCH; $verification_failure" ;;
+	esac
+	case "${#published_sha}" in
+	40 | 64) ;;
+	*) die "$current_repo listed an invalid commit for $GH_DASH_SOURCE_BRANCH; $verification_failure" ;;
+	esac
+	git -C "$source_root" fetch \
+		--no-tags \
+		--no-write-fetch-head \
+		--no-auto-maintenance \
+		--force \
+		"$fetch_url" \
+		"+$source_branch_ref:$published_ref" ||
+		die "unable to fetch $GH_DASH_SOURCE_BRANCH from $current_repo; $verification_failure. Check Git access to GitHub, then press $issue_key again."
+	fetched_sha="$(git -C "$source_root" rev-parse --verify "${published_ref}^{commit}" 2>/dev/null)" ||
+		die "the fetched $GH_DASH_SOURCE_BRANCH commit is unavailable; $verification_failure"
+	# A branch that moves between listing and fetch is reported, never re-polled.
+	[ "$fetched_sha" = "$published_sha" ] ||
+		die "$GH_DASH_SOURCE_BRANCH on $current_repo moved during the fetch (listed ${published_sha:0:12}, fetched ${fetched_sha:0:12}); $verification_failure. Press $issue_key again."
+	branch_base_sha="$published_sha"
+	published_snapshot="$GH_DASH_SOURCE_BRANCH@${branch_base_sha:0:12}"
+}
 
 load_worktree_state() {
 	local branch_lookup_status=0 listed_source_path listed_source_root
@@ -958,8 +954,8 @@ load_worktree_state() {
 	fi
 }
 
-# An implementation's PR target is bound once per clone, beside its private intent, so a retained
-# branch keeps the target of its first dispatch whatever a later ghd has checked out.
+# An implementation's PR target and intent are bound once per clone, so a retained
+# branch keeps the target and intent of its first dispatch whatever a later ghd has checked out.
 source_clone_identity="$(printf '%s' "$source_common_directory" | git -C "$source_root" hash-object --stdin)" ||
 	die 'unable to derive the source clone identity'
 pr_target_path="$state_directory/intents/$lock_identity.$source_clone_identity.pr-target.json"
@@ -991,6 +987,46 @@ load_pr_target() {
 	pr_base_branch="$recorded_base"
 }
 
+capture_issue_intent() {
+	local intent_directory="$state_directory/intents" issue_json intent_stage
+
+	ensure_private_directory "$intent_directory" 'issue intent directory'
+	intent_path="$intent_directory/$lock_identity.$source_clone_identity.md"
+	issue_json=
+	capture_json issue_json env -u GH_REPO \
+		gh issue view "$issue_number" --repo "$selected_repo" --json number,title,body
+	printf '%s\n' "$issue_json" | jq -e --arg number "$issue_number" \
+		'(.number | tostring) == $number and (.title | type) == "string" and (.body | type) == "string"' \
+		>/dev/null 2>&1 || die 'unexpected GitHub issue response; issue branch not created and prompt not sent'
+	# Issue prose is data: jq writes it to a private file and never shell-evaluates it.
+	intent_stage="$intent_path.$$"
+	if ! (umask 077 && printf '%s\n' "$issue_json" | jq -r --arg repository "$selected_repo" \
+		'"Issue \($repository)#\(.number): \(.title)\n\n\(.body)"' >"$intent_stage") ||
+		! mv -f -- "$intent_stage" "$intent_path"; then
+		rm -f -- "$intent_stage"
+		die 'unable to capture the issue intent outside the worktree; issue branch not created and prompt not sent'
+	fi
+}
+
+usable_intent() {
+	[ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] && [ -s "$1" ]
+}
+
+# A retained branch keeps the intent captured when it started, including any appended decisions;
+# a later issue revision is never fetched into it. Earlier releases kept it at $lock_identity.md,
+# which is then used in place.
+load_retained_intent() {
+	local quoted_target
+
+	intent_path="$state_directory/intents/$lock_identity.$source_clone_identity.md"
+	usable_intent "$intent_path" ||
+		! usable_intent "$state_directory/intents/$lock_identity.md" ||
+		intent_path="$state_directory/intents/$lock_identity.md"
+	printf -v quoted_target '%q' "$pr_base_branch"
+	usable_intent "$intent_path" ||
+		die "$issue_branch has no usable retained issue intent at $intent_path. The current issue text was not substituted, its work and PR target $pr_base_branch were preserved, and no prompt was sent. From its worktree, run no-mistakes axi run --yes --base-branch $quoted_target --intent TEXT with the intended scope yourself; or save its work, remove its worktree and branch, and press $issue_key to start fresh."
+}
+
 refuse_untargeted_issue_branch() {
 	die "$issue_branch has no recorded PR target (it predates target binding or came from another clone). The current ghd branch was not assumed, its work was preserved, and no prompt was sent. From its worktree, run no-mistakes axi run --yes --base-branch BRANCH --intent TEXT with the intended target yourself; or save its work, remove its worktree and branch, and press $issue_key to start fresh."
 }
@@ -1009,10 +1045,17 @@ if [ "$issue_mode" = implement ]; then
 fi
 # A new worktree cannot hold a retained agent, so the selected kind is checked before creating it.
 [ "$reusing_existing_worktree" -eq 1 ] || require_manager_manifest
+# Only new work needs GitHub; a retained issue branch or worktree is resumed or focused without it.
+if [ "$worktree_count" -eq 0 ] && { [ "$issue_mode" = prepare ] || [ "$branch_exists" -eq 0 ]; }; then
+	pin_published_tip
+fi
 if [ "$worktree_count" -eq 0 ]; then
 	if [ "$branch_exists" -eq 0 ]; then
-		# Recorded first, so an interrupted start cannot leave a branch that has lost its target.
-		[ "$issue_mode" != implement ] || record_pr_target
+		# Captured first, so an interrupted start cannot leave a branch that has lost its intent or target.
+		if [ "$issue_mode" = implement ]; then
+			capture_issue_intent
+			record_pr_target
+		fi
 		git -C "$source_root" update-ref "$issue_branch_ref" "$branch_base_sha" '' ||
 			worktree_conflict "unable to create issue branch $issue_branch"
 		created_issue_branch=1
@@ -1320,41 +1363,28 @@ fi
 require_manager_manifest
 
 refresh_preparation_worktree() {
-	local head_sha="$1" status_output
+	local head_sha="$1" status_output ancestry_status=0
 
-	# Local changes would be presented as evidence of the captured snapshot, even at its exact commit.
+	# Local changes would be presented as evidence of the published commit, even at that exact commit.
 	status_output="$(git -C "$worktree_root" status --porcelain --untracked-files=normal 2>/dev/null)" ||
 		die 'unable to inspect the preparation worktree state'
 	[ -n "$status_output" ] || [ "$head_sha" != "$branch_base_sha" ] || return 0
-	if [ -n "$status_output" ] ||
-		! git -C "$worktree_root" merge-base --is-ancestor "$head_sha" "$branch_base_sha" 2>/dev/null; then
-		printf 'WARNING: %s: preparation worktree %s has local work or diverged from captured %s\n' \
-			"$PROGRAM" "$worktree_root" "$source_snapshot" >&2
-		finish_without_action "Preparation worktree has local work or diverged from captured $source_snapshot; not refreshed and prompt not sent. To start fresh, remove it with herdr worktree remove --workspace $workspace_id, then delete branch $issue_branch."
+	if [ -z "$status_output" ]; then
+		git -C "$worktree_root" merge-base --is-ancestor "$head_sha" "$branch_base_sha" 2>/dev/null ||
+			ancestry_status=$?
+		[ "$ancestry_status" -le 1 ] ||
+			die "unable to compare the preparation worktree with published $published_snapshot; existing work was preserved and prompt not sent"
 	fi
+	if [ -n "$status_output" ] || [ "$ancestry_status" -ne 0 ]; then
+		printf 'WARNING: %s: preparation worktree %s has local work or diverged from published %s\n' \
+			"$PROGRAM" "$worktree_root" "$published_snapshot" >&2
+		finish_without_action "Preparation worktree has local work or diverged from published $published_snapshot; not refreshed and prompt not sent. To start fresh, remove it with herdr worktree remove --workspace $workspace_id, then delete branch $issue_branch."
+	fi
+	# A retained agent's conversation belongs to its older snapshot; only an agentless worktree is moved.
+	[ "$agent_present" -eq 0 ] ||
+		finish_without_action "Preparation agent still owns $issue_branch at older ${head_sha:0:12}; not moved to published $published_snapshot and prompt not sent. Exit the agent in its pane, then press $issue_key to prepare from the published commit."
 	git -C "$worktree_root" merge --ff-only --quiet "$branch_base_sha" >&2 ||
-		die "unable to fast-forward the preparation worktree to captured $source_snapshot; existing work was preserved"
-}
-
-capture_issue_intent() {
-	local intent_directory="$state_directory/intents" issue_json intent_stage
-
-	ensure_private_directory "$intent_directory" 'issue intent directory'
-	intent_path="$intent_directory/$lock_identity.md"
-	issue_json=
-	capture_json issue_json env -u GH_REPO \
-		gh issue view "$issue_number" --repo "$selected_repo" --json number,title,body
-	printf '%s\n' "$issue_json" | jq -e --arg number "$issue_number" \
-		'(.number | tostring) == $number and (.title | type) == "string" and (.body | type) == "string"' \
-		>/dev/null 2>&1 || die 'unexpected GitHub issue response; prompt not sent'
-	# Issue prose is data: jq writes it to a private file and never shell-evaluates it.
-	intent_stage="$intent_path.$$"
-	if ! (umask 077 && printf '%s\n' "$issue_json" | jq -r --arg repository "$selected_repo" \
-		'"Issue \($repository)#\(.number): \(.title)\n\n\(.body)"' >"$intent_stage") ||
-		! mv -f -- "$intent_stage" "$intent_path"; then
-		rm -f -- "$intent_stage"
-		die 'unable to capture the issue intent outside the worktree; prompt not sent'
-	fi
+		die "unable to fast-forward the preparation worktree to published $published_snapshot; existing work was preserved"
 }
 
 prepare_issue_prompt() {
@@ -1363,24 +1393,27 @@ prepare_issue_prompt() {
 	head_sha="$(git -C "$worktree_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
 		die "unable to inspect the $issue_branch worktree"
 	if [ "$issue_mode" = prepare ]; then
+		pin_published_tip
 		refresh_preparation_worktree "$head_sha"
-		prompt_summary="Preparation of #$issue_number at captured $source_snapshot ($source_freshness); uncommitted checkout changes are not included."
+		prompt_summary="Preparation of #$issue_number at published $published_snapshot (ghd launched at ${GH_DASH_SOURCE_SHA:0:12}); local-only commits and uncommitted changes are not included."
 		printf 'INFO: %s: %s\n' "$PROGRAM" "$prompt_summary" >&2
-		prompt="Prepare issue ${selected_repo}#${issue_number} for dispatch; do not implement it. This separate preparation worktree is on branch $issue_branch at commit $branch_base_sha, the committed snapshot of branch $GH_DASH_SOURCE_BRANCH that ghd captured at launch. $source_freshness_note Uncommitted changes in the source checkout are not included.
+		prompt="Prepare issue ${selected_repo}#${issue_number} for dispatch; do not implement it. This separate preparation worktree is on branch $issue_branch at commit $branch_base_sha, the published tip of $current_repo's $GH_DASH_SOURCE_BRANCH branch, fetched from GitHub for this preparation. The commit ghd launched at ($GH_DASH_SOURCE_SHA) only identified that branch; local-only commits and uncommitted changes in the source checkout are not included.
 
-1. Fetch the issue, for example with gh issue view $issue_number --repo $selected_repo --comments. Inspect the relevant code, repository instructions, tests, and documentation in this worktree. Report the captured branch and commit you inspected and whether GitHub matched it or it is local/unpublished. If HEAD is no longer $branch_base_sha, say so instead of presenting it as that snapshot.
-2. Verify the issue's premise, assess whether an agent could implement it as written, flag overengineering, and prefer the smallest justified scope.
-3. When useful, edit only this issue's title and body (gh issue edit $issue_number --repo $selected_repo) so it becomes an executable prompt with the relevant constraints, acceptance criteria, and validation. Do not implement it, commit, push, comment, or make any other repository or GitHub change.
-4. Make reasonable decisions from repository evidence. If an essential product decision is still unknown, report it concisely instead of inventing requirements.
-5. Finish with exactly one verdict: ready to dispatch, needs a decision, or already satisfied. Briefly explain any material edits."
+1. Fetch the issue, for example with gh issue view $issue_number --repo $selected_repo --comments. Report the branch $GH_DASH_SOURCE_BRANCH and commit $branch_base_sha you inspected. If HEAD is no longer $branch_base_sha, say so instead of presenting it as the published state.
+2. Compare each requirement with the relevant code, tests, repository instructions, and documentation in this worktree. Verify the issue's premise, assess whether an agent could implement it as written, and account for anything already satisfied, keeping only the remaining work.
+3. Prefer the smallest justified scope: flag overengineering and do not add speculative architecture.
+4. When useful, edit only this issue's title and body (gh issue edit $issue_number --repo $selected_repo) so it becomes an executable prompt with the relevant constraints, specific acceptance criteria, and focused executable validation. Distinguish verified facts from assumptions. Do not implement it, commit, push, comment, or make any other repository or GitHub change.
+5. Make reasonable decisions from repository evidence. If an essential product decision is still unknown, ask about it concisely instead of inventing requirements.
+6. Finish with exactly one verdict: ready to dispatch, needs a decision, or already satisfied. Briefly explain any material edits."
 		return
 	fi
 
 	[ -n "$pr_base_branch" ] || refuse_untargeted_issue_branch
-	capture_issue_intent
+	# A new branch's intent was captured before the branch was created.
+	[ "$created_issue_branch" -eq 1 ] || load_retained_intent
 	if [ "$created_issue_branch" -eq 1 ]; then
-		base_description="starts from $GH_DASH_SOURCE_BRANCH at $branch_base_sha, the committed source captured by ghd"
-		prompt_summary="Implementation of #$issue_number on $issue_branch from $GH_DASH_SOURCE_BRANCH@${branch_base_sha:0:12}; PR target $pr_base_branch; No-Mistakes outcome pending."
+		base_description="starts from $GH_DASH_SOURCE_BRANCH at $branch_base_sha, the published tip of $current_repo's $GH_DASH_SOURCE_BRANCH branch fetched when this implementation was dispatched (ghd launched at $GH_DASH_SOURCE_SHA, which only identified the branch)"
+		prompt_summary="Implementation of #$issue_number on $issue_branch from published $published_snapshot; PR target $pr_base_branch; No-Mistakes outcome pending."
 	else
 		base_description="is a retained branch now at $head_sha; its existing work is preserved"
 		prompt_summary="Implementation of #$issue_number on retained $issue_branch@${head_sha:0:12}; original PR target $pr_base_branch kept; No-Mistakes outcome pending."
@@ -1388,7 +1421,7 @@ prepare_issue_prompt() {
 	printf 'INFO: %s: %s\n' "$PROGRAM" "$prompt_summary" >&2
 	printf -v quoted_intent_path '%q' "$intent_path"
 	printf -v quoted_base_branch '%q' "$pr_base_branch"
-	prompt="Use the title and body of issue ${selected_repo}#${issue_number} captured in the private file $quoted_intent_path as the implementation prompt; that captured text is authoritative for the implementation scope. You may fetch the issue for context, but a later issue revision must not change the implementation scope; if it differs materially from the captured text, report the difference instead of implementing it. Implement it in this worktree on branch $issue_branch, which $base_description. That base can differ from the commit a preparation run inspected; do not assume they are the same. Follow the target repository's instructions and keep to the issue's intended scope.
+	prompt="Use the title and body of issue ${selected_repo}#${issue_number} captured in the private file $quoted_intent_path as the implementation prompt; that captured text is authoritative for the implementation scope. You may fetch the issue for context, but a later issue revision must not change the implementation scope; if it differs materially from the captured text, report the difference instead of implementing it. Implement it in this worktree on branch $issue_branch, which $base_description. That base can differ from the commit a preparation run inspected; do not assume they are the same. Recheck the issue's baseline-sensitive claims, such as what already exists, is missing, or is done, against the commit you actually start from before relying on them. Follow the target repository's instructions and keep to the issue's intended scope.
 
 When the implementation is ready, deliver it through No-Mistakes unattended:
 1. Run the relevant checks, then commit only the task changes on $issue_branch. No-Mistakes needs a non-default branch and a clean, committed worktree to start a run.
@@ -1455,6 +1488,9 @@ fi
 
 agent_status="$(printf '%s\n' "$agent_document" | jq -r \
 	'if (.result.agent.agent_status | type) == "string" then .result.agent.agent_status else "__uncertain__" end')"
+busy_notice=
+[ "$issue_mode" != prepare ] ||
+	busy_notice=" To prepare again from the latest published commit, let it finish, exit it in its pane, then press $issue_key."
 case "$agent_status" in
 idle | done)
 	prepare_issue_prompt
@@ -1470,13 +1506,13 @@ working)
 	if ! focus_exact_agent "$agent_pane_id" "$agent_tab_id"; then
 		die "issue is already running and was not resent, but the exact $manager_label agent could not be focused"
 	fi
-	notify "Issue already running; prompt not resent and worktree not refreshed.$retained_notice" request
+	notify "Issue already running; prompt not resent and worktree not refreshed.$busy_notice$retained_notice" request
 	;;
 blocked)
 	if ! focus_exact_agent "$agent_pane_id" "$agent_tab_id"; then
 		die "issue agent is blocked and was not resent, but the exact $manager_label agent could not be focused"
 	fi
-	notify "Issue agent is blocked; prompt not resent and worktree not refreshed.$retained_notice" request
+	notify "Issue agent is blocked; prompt not resent and worktree not refreshed.$busy_notice$retained_notice" request
 	;;
 *)
 	finish_uncertain_status \

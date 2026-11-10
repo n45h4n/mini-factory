@@ -52,8 +52,8 @@ checkout, `make doctor` would run that repository's own Makefile, and
 
 | View | Key | Action |
 | ---- | --- | ------ |
-| Issues | `i` | Prepare the issue with the selected agent: check it against the branch and commit captured when `ghd` launched (verified against that branch on GitHub), then edit only its title/body into an executable prompt and report **ready to dispatch**, **needs a decision**, or **already satisfied**. |
-| Issues | `I` | Implement the issue with the selected agent, commit it, and run No-Mistakes unattended (`--yes`) to an open PR. Never merges. |
+| Issues | `i` | Prepare the issue with the selected agent: check it against the latest commit published on GitHub for the branch `ghd` launched on (fetched at each press), then edit only its title/body into an executable prompt and report **ready to dispatch**, **needs a decision**, or **already satisfied**. |
+| Issues | `I` | Implement the issue with the selected agent (a new `agent/issue-N` branch starts from that branch's latest published commit), commit it, and run No-Mistakes unattended (`--yes`) to an open PR against that branch. Never merges. |
 | PRs | `I` | Review the PR **read-only** with the selected agent (Codex by default, or Claude Code or Cursor). Findings appear only in the reviewer's Herdr pane; nothing is posted to GitHub (see [What the workflows do](#what-the-workflows-do)). |
 
 **Each target repository needs PR checks.** No-Mistakes reports a finished run
@@ -341,8 +341,8 @@ pane), then press the key again.
 
 ## Git transport for PR reviews and issue preparation
 
-The existing PR worker, and issue preparation's captured-branch verification, use
-GitHub's `sshUrl`, including when `origin` uses HTTPS. With the default SSH transport, configure your own GitHub SSH key and
+The existing PR worker, and the published-branch fetch of issue preparation and
+new issue implementations, use GitHub's `sshUrl`, including when `origin` uses HTTPS. With the default SSH transport, configure your own GitHub SSH key and
 verify GitHub's host key using
 [GitHub's SSH instructions](https://docs.github.com/en/authentication/connecting-to-github-with-ssh).
 Then check in your target checkout:
@@ -398,36 +398,46 @@ changed `ISSUE_AGENT` or an `mf-config` profile while an agent still exists,
 that agent is kept and reused with its original options; the new choice applies
 once it is closed.
 
-Issue **i** prepares against the branch and commit `ghd` captured at launch (the
-same source **I** uses), not the default branch, that branch's upstream, or
-whatever is checked out later. It creates or reuses a separate
-`agent/prepare-issue-N` worktree, Herdr workspace, and agent at that committed
-snapshot; it never touches the source checkout or the implementation session,
-and uncommitted checkout changes are not included. Before anything starts, it
-compares the captured commit with the same named branch
-(`refs/heads/<captured-branch>`) on GitHub:
+Issue **i** prepares against the latest **published** commit of the branch
+`ghd` captured at launch (the same branch **I** uses), not the default branch,
+that branch's upstream, or whatever is checked out later. The commit `ghd`
+launched at only identifies the branch, so GitHub moving on needs no checkout
+sync or `ghd` relaunch. Before a new preparation prompt, it lists and fetches
+exactly `refs/heads/<captured-branch>` from the verified GitHub repository once
+and pins that commit. It creates or reuses a separate `agent/prepare-issue-N`
+worktree, Herdr workspace, and agent there; it never touches the source checkout
+or the implementation session, and local-only commits and uncommitted checkout
+changes are not included.
 
 | GitHub's branch | Result |
 | --- | --- |
-| Matches the captured commit | Prepares normally. |
-| Absent, or behind the captured commit | Prepares from the captured commit, labelled local/unpublished; it does not claim GitHub is current. |
-| Ahead of the captured commit, or diverged | Stops before creating or prompting anything. Sync the checkout with GitHub and relaunch `ghd`. |
-| Cannot be read, fetched, or compared | Preparation does not start. It never reuses an older snapshot or substitutes another branch. |
+| Present | Prepares from its current tip, whether `ghd` launched behind, ahead of, or diverged from it. |
+| Absent | Stops before creating or prompting anything. Push the branch (or relaunch `ghd` on a published branch), then press `i` again. |
+| Cannot be read or fetched, or moved during the fetch | Stops before creating or prompting anything. It never falls back to local code, an older snapshot, or another branch; press `i` again. |
 
-A new preparation branch starts at the captured commit. A retained preparation
-worktree is reused (fast-forwarded to it when behind) only when its agent is not
-working or blocked, it has no local changes, and it has not diverged; otherwise
-nothing is refreshed or sent, and the notification explains how to start fresh
-(close the agent, run `herdr worktree remove --workspace ID`, delete the
-branch). The prompt and notification name the captured branch and commit and
-its GitHub status, and the prompt allows only title/body edits of that issue.
+A new preparation branch starts at the published commit. A retained preparation
+worktree is fast-forwarded to it only when it has no agent, no local changes,
+and has not diverged. A working or blocked agent is only focused, without
+contacting GitHub; an idle or finished agent is prompted again only when its
+worktree is already at the published commit. Otherwise nothing is moved or
+sent, and the notification explains how to retry: exit the agent in its pane
+and press `i` again, or for local or diverged work, run
+`herdr worktree remove --workspace ID` and delete the branch. The prompt and
+notification name the published branch and commit, and the prompt allows only
+title/body edits of that issue.
 
-Issue **I** creates or reuses an `agent/issue-N` implementation worktree. A new
-branch starts at the commit `ghd` captured (below), which can differ from the
-commit an earlier preparation inspected under another `ghd` launch; the prompt
-and notification show the starting branch and SHA, or the retained branch's current SHA. The helper
-captures the issue title and body into a private file outside the worktree, and
-the prompt asks the agent to implement and commit the change, run
+Issue **I** creates or reuses an `agent/issue-N` implementation worktree. Only
+when it creates that branch for the first time does it fetch the captured
+branch's published tip the same way (and stop the same way when that fails),
+then start there; that commit can differ from the one an earlier preparation
+inspected. The prompt and notification show the actual starting branch and
+SHA, and the prompt asks the agent to recheck baseline-sensitive claims against
+it. A retained branch is never refreshed or rebased and is resumed without
+contacting GitHub; the prompt shows its current SHA. When it creates the
+branch, the helper captures the issue title and body into a private file outside
+the worktree; a retained branch reuses that file as it stands (with any
+decisions the agent appended), so later issue edits never change its scope, and
+a missing file is reported without sending a prompt. The prompt asks the agent to implement and commit the change, run
 `no-mistakes init` if the repository is not initialized, check the target's
 real PR-check expectations (see the
 [CI prerequisite](#ci-prerequisite-for-each-target-repository)), and start:
@@ -519,10 +529,11 @@ a fresh reviewer with the configured read-only options.
 
 `ghd` captures the physical source root, canonical GitHub repository, branch,
 commit SHA, and dirty status **before** opening gh-dash. New issue preparation and implementation
-worktrees contain the captured committed snapshot; uncommitted/untracked changes stay in
+worktrees start from the captured branch's published tip on GitHub (the captured SHA
+only identifies the branch); local-only commits and uncommitted/untracked changes stay in
 your source checkout. A dirty checkout produces a warning. Detached HEAD and
 repositories without a commit are rejected. Later changes in the source checkout
-do not replace the captured snapshot. Invoke `ghd` from the target checkout,
+do not change the captured branch. Invoke `ghd` from the target checkout,
 not from this distribution's clone.
 
 The bundled config includes existing defaults and exactly the three custom
@@ -858,9 +869,10 @@ end in `-prepare.log`; captured intents and each issue's bound PR target are in
 its private `intents/` directory) and `${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-pr-review/`
 (review diffs are in its private `contexts/` directory, one
 `pr-MERGE_BASE-HEAD.diff` per reviewed commit pair).
-Preparation keeps the last commit it fetched from the captured branch, used
-only for its freshness comparison, under
-`refs/gh-dash-issue-prepare/` in the target repository. Dispatch reports the
+Preparation and new implementations keep the last commit they fetched from the
+captured branch under `refs/gh-dash-issue-prepare/` and
+`refs/gh-dash-issue-implement/` in the target repository; every press fetches
+again and never trusts an earlier one. Dispatch reports the
 relevant log path. Herdr's default-session logs are under
 `~/.config/herdr/`; named-session logs live under its `sessions/NAME/` directory.
 
@@ -941,7 +953,7 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    then `make doctor` reports ready.
 2. In a Herdr pane of the test repository, run the installed doctor (as in the
    quick start) until it reports Git transport authenticated, then run `ghd`, select the issue, press
-   `i`: the preparation agent reports the captured branch/commit it inspected and
+   `i`: the preparation agent reports the published branch/commit it inspected and
    one verdict, and edits only the issue's title/body.
 3. Press `I`: the implementation agent commits on `agent/issue-N`, starts
    `no-mistakes axi run --yes --base-branch ... --intent ...` with the captured branch and issue, and drives it.
