@@ -400,8 +400,13 @@ elif name == "herdr" and os.environ.get("MOCK_PR_WORKFLOW") == "1" and (
                           **({"open_workspace_id": "pr-ws"} if state.get("open") == path else {})})
         return found
     def agent():
+        # MOCK_STATUS_AFTER_FETCH is the status once the PR fetch has started (the mock Git fetch records it).
+        fetched = root / "pr-status-after-fetch"
+        status = (fetched.read_text() if os.environ.get("MOCK_STATUS_AFTER_FETCH") and fetched.exists()
+                  else os.environ.get("MOCK_AGENT_STATUS", "idle"))
         return {"name": state["alias"], "agent": state.get("kind", "codex"), "workspace_id": "pr-ws",
-                "tab_id": "pr-tab", "pane_id": "pr-pane", "agent_status": os.environ.get("MOCK_AGENT_STATUS", "idle")}
+                "tab_id": "pr-tab", "pane_id": os.environ.get("MOCK_AGENT_PANE", "pr-pane"),
+                **({} if status == "missing" else {"agent_status": status})}
     if args[:2] == ["worktree", "list"]:
         print(json.dumps({"id": "test", "result": {"type": "worktree_list",
             "source": {"source_checkout_path": args[args.index("--cwd") + 1], "source_workspace_id": "ws"},
@@ -420,7 +425,8 @@ elif name == "herdr" and os.environ.get("MOCK_PR_WORKFLOW") == "1" and (
         envelope("pane_info", "pane", {"pane_id": "pr-pane", "tab_id": "pr-tab", "workspace_id": "pr-ws",
                                        "foreground_cwd": state["open"]})
     elif args[:2] == ["agent", "list"]:
-        envelope("agent_list", "agents", [agent()] if "alias" in state else [])
+        copies = 2 if os.environ.get("MOCK_PR_AGENTS") == "duplicate" else 1
+        envelope("agent_list", "agents", [agent()] * copies if "alias" in state else [])
     elif args[:2] == ["agent", "get"]:
         if state.get("alias") != args[2]:
             print(json.dumps({"id": "test", "error": {"code": "agent_not_found", "message": "agent not found"}}))
@@ -601,6 +607,9 @@ elif name == "git":
         # Preparation reads and fetches GitHub's sshUrl; route it to a disposable local fixture.
         if "fetch" in args and os.environ.get("MOCK_FETCH") == "fail":
             fail("mock branch fetch failure")
+        if "fetch" in args and os.environ.get("MOCK_STATUS_AFTER_FETCH"):
+            # The PR reviewer is prompted in its own pane while the PR is being fetched.
+            (root / "pr-status-after-fetch").write_text(os.environ["MOCK_STATUS_AFTER_FETCH"])
         if "fetch" in args and os.environ.get("MOCK_FETCH_MOVES_TO"):
             # GitHub's branch moves after it was listed and before it is fetched.
             subprocess.run([os.environ["REAL_GIT"], "-C", os.environ["MOCK_REMOTE"], "update-ref",
@@ -3401,12 +3410,26 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 prompt = prompts[0][3]
                 self.assertIn("\n" + str(diff_path) + "\n", prompt)
                 self.assertIn("detached at the PR head " + route["MOCK_PR_HEAD"], prompt)
-                self.assertIn("merge base " + route["MOCK_PR_BASE"], prompt)
-                for rule in ("report your findings only here, in this terminal", "severity and a file/line reference",
-                             "say explicitly that there are no actionable findings", "Do not write to GitHub",
-                             "do not modify, create, or delete files"):
+                self.assertIn("The PR targets main at " + route["MOCK_PR_BASE"] + "; its changes are compared from "
+                              "their merge base " + route["MOCK_PR_BASE"], prompt)
+                # Findings must be evidence-backed problems this PR introduces, not speculation.
+                for rule in ("report your findings only here, in this terminal",
+                             "review exactly these and this diff, not the live PR, which may have moved since",
+                             "read the relevant callers, tests, and surrounding source",
+                             "acceptance criteria of a linked issue when they are readily available",
+                             "Report only actionable problems this PR introduces",
+                             "give its severity, a file/line reference, the specific condition that triggers it, its "
+                             "concrete consequence, and your evidence",
+                             "label anything you could not confirm as uncertain",
+                             "Flag missing tests only when materially changed behavior is left unprotected",
+                             "Do not report speculative edge cases, cosmetic nits, unrelated cleanup, or unnecessary "
+                             "architectural changes",
+                             "say explicitly that there are no actionable findings and mention any material limits of "
+                             "your validation", "You do not need to rerun the whole test suite",
+                             "Do not write to GitHub", "do not modify, create, or delete files"):
                     self.assertIn(rule, prompt)
-                for removed in ("<!-- gh-dash-codex-pr-review -->", "ready for review", "publish"):
+                for removed in ("<!-- gh-dash-codex-pr-review -->", "ready for review", "publish",
+                                "edge cases, and missing tests"):
                     self.assertNotIn(removed, prompt)
                 self.assertIn("read-only " + {"codex": "Codex", "claude": "Claude Code", "cursor": "Cursor"}[kind]
                               + " reviewer; its findings appear in its pane.", self.notifications()[-1])
@@ -3422,10 +3445,10 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.profiles_file({"pr-review": {"agent": "claude"}})
         self.assert_success(self.run_pr_review(repo, route))
         self.assertEqual(self.herdr_calls("agent", "start")[0][4], "claude")
-        # A changed selection never duplicates or replaces the live reviewer; idle, finished, or working
-        # reviewers get the review prompt again, as before.
+        # A changed selection never duplicates or replaces the live reviewer; an idle or finished reviewer gets the
+        # review prompt again.
         self.profiles_file({"pr-review": {"agent": "cursor", "model": "gpt-5"}})
-        for status in ("idle", "done", "working"):
+        for status in ("idle", "done"):
             with self.subTest(status=status):
                 result = self.run_pr_review(repo, route, MOCK_AGENT_STATUS=status)
                 self.assert_success(result)
@@ -3440,14 +3463,18 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 # Saved options are not even read for a retained reviewer.
                 self.assertFalse(self.calls("cursor-agent") + self.calls("claude"))
                 self.assert_terminal_only_review(repo, worktree)
-        # A blocked reviewer may be waiting on its own plan or trust dialog: it is focused, never typed into.
-        for status in ("blocked", "unexpected-status"):
+        # A working reviewer is still reviewing, and a blocked one may be waiting on its own plan or trust dialog:
+        # each is focused with its original harness, never typed into.
+        for status in ("working", "blocked", "unexpected-status"):
             with self.subTest(status=status):
                 result = self.run_pr_review(repo, route, MOCK_AGENT_STATUS=status)
                 self.assert_success(result)
                 self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start"))
                 self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "pr-pane"]])
                 self.assertIn("prompt not sent", self.notifications()[-1])
+                self.assertIn("exact Claude Code reviewer focused", self.notifications()[-1])
+                self.assertIn("it may not be read-only", self.notifications()[-1])
+                self.assertFalse(self.calls("cursor-agent") + self.calls("claude"))
         # Detection must cover the retained reviewer, not the new selection.
         result = self.run_pr_review(repo, route, MOCK_MANIFEST="claude")
         self.assertNotEqual(result.returncode, 0)
@@ -3502,40 +3529,147 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         git("update-ref", "refs/pull/7/head", head)
         return dict(route, MOCK_PR_HEAD=head)
 
-    def test_pr_review_keeps_each_prompted_diff_when_the_pr_advances(self):
+    REVIEW_REF = "refs/gh-dash-codex-pr-review/repo-6-friend-6-target-pr-7-review/head"
+
+    def review_inputs(self, git, worktree, context):
+        # What a retained reviewer reads: its worktree HEAD and state, the PR review refs, and every diff file.
+        return (git("-C", str(worktree), "rev-parse", "HEAD"),
+                git("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"),
+                git("for-each-ref", "--format=%(refname) %(objectname)", "refs/gh-dash-codex-pr-review/"),
+                {path.name: (path.stat().st_ino, path.read_text()) for path in context.iterdir()})
+
+    def assert_review_inputs_untouched(self, git, worktree, context, inputs):
+        # Nothing was fetched, moved, written, or pruned; no PR lookup, prompt, or second agent happened, and Herdr
+        # was only read, focused, or asked to notify.
+        self.assertEqual(self.review_inputs(git, worktree, context), inputs)
+        self.assertEqual({tuple(c["args"][:2]) for c in self.calls("gh")}, {("repo", "view")})
+        for args in (c["args"] for c in self.calls("git")):
+            self.assertFalse({"fetch", "switch", "update-ref", "worktree", "diff", "checkout", "merge-base"} & set(args),
+                             args)
+        reads = {("status", "--json"), ("workspace", "get"), ("tab", "get"), ("pane", "get"),
+                 ("server", "agent-manifests"), ("worktree", "list"), ("worktree", "open"), ("agent", "list"),
+                 ("agent", "get"), ("agent", "focus"), ("notification", "show")}
+        for args in self.herdr_calls():
+            self.assertIn(tuple(args[:2]), reads, args)
+
+    def test_pr_review_never_changes_what_a_busy_or_uncertain_reviewer_reads(self):
         repo, git = self.source_repo()
         route = self.pr_environment(repo, git)
         worktree, context = self.pr_review_paths()
         self.assert_success(self.run_pr_review(repo, route))
-        first = context / ("pr-" + route["MOCK_PR_BASE"] + "-" + route["MOCK_PR_HEAD"] + ".diff")
-        self.assertIn("\n" + str(first) + "\n", self.herdr_calls("agent", "prompt")[0][3])
-        first_diff = first.read_text()
-        # The PR advances to head B while the reviewer still works on head A's prompt; the same reviewer and the
-        # refreshed worktree get head B's diff in a new file, and head A's prompt keeps naming its unchanged diff.
+        head = route["MOCK_PR_HEAD"]
+        inputs = self.review_inputs(git, worktree, context)
+        self.assertEqual(inputs[0], head)
+        self.assertEqual(inputs[2], self.REVIEW_REF + " " + head)
+        # The PR moves from head A to head B while the reviewer still handles A: pressing I leaves A in place.
         advanced = self.advance_pr_head(repo, git, route, {"reviewed.txt": "reviewed change\nsecond change\n"})
-        self.assert_success(self.run_pr_review(repo, advanced, MOCK_AGENT_STATUS="working"))
+        for status, state in (("working", "PR reviewer is still working"),
+                              ("blocked", "PR reviewer is waiting for your answer in its pane"),
+                              ("unexpected-status", "PR reviewer status is uncertain (unexpected-status)"),
+                              ("missing", "PR reviewer status is uncertain (__uncertain__)")):
+            with self.subTest(status=status):
+                result = self.run_pr_review(repo, advanced, MOCK_AGENT_STATUS=status)
+                self.assert_success(result)
+                self.assert_review_inputs_untouched(git, worktree, context, inputs)
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "pr-pane"]])
+                notice = self.notifications()[-1]
+                self.assertIn(state + "; prompt not sent; its worktree at " + head[:12] + " and its diffs were left "
+                              "unchanged; exact Codex reviewer focused. Once it is idle or done, press I again to "
+                              "review the latest PR head.", notice)
+                # The retained session's current permission mode is still not claimed to be read-only.
+                self.assertIn("its read-only permissions cannot be verified and it may not be read-only", notice)
+        # An ambiguous identity is reported without focusing, prompting, starting, or closing anything.
+        for overrides in ({"MOCK_AGENT_PANE": "other-pane"}, {"MOCK_PR_AGENTS": "duplicate"}):
+            with self.subTest(**overrides):
+                result = self.run_pr_review(repo, advanced, **overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("identities conflict with target#7-review" if "MOCK_AGENT_PANE" in overrides
+                              else "multiple complete reviewer identities match target#7-review", result.stderr)
+                self.assertIn("ambiguous or conflicting; prompt not sent", self.notifications()[-1])
+                self.assert_review_inputs_untouched(git, worktree, context, inputs)
+                self.assertFalse(self.herdr_calls("agent", "focus"))
+        # Prompted in its pane while head B was being fetched, the reviewer still keeps head A.
+        result = self.run_pr_review(repo, advanced, MOCK_STATUS_AFTER_FETCH="working")
+        (self.mock / "pr-status-after-fetch").unlink()
+        self.assert_success(result)
+        self.assertEqual(self.review_inputs(git, worktree, context), inputs)
+        self.assertTrue([c for c in self.calls("git") if "fetch" in c["args"]])
+        self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start"))
+        self.assertIn("PR reviewer is still working; prompt not sent", self.notifications()[-1])
+
+    def test_pr_review_re_reviews_the_latest_captured_head_only_once_idle_or_done(self):
+        repo, git = self.source_repo()
+        route = self.pr_environment(repo, git)
+        worktree, context = self.pr_review_paths()
+        base = route["MOCK_PR_BASE"]
+        self.assert_success(self.run_pr_review(repo, route))
+        first = context / ("pr-" + base + "-" + route["MOCK_PR_HEAD"] + ".diff")
+        self.assertIn("\n" + str(first) + "\n", self.herdr_calls("agent", "prompt")[0][3])
+        first_diff = (first.stat().st_ino, first.read_text())
+        # Once the reviewer is idle, I deliberately reviews head B: the clean worktree and review ref move to B, and
+        # the one new prompt names B's exact captured head, base, and new diff; head A's diff stays as it was.
+        advanced = self.advance_pr_head(repo, git, route, {"reviewed.txt": "reviewed change\nsecond change\n"})
+        self.assert_success(self.run_pr_review(repo, advanced, MOCK_AGENT_STATUS="idle"))
+        second = context / ("pr-" + base + "-" + advanced["MOCK_PR_HEAD"] + ".diff")
         self.assertFalse(self.herdr_calls("agent", "start"))
-        second = context / ("pr-" + route["MOCK_PR_BASE"] + "-" + advanced["MOCK_PR_HEAD"] + ".diff")
-        self.assertIn("\n" + str(second) + "\n", self.herdr_calls("agent", "prompt")[0][3])
+        prompts = self.herdr_calls("agent", "prompt")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("\n" + str(second) + "\n", prompts[0][3])
+        self.assertIn("detached at the PR head " + advanced["MOCK_PR_HEAD"] + ". The PR targets main at " + base,
+                      prompts[0][3])
+        self.assertNotIn(route["MOCK_PR_HEAD"], prompts[0][3])
+        self.assertIn("exact existing Codex reviewer", self.notifications()[-1])
         self.assertEqual(git("-C", str(worktree), "rev-parse", "HEAD"), advanced["MOCK_PR_HEAD"])
-        self.assertEqual(first.read_text(), first_diff)
-        self.assertNotIn("+second change", first_diff)
+        self.assertEqual(git("rev-parse", self.REVIEW_REF), advanced["MOCK_PR_HEAD"])
+        self.assertEqual((first.stat().st_ino, first.read_text()), first_diff)
         self.assertIn("+second change", second.read_text())
         self.assertEqual(sorted(path.name for path in context.iterdir()), sorted([first.name, second.name]))
-        # Prompting the same head again reuses its diff file as is.
+        # A finished reviewer reviewing the same head again reuses its diff file as is.
         identity = second.stat().st_ino
-        self.assert_success(self.run_pr_review(repo, advanced, MOCK_AGENT_STATUS="idle"))
+        self.assert_success(self.run_pr_review(repo, advanced, MOCK_AGENT_STATUS="done"))
         self.assertEqual(second.stat().st_ino, identity)
+        self.assertEqual(len(self.herdr_calls("agent", "prompt")), 1)
+        # When the base branch advances too, the prompt names the new base and the unchanged merge base, and the
+        # pinned diff still holds only this PR's changes.
+        git("checkout", "-q", "--detach", "main")
+        (repo / "base-only.txt").write_text("base change\n")
+        git("add", "base-only.txt")
+        git("commit", "-q", "-m", "Base update")
+        new_base = git("rev-parse", "HEAD")
+        git("checkout", "-q", "feature/friend")
+        git("update-ref", "refs/heads/main", new_base)
+        moved = dict(self.advance_pr_head(repo, git, advanced, {"reviewed.txt": "reviewed change\nthird change\n"}),
+                     MOCK_PR_BASE=new_base)
+        self.assert_success(self.run_pr_review(repo, moved, MOCK_AGENT_STATUS="done"))
+        third = context / ("pr-" + base + "-" + moved["MOCK_PR_HEAD"] + ".diff")
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        self.assertIn("detached at the PR head " + moved["MOCK_PR_HEAD"] + ". The PR targets main at " + new_base
+                      + "; its changes are compared from their merge base " + base + ".", prompt)
+        self.assertIn("\n" + str(third) + "\n", prompt)
+        self.assertIn("+third change", third.read_text())
+        self.assertNotIn("base-only.txt", third.read_text())
+        self.assertEqual(git("-C", str(worktree), "rev-parse", "HEAD"), moved["MOCK_PR_HEAD"])
+        self.assert_terminal_only_review(repo, worktree)
         # Once that reviewer has exited, a fresh one removes the obsolete diffs, including a legacy pr.diff.
         (context / "pr.diff").write_text("legacy\n")
         state_file = self.mock / "pr-workflow.json"
         state = json.loads(state_file.read_text())
         del state["alias"]
         state_file.write_text(json.dumps(state))
-        self.assert_success(self.run_pr_review(repo, advanced))
+        self.assert_success(self.run_pr_review(repo, moved))
         self.assertEqual(len(self.herdr_calls("agent", "start")), 1)
-        self.assertEqual([path.name for path in context.iterdir()], [second.name])
+        self.assertEqual([path.name for path in context.iterdir()], [third.name])
         self.assert_terminal_only_review(repo, worktree)
+        # Without its worktree, an agent still using the reviewer's alias is ambiguous: nothing is fetched or created.
+        git("worktree", "remove", "--force", str(worktree))
+        result = self.run_pr_review(repo, moved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("partial or coordinate-sharing agent identities conflict", result.stderr)
+        self.assertFalse(worktree.exists())
+        self.assertEqual(git("rev-parse", self.REVIEW_REF), moved["MOCK_PR_HEAD"])
+        self.assertFalse([c for c in self.calls("git") if {"fetch", "worktree", "update-ref"} & set(c["args"])])
+        self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start")
+                         or self.herdr_calls("worktree", "open"))
 
     def test_codex_reviewer_refuses_a_pr_head_with_executable_project_codex_config(self):
         # Codex loads a trusted worktree's .codex/config.toml (MCP servers it starts as the user at launch) and
