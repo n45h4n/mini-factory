@@ -65,7 +65,7 @@ agent_conflict() {
 	local detail="$1"
 
 	printf 'ERROR: %s: %s\n' "$PROGRAM" "$detail" >&2
-	notify 'PR review agent identity is ambiguous or conflicting; prompt not sent.' request
+	notify 'PR review agent identity is ambiguous or conflicting; prompt not sent and no reviewer was closed. Resolve the conflict shown in the PR review diagnostics, then press I again.' request
 	exit 1
 }
 
@@ -889,28 +889,6 @@ require_reviewer_manifest() {
 		die "the Herdr server does not have an active $reviewer_label detection manifest"
 }
 
-pr_json=
-capture_json pr_json gh pr view "$pr_number" \
-	--repo "$selected_repo" \
-	--json number,state,headRefOid,baseRefOid,baseRefName,isCrossRepository
-printf '%s\n' "$pr_json" | jq -e --arg pr_number "$pr_number" \
-	'type == "object" and
-	 (.number | type == "number" and tostring == $pr_number) and
-	 (.state | type == "string" and length > 0) and
-	 (.headRefOid | type == "string" and length > 0) and
-	 (.baseRefOid | type == "string" and length > 0) and
-	 (.baseRefName | type == "string" and length > 0) and
-	 (.isCrossRepository | type == "boolean")' >/dev/null 2>&1 ||
-	die 'the pull request metadata response is malformed or identifies another PR'
-pr_head_sha="$(printf '%s\n' "$pr_json" | jq -r '.headRefOid')"
-pr_base_sha="$(printf '%s\n' "$pr_json" | jq -r '.baseRefOid')"
-pr_base_ref="$(printf '%s\n' "$pr_json" | jq -r '.baseRefName')"
-validate_commit_id "$pr_head_sha" 'pull request head commit'
-validate_commit_id "$pr_base_sha" 'pull request base commit'
-git -C "$source_root" check-ref-format --branch "$pr_base_ref" >/dev/null 2>&1 ||
-	die "pull request base branch is invalid: $pr_base_ref"
-pr_head_sha="$(printf '%s' "$pr_head_sha" | lowercase)"
-
 state_root="$(physical_directory "$state_directory")" || die 'unable to resolve the workflow state directory'
 review_worktree_parent="$state_root/worktrees"
 ensure_private_directory "$review_worktree_parent" 'PR review worktree parent directory'
@@ -923,47 +901,6 @@ case "$agent_alias" in
 '' | [!a-z]* | *[!a-z0-9_-]*) die "unable to derive a valid Herdr agent alias: $agent_alias" ;;
 esac
 [ "${#agent_alias}" -le 32 ] || die "Herdr agent alias is too long: $agent_alias"
-
-ref_root="refs/gh-dash-codex-pr-review/$lock_identity"
-review_ref="$ref_root/head"
-candidate_ref="$ref_root/candidate-$$"
-git -C "$source_root" check-ref-format "$review_ref" >/dev/null 2>&1 ||
-	die 'unable to derive a valid durable PR review ref'
-git -C "$source_root" check-ref-format "$candidate_ref" >/dev/null 2>&1 ||
-	die 'unable to derive a valid temporary PR review ref'
-candidate_lookup_status=0
-git -C "$source_root" show-ref --verify --quiet "$candidate_ref" || candidate_lookup_status=$?
-case "$candidate_lookup_status" in
-0) worktree_conflict "temporary PR review ref already exists: $candidate_ref" ;;
-1) ;;
-*) die 'unable to inspect the temporary PR review ref' ;;
-esac
-
-# The base branch is fetched without updating any local ref, only so its commit is available for the diff.
-git -C "$source_root" fetch \
-	--no-tags \
-	--no-write-fetch-head \
-	--no-auto-maintenance \
-	--force \
-	"$fetch_url" \
-	"+refs/pull/${pr_number}/head:$candidate_ref" \
-	"refs/heads/${pr_base_ref}" ||
-	die 'unable to fetch the pull request head and base refs'
-candidate_ref_owned=1
-candidate_sha="$(git -C "$source_root" rev-parse --verify "$candidate_ref" 2>/dev/null)" ||
-	die 'the fetched pull request head ref is unavailable'
-validate_commit_id "$candidate_sha" 'fetched pull request head commit'
-git -C "$source_root" cat-file -e "${candidate_sha}^{commit}" 2>/dev/null ||
-	die 'the fetched pull request head ref is not a commit'
-candidate_sha="$(printf '%s' "$candidate_sha" | lowercase)"
-[ "$candidate_sha" = "$pr_head_sha" ] ||
-	die 'the pull request head changed while it was being fetched; press I to retry'
-git -C "$source_root" cat-file -e "${pr_base_sha}^{commit}" 2>/dev/null ||
-	die 'the pull request base commit is unavailable after fetching its branch; press I to retry'
-# Like GitHub's Files changed view, the review compares the PR head with its merge base.
-merge_base_sha="$(git -C "$source_root" merge-base "$pr_base_sha" "$pr_head_sha" 2>/dev/null)" ||
-	die 'the pull request head and base have no merge base; review not started'
-validate_commit_id "$merge_base_sha" 'pull request merge base'
 
 load_worktree_state() {
 	local listed_source_path listed_source_root listed_worktree_common_directory
@@ -1054,147 +991,6 @@ load_worktree_state() {
 		'.open_workspace_id // empty')"
 }
 
-load_worktree_state
-initial_worktree_count="$worktree_count"
-initial_worktree_root="$listed_worktree_root"
-initial_open_workspace_id="$target_open_workspace_id"
-# A new worktree cannot hold a retained reviewer, so the selected kind is checked before creating it.
-[ "$initial_worktree_count" -eq 1 ] || require_reviewer_manifest
-
-review_ref_lookup_status=0
-git -C "$source_root" show-ref --verify --quiet "$review_ref" || review_ref_lookup_status=$?
-case "$review_ref_lookup_status" in
-0)
-	review_ref_exists=1
-	review_ref_sha="$(git -C "$source_root" rev-parse --verify "${review_ref}^{commit}" 2>/dev/null)" ||
-		die 'the durable PR review ref is not a commit'
-	validate_commit_id "$review_ref_sha" 'durable PR review ref'
-	review_ref_sha="$(printf '%s' "$review_ref_sha" | lowercase)"
-	;;
-1)
-	review_ref_exists=0
-	review_ref_sha=
-	;;
-*) die 'unable to inspect the durable PR review ref' ;;
-esac
-
-if [ "$worktree_count" -eq 0 ]; then
-	if [ "$review_ref_exists" -eq 0 ]; then
-		git -C "$source_root" update-ref "$review_ref" "$pr_head_sha" '' ||
-			worktree_conflict 'unable to create the durable PR review ref'
-	else
-		if [ "$review_ref_sha" != "$pr_head_sha" ]; then
-			git -C "$source_root" update-ref "$review_ref" "$pr_head_sha" "$review_ref_sha" ||
-				worktree_conflict 'unable to refresh the unoccupied durable PR review ref'
-		fi
-	fi
-	release_candidate_ref || die 'unable to remove the temporary PR-head ref'
-	git -C "$source_root" worktree add --detach "$review_worktree_path" "$review_ref" ||
-		worktree_conflict 'unable to create the detached PR review worktree'
-else
-	[ "$review_ref_exists" -eq 1 ] ||
-		worktree_conflict 'the PR review worktree exists without its durable review ref'
-	if [ "$worktree_head_sha" != "$pr_head_sha" ]; then
-		[ "$worktree_head_sha" = "$review_ref_sha" ] ||
-			worktree_conflict 'the PR review worktree and durable ref have diverged'
-		git -C "$listed_worktree_root" switch \
-			--detach \
-			--no-overwrite-ignore \
-			"$candidate_ref" ||
-			worktree_conflict 'unable to refresh the clean PR review worktree safely'
-		refreshed_worktree_sha="$(git -C "$listed_worktree_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
-			worktree_conflict 'unable to verify the refreshed PR review worktree HEAD'
-		refreshed_worktree_sha="$(printf '%s' "$refreshed_worktree_sha" | lowercase)"
-		[ "$refreshed_worktree_sha" = "$pr_head_sha" ] ||
-			worktree_conflict 'the refreshed PR review worktree does not match the pull request head'
-	fi
-	if [ "$review_ref_sha" != "$pr_head_sha" ]; then
-		git -C "$source_root" update-ref "$review_ref" "$pr_head_sha" "$review_ref_sha" ||
-			worktree_conflict 'unable to update the durable PR review ref after refreshing the worktree'
-	fi
-	release_candidate_ref || die 'unable to remove the temporary PR-head ref'
-fi
-
-load_worktree_state
-[ "$worktree_count" -eq 1 ] ||
-	worktree_conflict 'the prepared PR review worktree is not the only canonical worktree at its path'
-worktree_root="$listed_worktree_root"
-if [ "$initial_worktree_count" -eq 1 ]; then
-	[ "$worktree_root" = "$initial_worktree_root" ] ||
-		worktree_conflict 'the refreshed PR review worktree path changed unexpectedly'
-fi
-[ "$worktree_head_sha" = "$pr_head_sha" ] ||
-	worktree_conflict 'the prepared PR review worktree does not represent the pull request head'
-prepared_review_ref_sha="$(git -C "$source_root" rev-parse --verify "${review_ref}^{commit}" 2>/dev/null)" ||
-	worktree_conflict 'the prepared durable PR review ref is unavailable'
-prepared_review_ref_sha="$(printf '%s' "$prepared_review_ref_sha" | lowercase)"
-[ "$prepared_review_ref_sha" = "$pr_head_sha" ] ||
-	worktree_conflict 'the prepared durable PR review ref does not represent the pull request head'
-
-worktree_result_json=
-worktree_open_status=0
-capture_json_response worktree_result_json herdr worktree open \
-	--cwd "$source_root" \
-	--path "$review_worktree_path" \
-	--label "$workspace_label" \
-	--no-focus \
-	--json || worktree_open_status=$?
-[ "$worktree_open_status" -eq 0 ] ||
-	die "unable to open the PR review worktree; existing work was preserved: $worktree_result_json"
-json_has_type "$worktree_result_json" worktree_opened ||
-	die 'unexpected Herdr worktree-open response'
-printf '%s\n' "$worktree_result_json" | jq -e \
-	'.result.workspace.workspace_id as $workspace_id |
-	 .result.tab.tab_id as $tab_id |
-	 .result.root_pane.pane_id as $pane_id |
-	 ($workspace_id | type == "string" and length > 0) and
-	 ($tab_id | type == "string" and length > 0) and
-	 ($pane_id | type == "string" and length > 0) and
-	 (.result.already_open | type) == "boolean" and
-	 .result.tab.workspace_id == $workspace_id and
-	 .result.root_pane.workspace_id == $workspace_id and
-	 .result.root_pane.tab_id == $tab_id and
-	 (.result.root_pane.foreground_cwd | type == "string" and length > 0) and
-	 .result.worktree.branch == null and
-	 .result.worktree.is_bare == false and
-	 .result.worktree.is_detached == true and
-	 .result.worktree.is_prunable == false and
-	 .result.worktree.is_linked_worktree == true and
-	 (.result.worktree.path | type == "string" and length > 0)' >/dev/null 2>&1 ||
-	die 'Herdr returned an invalid PR review worktree or workspace identity'
-
-workspace_id="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.workspace.workspace_id')"
-root_tab_id="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.tab.tab_id')"
-root_pane_id="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.root_pane.pane_id')"
-root_pane_cwd="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.root_pane.foreground_cwd')"
-returned_worktree_path="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.worktree.path')"
-already_open="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.already_open')"
-returned_worktree_root="$(physical_directory "$returned_worktree_path")" ||
-	die 'Herdr returned an unavailable PR review worktree path'
-root_pane_directory="$(physical_directory "$root_pane_cwd")" ||
-	die 'the PR review workspace root pane has an unavailable live directory'
-[ "$returned_worktree_root" = "$worktree_root" ] ||
-	die 'Herdr opened a different PR review worktree path'
-[ "$root_pane_directory" = "$worktree_root" ] ||
-	die 'the PR review workspace root pane is not at the PR review worktree root'
-if [ -n "$initial_open_workspace_id" ]; then
-	[ "$already_open" = true ] && [ "$workspace_id" = "$initial_open_workspace_id" ] ||
-		worktree_conflict 'Herdr did not reuse the existing PR review workspace'
-else
-	[ "$already_open" = false ] ||
-		worktree_conflict 'Herdr reported an unexpected pre-existing PR review workspace'
-fi
-
-load_worktree_state
-[ "$worktree_count" -eq 1 ] ||
-	worktree_conflict 'opened PR review worktree is no longer canonical'
-[ "$listed_worktree_root" = "$worktree_root" ] ||
-	worktree_conflict 'post-open PR review worktree path changed unexpectedly'
-[ "$target_open_workspace_id" = "$workspace_id" ] ||
-	worktree_conflict 'canonical PR review worktree is associated with another workspace'
-[ "$worktree_head_sha" = "$pr_head_sha" ] ||
-	worktree_conflict 'opened PR review worktree no longer represents the pull request head'
-
 runtime_validation_error=
 validate_runtime_pane() {
 	local expected_tab_id="$1" expected_pane_id="$2"
@@ -1264,106 +1060,6 @@ agent_identity_matches() {
 			 ][]; type == "string" and length > 0)' >/dev/null 2>&1
 }
 
-agent_list_json=
-capture_json agent_list_json herdr agent list
-if ! json_has_type "$agent_list_json" agent_list ||
-	! printf '%s\n' "$agent_list_json" | jq -e \
-		'(.result.agents | type) == "array" and
-		 all(.result.agents[];
-			(type == "object") and
-			(.name == null or
-			 ((.name | type) == "string" and (.name | length) > 0)) and
-			(.agent == null or
-			 ((.agent | type) == "string" and (.agent | length) > 0)) and
-			((.workspace_id | type) == "string" and (.workspace_id | length) > 0) and
-			((.tab_id | type) == "string" and (.tab_id | length) > 0) and
-			((.pane_id | type) == "string" and (.pane_id | length) > 0))' >/dev/null 2>&1; then
-	die 'unexpected Herdr agent-list response'
-fi
-
-complete_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
-	--arg name "$agent_alias" \
-	--arg workspace_id "$workspace_id" \
-	--arg tab_id "$root_tab_id" \
-	--arg pane_id "$root_pane_id" \
-	'[.result.agents[] | select(
-		.name == $name and
-		(.agent == "claude" or .agent == "codex" or .agent == "cursor") and
-		.workspace_id == $workspace_id and
-		.tab_id == $tab_id and
-		.pane_id == $pane_id
-	)] | length')"
-related_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
-	--arg name "$agent_alias" \
-	--arg workspace_id "$workspace_id" \
-	--arg tab_id "$root_tab_id" \
-	--arg pane_id "$root_pane_id" \
-	'[.result.agents[] | select(
-		.name == $name or
-		.workspace_id == $workspace_id or
-		.tab_id == $tab_id or
-		.pane_id == $pane_id
-	)] | length')"
-if [ "$complete_agent_count" -gt 1 ]; then
-	agent_conflict "multiple complete reviewer identities match $workspace_label"
-fi
-if [ "$complete_agent_count" -eq 0 ] && [ "$related_agent_count" -gt 0 ]; then
-	agent_conflict "partial or coordinate-sharing agent identities conflict with $workspace_label"
-fi
-if [ "$complete_agent_count" -eq 1 ] && [ "$related_agent_count" -ne 1 ]; then
-	agent_conflict 'the complete PR reviewer identity has conflicting related entries'
-fi
-
-agent_document=
-agent_get_status=0
-capture_json_response agent_document herdr agent get "$agent_alias" || agent_get_status=$?
-if [ "$agent_get_status" -eq 125 ]; then
-	die "agent lookup did not return exactly one JSON object; prompt not sent: $agent_document"
-fi
-reuse_notice=
-reviewer_mode='read-only'
-if [ "$complete_agent_count" -eq 0 ]; then
-	case "$agent_get_status" in
-	0) agent_conflict "agent list and agent lookup disagree for alias $agent_alias" ;;
-	*)
-		json_is_error_only "$agent_document" agent_not_found ||
-			agent_conflict "agent lookup failed for alias $agent_alias: $agent_document"
-		;;
-	esac
-	agent_present=0
-else
-	[ "$agent_get_status" -eq 0 ] ||
-		agent_conflict "agent lookup failed for listed alias $agent_alias: $agent_document"
-	retained_kind="$(printf '%s\n' "$agent_list_json" | jq -r \
-		--arg name "$agent_alias" \
-		'[.result.agents[] | select(.name == $name)][0].agent')"
-	agent_identity_matches \
-		"$agent_document" agent_info \
-		"$agent_alias" "$retained_kind" "$workspace_id" "$root_tab_id" "$root_pane_id" ||
-		agent_conflict 'agent list and lookup identities do not agree completely'
-	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
-		agent_conflict "$runtime_validation_error"
-	agent_present=1
-	# Herdr does not report launch options, so a retained reviewer's read-only mode cannot be verified;
-	# it is never replaced, restarted, or changed.
-	if [ "$retained_kind" != "$reviewer_kind" ]; then
-		reuse_notice=" Kept the existing $(agent_label "$retained_kind") reviewer with its original options; the $reviewer_label setting applies once it is closed."
-		printf 'WARNING: %s: retaining existing %s reviewer for %s instead of the %s setting\n' \
-			"$PROGRAM" "$retained_kind" "$workspace_label" "$reviewer_kind" >&2
-		reviewer_kind="$retained_kind"
-		reviewer_label="$(agent_label "$reviewer_kind")"
-	elif [ "$reviewer_source" = override ]; then
-		reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer.'
-	else
-		reuse_notice=' Reused the existing reviewer with its original options.'
-	fi
-	reuse_notice="$reuse_notice WARNING: Herdr does not report those options, so its read-only permissions cannot be verified and it may not be read-only. Exit it in its pane, then press I again to start a fresh reviewer with the configured read-only options."
-	reviewer_mode='existing'
-	printf 'WARNING: %s: reusing existing %s reviewer for %s; its read-only permissions cannot be verified\n' \
-		"$PROGRAM" "$reviewer_kind" "$workspace_label" >&2
-fi
-require_reviewer_manifest
-
 focus_exact_agent() {
 	local focus_json response_status=0
 
@@ -1373,22 +1069,374 @@ focus_exact_agent() {
 			"$focus_json" agent_info "$agent_alias" "$reviewer_kind" "$workspace_id" "$root_tab_id" "$root_pane_id"
 }
 
-# A blocked reviewer waits on its own dialog (for example a plan or trust approval), where a typed
-# prompt could answer it; an unknown status is equally uncertain. Neither is prompted.
-if [ "$agent_present" -eq 1 ]; then
+# Opens or reuses the review worktree's own Herdr workspace, whose root pane holds the reviewer. Opening it
+# changes no files, so it is safe before the retained reviewer has been inspected.
+open_review_workspace() {
+	local worktree_result_json worktree_open_status=0 root_pane_cwd returned_worktree_path already_open
+	local returned_worktree_root root_pane_directory
+	local expected_open_workspace_id="$target_open_workspace_id" expected_head_sha="$worktree_head_sha"
+
+	worktree_root="$listed_worktree_root"
+	capture_json_response worktree_result_json herdr worktree open \
+		--cwd "$source_root" \
+		--path "$review_worktree_path" \
+		--label "$workspace_label" \
+		--no-focus \
+		--json || worktree_open_status=$?
+	[ "$worktree_open_status" -eq 0 ] ||
+		die "unable to open the PR review worktree; existing work was preserved: $worktree_result_json"
+	json_has_type "$worktree_result_json" worktree_opened ||
+		die 'unexpected Herdr worktree-open response'
+	printf '%s\n' "$worktree_result_json" | jq -e \
+		'.result.workspace.workspace_id as $workspace_id |
+		 .result.tab.tab_id as $tab_id |
+		 .result.root_pane.pane_id as $pane_id |
+		 ($workspace_id | type == "string" and length > 0) and
+		 ($tab_id | type == "string" and length > 0) and
+		 ($pane_id | type == "string" and length > 0) and
+		 (.result.already_open | type) == "boolean" and
+		 .result.tab.workspace_id == $workspace_id and
+		 .result.root_pane.workspace_id == $workspace_id and
+		 .result.root_pane.tab_id == $tab_id and
+		 (.result.root_pane.foreground_cwd | type == "string" and length > 0) and
+		 .result.worktree.branch == null and
+		 .result.worktree.is_bare == false and
+		 .result.worktree.is_detached == true and
+		 .result.worktree.is_prunable == false and
+		 .result.worktree.is_linked_worktree == true and
+		 (.result.worktree.path | type == "string" and length > 0)' >/dev/null 2>&1 ||
+		die 'Herdr returned an invalid PR review worktree or workspace identity'
+
+	workspace_id="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.workspace.workspace_id')"
+	root_tab_id="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.tab.tab_id')"
+	root_pane_id="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.root_pane.pane_id')"
+	root_pane_cwd="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.root_pane.foreground_cwd')"
+	returned_worktree_path="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.worktree.path')"
+	already_open="$(printf '%s\n' "$worktree_result_json" | jq -r '.result.already_open')"
+	returned_worktree_root="$(physical_directory "$returned_worktree_path")" ||
+		die 'Herdr returned an unavailable PR review worktree path'
+	root_pane_directory="$(physical_directory "$root_pane_cwd")" ||
+		die 'the PR review workspace root pane has an unavailable live directory'
+	[ "$returned_worktree_root" = "$worktree_root" ] ||
+		die 'Herdr opened a different PR review worktree path'
+	[ "$root_pane_directory" = "$worktree_root" ] ||
+		die 'the PR review workspace root pane is not at the PR review worktree root'
+	if [ -n "$expected_open_workspace_id" ]; then
+		[ "$already_open" = true ] && [ "$workspace_id" = "$expected_open_workspace_id" ] ||
+			worktree_conflict 'Herdr did not reuse the existing PR review workspace'
+	else
+		[ "$already_open" = false ] ||
+			worktree_conflict 'Herdr reported an unexpected pre-existing PR review workspace'
+	fi
+
+	load_worktree_state
+	[ "$worktree_count" -eq 1 ] ||
+		worktree_conflict 'opened PR review worktree is no longer canonical'
+	[ "$listed_worktree_root" = "$worktree_root" ] ||
+		worktree_conflict 'post-open PR review worktree path changed unexpectedly'
+	[ "$target_open_workspace_id" = "$workspace_id" ] ||
+		worktree_conflict 'canonical PR review worktree is associated with another workspace'
+	[ "$worktree_head_sha" = "$expected_head_sha" ] ||
+		worktree_conflict 'opened PR review worktree HEAD changed unexpectedly'
+}
+
+# Only an idle or finished reviewer is reviewed again. A working one is still reading its worktree and diff; a
+# blocked one waits on its own dialog (for example a plan or trust approval), where a typed prompt could answer
+# it; an unknown status is equally uncertain. Each is only focused: no PR fetch, worktree, review ref, or diff
+# change, and no prompt.
+hold_unready_reviewer() {
+	local agent_status retained
+
 	agent_status="$(printf '%s\n' "$agent_document" | jq -r \
 		'if (.result.agent.agent_status | type) == "string" then .result.agent.agent_status else "__uncertain__" end')"
 	case "$agent_status" in
-	idle | done | working) ;;
-	*)
-		focus_exact_agent ||
-			die "the $reviewer_label reviewer is $agent_status and was not prompted, but it could not be focused"
-		if [ "$agent_status" = blocked ]; then
-			finish_without_action "PR reviewer is waiting for your answer in its pane; prompt not sent; exact $reviewer_label reviewer focused.$reuse_notice"
-		fi
-		finish_without_action "PR reviewer status is uncertain ($agent_status); prompt not sent; exact $reviewer_label reviewer focused.$reuse_notice"
-		;;
+	idle | done) return 0 ;;
 	esac
+	focus_exact_agent ||
+		die "the $reviewer_label reviewer is $agent_status and was left unchanged without a prompt, but it could not be focused"
+	retained="prompt not sent; its worktree at ${worktree_head_sha:0:12} and its diffs were left unchanged; exact $reviewer_label reviewer focused. Once it is idle or done, press I again to review the latest PR head.$reuse_notice"
+	case "$agent_status" in
+	working) finish_without_action "PR reviewer is still working; $retained" ;;
+	blocked) finish_without_action "PR reviewer is waiting for your answer in its pane; $retained" ;;
+	esac
+	finish_without_action "PR reviewer status is uncertain ($agent_status); $retained"
+}
+
+# Before anything could replace the files, ref, or diff a retained reviewer is reading, its canonical identity
+# and status are verified. Without a review worktree no workspace can hold its reviewer, so any agent using its
+# alias conflicts.
+inspect_reviewer() {
+	agent_list_json=
+	capture_json agent_list_json herdr agent list
+	if ! json_has_type "$agent_list_json" agent_list ||
+		! printf '%s\n' "$agent_list_json" | jq -e \
+			'(.result.agents | type) == "array" and
+			 all(.result.agents[];
+				(type == "object") and
+				(.name == null or
+				 ((.name | type) == "string" and (.name | length) > 0)) and
+				(.agent == null or
+				 ((.agent | type) == "string" and (.agent | length) > 0)) and
+				((.workspace_id | type) == "string" and (.workspace_id | length) > 0) and
+				((.tab_id | type) == "string" and (.tab_id | length) > 0) and
+				((.pane_id | type) == "string" and (.pane_id | length) > 0))' >/dev/null 2>&1; then
+		die 'unexpected Herdr agent-list response'
+	fi
+
+	complete_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
+		--arg name "$agent_alias" \
+		--arg workspace_id "$workspace_id" \
+		--arg tab_id "$root_tab_id" \
+		--arg pane_id "$root_pane_id" \
+		'[.result.agents[] | select(
+			.name == $name and
+			(.agent == "claude" or .agent == "codex" or .agent == "cursor") and
+			.workspace_id == $workspace_id and
+			.tab_id == $tab_id and
+			.pane_id == $pane_id
+		)] | length')"
+	related_agent_count="$(printf '%s\n' "$agent_list_json" | jq -r \
+		--arg name "$agent_alias" \
+		--arg workspace_id "$workspace_id" \
+		--arg tab_id "$root_tab_id" \
+		--arg pane_id "$root_pane_id" \
+		'[.result.agents[] | select(
+			.name == $name or
+			.workspace_id == $workspace_id or
+			.tab_id == $tab_id or
+			.pane_id == $pane_id
+		)] | length')"
+	if [ "$complete_agent_count" -gt 1 ]; then
+		agent_conflict "multiple complete reviewer identities match $workspace_label"
+	fi
+	if [ "$complete_agent_count" -eq 0 ] && [ "$related_agent_count" -gt 0 ]; then
+		agent_conflict "partial or coordinate-sharing agent identities conflict with $workspace_label"
+	fi
+	if [ "$complete_agent_count" -eq 1 ] && [ "$related_agent_count" -ne 1 ]; then
+		agent_conflict 'the complete PR reviewer identity has conflicting related entries'
+	fi
+
+	agent_document=
+	agent_get_status=0
+	capture_json_response agent_document herdr agent get "$agent_alias" || agent_get_status=$?
+	if [ "$agent_get_status" -eq 125 ]; then
+		die "agent lookup did not return exactly one JSON object; prompt not sent: $agent_document"
+	fi
+	reuse_notice=
+	reviewer_mode='read-only'
+	if [ "$complete_agent_count" -eq 0 ]; then
+		case "$agent_get_status" in
+		0) agent_conflict "agent list and agent lookup disagree for alias $agent_alias" ;;
+		*)
+			json_is_error_only "$agent_document" agent_not_found ||
+				agent_conflict "agent lookup failed for alias $agent_alias: $agent_document"
+			;;
+		esac
+		agent_present=0
+	else
+		[ "$agent_get_status" -eq 0 ] ||
+			agent_conflict "agent lookup failed for listed alias $agent_alias: $agent_document"
+		retained_kind="$(printf '%s\n' "$agent_list_json" | jq -r \
+			--arg name "$agent_alias" \
+			'[.result.agents[] | select(.name == $name)][0].agent')"
+		agent_identity_matches \
+			"$agent_document" agent_info \
+			"$agent_alias" "$retained_kind" "$workspace_id" "$root_tab_id" "$root_pane_id" ||
+			agent_conflict 'agent list and lookup identities do not agree completely'
+		validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
+			agent_conflict "$runtime_validation_error"
+		agent_present=1
+		# Herdr does not report launch options, so a retained reviewer's read-only mode cannot be verified;
+		# it is never replaced, restarted, or changed.
+		if [ "$retained_kind" != "$reviewer_kind" ]; then
+			reuse_notice=" Kept the existing $(agent_label "$retained_kind") reviewer with its original options; the $reviewer_label setting applies once it is closed."
+			printf 'WARNING: %s: retaining existing %s reviewer for %s instead of the %s setting\n' \
+				"$PROGRAM" "$retained_kind" "$workspace_label" "$reviewer_kind" >&2
+			reviewer_kind="$retained_kind"
+			reviewer_label="$(agent_label "$reviewer_kind")"
+		elif [ "$reviewer_source" = override ]; then
+			reuse_notice=' Reused the existing reviewer with its original options; saved mf-config preferences apply to a fresh reviewer.'
+		else
+			reuse_notice=' Reused the existing reviewer with its original options.'
+		fi
+		reuse_notice="$reuse_notice WARNING: Herdr does not report those options, so its read-only permissions cannot be verified and it may not be read-only. Exit it in its pane, then press I again to start a fresh reviewer with the configured read-only options."
+		reviewer_mode='existing'
+		printf 'WARNING: %s: reusing existing %s reviewer for %s; its read-only permissions cannot be verified\n' \
+			"$PROGRAM" "$reviewer_kind" "$workspace_label" >&2
+	fi
+	require_reviewer_manifest
+	[ "$agent_present" -eq 0 ] || hold_unready_reviewer
+}
+
+load_worktree_state
+initial_worktree_count="$worktree_count"
+initial_worktree_root="$listed_worktree_root"
+if [ "$initial_worktree_count" -eq 1 ]; then
+	open_review_workspace
+else
+	workspace_id=
+	root_tab_id=
+	root_pane_id=
+fi
+# A busy, blocked, or uncertain reviewer stops here, before the PR is looked up or fetched. Without a retained
+# reviewer, the selected kind's detection is checked before a worktree is created.
+inspect_reviewer
+
+pr_json=
+capture_json pr_json gh pr view "$pr_number" \
+	--repo "$selected_repo" \
+	--json number,state,headRefOid,baseRefOid,baseRefName,isCrossRepository
+printf '%s\n' "$pr_json" | jq -e --arg pr_number "$pr_number" \
+	'type == "object" and
+	 (.number | type == "number" and tostring == $pr_number) and
+	 (.state | type == "string" and length > 0) and
+	 (.headRefOid | type == "string" and length > 0) and
+	 (.baseRefOid | type == "string" and length > 0) and
+	 (.baseRefName | type == "string" and length > 0) and
+	 (.isCrossRepository | type == "boolean")' >/dev/null 2>&1 ||
+	die 'the pull request metadata response is malformed or identifies another PR'
+pr_head_sha="$(printf '%s\n' "$pr_json" | jq -r '.headRefOid')"
+pr_base_sha="$(printf '%s\n' "$pr_json" | jq -r '.baseRefOid')"
+pr_base_ref="$(printf '%s\n' "$pr_json" | jq -r '.baseRefName')"
+validate_commit_id "$pr_head_sha" 'pull request head commit'
+validate_commit_id "$pr_base_sha" 'pull request base commit'
+git -C "$source_root" check-ref-format --branch "$pr_base_ref" >/dev/null 2>&1 ||
+	die "pull request base branch is invalid: $pr_base_ref"
+pr_head_sha="$(printf '%s' "$pr_head_sha" | lowercase)"
+
+ref_root="refs/gh-dash-codex-pr-review/$lock_identity"
+review_ref="$ref_root/head"
+candidate_ref="$ref_root/candidate-$$"
+git -C "$source_root" check-ref-format "$review_ref" >/dev/null 2>&1 ||
+	die 'unable to derive a valid durable PR review ref'
+git -C "$source_root" check-ref-format "$candidate_ref" >/dev/null 2>&1 ||
+	die 'unable to derive a valid temporary PR review ref'
+candidate_lookup_status=0
+git -C "$source_root" show-ref --verify --quiet "$candidate_ref" || candidate_lookup_status=$?
+case "$candidate_lookup_status" in
+0) worktree_conflict "temporary PR review ref already exists: $candidate_ref" ;;
+1) ;;
+*) die 'unable to inspect the temporary PR review ref' ;;
+esac
+
+# The base branch is fetched without updating any local ref, only so its commit is available for the diff.
+git -C "$source_root" fetch \
+	--no-tags \
+	--no-write-fetch-head \
+	--no-auto-maintenance \
+	--force \
+	"$fetch_url" \
+	"+refs/pull/${pr_number}/head:$candidate_ref" \
+	"refs/heads/${pr_base_ref}" ||
+	die 'unable to fetch the pull request head and base refs'
+candidate_ref_owned=1
+candidate_sha="$(git -C "$source_root" rev-parse --verify "$candidate_ref" 2>/dev/null)" ||
+	die 'the fetched pull request head ref is unavailable'
+validate_commit_id "$candidate_sha" 'fetched pull request head commit'
+git -C "$source_root" cat-file -e "${candidate_sha}^{commit}" 2>/dev/null ||
+	die 'the fetched pull request head ref is not a commit'
+candidate_sha="$(printf '%s' "$candidate_sha" | lowercase)"
+[ "$candidate_sha" = "$pr_head_sha" ] ||
+	die 'the pull request head changed while it was being fetched; press I to retry'
+git -C "$source_root" cat-file -e "${pr_base_sha}^{commit}" 2>/dev/null ||
+	die 'the pull request base commit is unavailable after fetching its branch; press I to retry'
+# Like GitHub's Files changed view, the review compares the PR head with its merge base.
+merge_base_sha="$(git -C "$source_root" merge-base "$pr_base_sha" "$pr_head_sha" 2>/dev/null)" ||
+	die 'the pull request head and base have no merge base; review not started'
+validate_commit_id "$merge_base_sha" 'pull request merge base'
+
+review_ref_lookup_status=0
+git -C "$source_root" show-ref --verify --quiet "$review_ref" || review_ref_lookup_status=$?
+case "$review_ref_lookup_status" in
+0)
+	review_ref_exists=1
+	review_ref_sha="$(git -C "$source_root" rev-parse --verify "${review_ref}^{commit}" 2>/dev/null)" ||
+		die 'the durable PR review ref is not a commit'
+	validate_commit_id "$review_ref_sha" 'durable PR review ref'
+	review_ref_sha="$(printf '%s' "$review_ref_sha" | lowercase)"
+	;;
+1)
+	review_ref_exists=0
+	review_ref_sha=
+	;;
+*) die 'unable to inspect the durable PR review ref' ;;
+esac
+
+# The reviewer may have been prompted in its pane during the fetch, so its status is read again just before its
+# review ref and worktree can move.
+if [ "$agent_present" -eq 1 ]; then
+	agent_get_status=0
+	capture_json_response agent_document herdr agent get "$agent_alias" || agent_get_status=$?
+	if [ "$agent_get_status" -ne 0 ] ||
+		! agent_identity_matches \
+			"$agent_document" agent_info \
+			"$agent_alias" "$reviewer_kind" "$workspace_id" "$root_tab_id" "$root_pane_id"; then
+		agent_conflict "the PR reviewer identity changed while the pull request was fetched: $agent_document"
+	fi
+	validate_runtime_pane "$root_tab_id" "$root_pane_id" ||
+		agent_conflict "$runtime_validation_error"
+	hold_unready_reviewer
+fi
+
+if [ "$worktree_count" -eq 0 ]; then
+	if [ "$review_ref_exists" -eq 0 ]; then
+		git -C "$source_root" update-ref "$review_ref" "$pr_head_sha" '' ||
+			worktree_conflict 'unable to create the durable PR review ref'
+	else
+		if [ "$review_ref_sha" != "$pr_head_sha" ]; then
+			git -C "$source_root" update-ref "$review_ref" "$pr_head_sha" "$review_ref_sha" ||
+				worktree_conflict 'unable to refresh the unoccupied durable PR review ref'
+		fi
+	fi
+	release_candidate_ref || die 'unable to remove the temporary PR-head ref'
+	git -C "$source_root" worktree add --detach "$review_worktree_path" "$review_ref" ||
+		worktree_conflict 'unable to create the detached PR review worktree'
+else
+	[ "$review_ref_exists" -eq 1 ] ||
+		worktree_conflict 'the PR review worktree exists without its durable review ref'
+	if [ "$worktree_head_sha" != "$pr_head_sha" ]; then
+		[ "$worktree_head_sha" = "$review_ref_sha" ] ||
+			worktree_conflict 'the PR review worktree and durable ref have diverged'
+		git -C "$listed_worktree_root" switch \
+			--detach \
+			--no-overwrite-ignore \
+			"$candidate_ref" ||
+			worktree_conflict 'unable to refresh the clean PR review worktree safely'
+		refreshed_worktree_sha="$(git -C "$listed_worktree_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+			worktree_conflict 'unable to verify the refreshed PR review worktree HEAD'
+		refreshed_worktree_sha="$(printf '%s' "$refreshed_worktree_sha" | lowercase)"
+		[ "$refreshed_worktree_sha" = "$pr_head_sha" ] ||
+			worktree_conflict 'the refreshed PR review worktree does not match the pull request head'
+	fi
+	if [ "$review_ref_sha" != "$pr_head_sha" ]; then
+		git -C "$source_root" update-ref "$review_ref" "$pr_head_sha" "$review_ref_sha" ||
+			worktree_conflict 'unable to update the durable PR review ref after refreshing the worktree'
+	fi
+	release_candidate_ref || die 'unable to remove the temporary PR-head ref'
+fi
+
+load_worktree_state
+[ "$worktree_count" -eq 1 ] ||
+	worktree_conflict 'the prepared PR review worktree is not the only canonical worktree at its path'
+worktree_root="$listed_worktree_root"
+if [ "$initial_worktree_count" -eq 1 ]; then
+	[ "$worktree_root" = "$initial_worktree_root" ] ||
+		worktree_conflict 'the refreshed PR review worktree path changed unexpectedly'
+fi
+[ "$worktree_head_sha" = "$pr_head_sha" ] ||
+	worktree_conflict 'the prepared PR review worktree does not represent the pull request head'
+prepared_review_ref_sha="$(git -C "$source_root" rev-parse --verify "${review_ref}^{commit}" 2>/dev/null)" ||
+	worktree_conflict 'the prepared durable PR review ref is unavailable'
+prepared_review_ref_sha="$(printf '%s' "$prepared_review_ref_sha" | lowercase)"
+[ "$prepared_review_ref_sha" = "$pr_head_sha" ] ||
+	worktree_conflict 'the prepared durable PR review ref does not represent the pull request head'
+
+if [ "$initial_worktree_count" -eq 1 ]; then
+	[ "$target_open_workspace_id" = "$workspace_id" ] ||
+		worktree_conflict 'the refreshed PR review worktree is associated with another workspace'
+else
+	open_review_workspace
+	inspect_reviewer
 fi
 
 # Codex loads a trusted worktree's .codex/config.toml (including MCP servers it starts as you at launch) and
@@ -1430,7 +1478,7 @@ fi
 
 # The full diff is handed off in a private file outside the worktree, so the worktree stays clean and
 # reviewers whose read-only mode cannot run shell commands can still read it. Each file is named by the
-# commits it compares and never rewritten, so a reviewer still reading an earlier prompt keeps its diff.
+# commits it compares and never rewritten, so a reused reviewer's earlier prompts keep naming their own diff.
 review_context_root="$state_root/contexts"
 review_context_directory="$review_context_root/$lock_identity"
 review_diff_path="$review_context_directory/pr-$(printf '%s' "$merge_base_sha" | lowercase)-$pr_head_sha.diff"
@@ -1514,11 +1562,11 @@ fi
 
 prompt="Review pull request ${selected_repo}#${pr_number} against its base. This is an interactive, read-only review: report your findings only here, in this terminal.
 
-This worktree is detached at the PR head $pr_head_sha. The PR targets $pr_base_ref at $pr_base_sha; its changes are compared from their merge base $merge_base_sha. Read the complete PR diff (git diff --stat --patch from the merge base to the PR head) with your read-only file tools from this private file outside the worktree:
+This review is pinned to the commits captured for this prompt: review exactly these and this diff, not the live PR, which may have moved since. This worktree is detached at the PR head $pr_head_sha. The PR targets $pr_base_ref at $pr_base_sha; its changes are compared from their merge base $merge_base_sha. Read the complete PR diff (git diff --stat --patch from the merge base to the PR head) with your read-only file tools from this private file outside the worktree:
 $review_diff_path
-Read the surrounding code in this worktree as needed.
+Evaluate those changes against the base: read the relevant callers, tests, and surrounding source in this worktree, and the acceptance criteria of a linked issue when they are readily available.
 
-Check for bugs, regressions, security issues, edge cases, and missing tests. Reply with concise, actionable findings ordered by severity, each with its severity and a file/line reference, or say explicitly that there are no actionable findings.
+Report only actionable problems this PR introduces, such as bugs, regressions, security issues, or unmet acceptance criteria. For each finding give its severity, a file/line reference, the specific condition that triggers it, its concrete consequence, and your evidence (the code you read or a check you ran); label anything you could not confirm as uncertain. Flag missing tests only when materially changed behavior is left unprotected. Do not report speculative edge cases, cosmetic nits, unrelated cleanup, or unnecessary architectural changes. Order findings by severity. If there are no actionable findings, say explicitly that there are no actionable findings and mention any material limits of your validation. You do not need to rerun the whole test suite.
 
 Stay read-only: do not modify, create, or delete files, commit, push, or switch branches. Do not write to GitHub: no PR or issue comments, reviews, approvals, draft/ready changes, or edits. Do not propose an implementation plan or ask to leave this read-only mode; the findings in this terminal are the whole result."
 

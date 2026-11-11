@@ -476,7 +476,8 @@ not include Pepper/Factory workflows, queues, Supervisors, or Docker sandbox
 infrastructure. The worker file names, state directories, and refs still say
 `codex` for compatibility; the issue and PR workers run the selected agent.
 
-PR **I** is an interactive, read-only, terminal-only review. It verifies the
+PR **I** is an interactive, read-only, terminal-only review. After checking any
+reviewer it already started for that PR (see below), it verifies the
 selected PR's head and base, fetches both (the base without updating any local
 ref), and opens or reuses a clean, detached review worktree at the PR head in
 its own Herdr workspace. It writes the PR's complete diff from the merge base
@@ -509,18 +510,33 @@ has `.codex/config.toml`, `.codex/rules`, or `.codex/hooks.json`, or when
 `.codex` is a symbolic link; pick Claude Code or Cursor for that PR. Other
 `.codex` content, such as skills, does not block Codex.
 
-The prompt asks for concise, actionable findings ordered by severity with
-file/line references, or an explicit "no actionable findings", **in the
-reviewer's pane only**. PR `I` posts no comments or reviews, never changes
+The prompt pins the review to the captured PR head, base, merge base, and diff
+file (never the live PR, which may have moved) and asks only for actionable
+problems the PR introduces, ordered by severity: each with a file/line
+reference, the condition that triggers it, its concrete consequence, and the
+evidence, with anything unconfirmed marked uncertain. Missing tests count only
+when materially changed behavior is unprotected; speculative edge cases,
+cosmetic nits, unrelated cleanup, and unnecessary architectural changes are
+left out, and no full test-suite rerun is required. Otherwise the reviewer says
+"no actionable findings" and names any material validation limits. Findings
+appear **in the reviewer's pane only**. PR `I` posts no comments or reviews, never changes
 draft/ready state, and makes no other GitHub change, commit, or push. These
 native modes are not hardened OS sandboxes, and an agent may still offer to
 leave its read-only mode (for example Claude Code's plan approval); decline
-that in the pane. A repeated `I` never
-starts a second reviewer: an idle, finished, or working reviewer gets the
-review prompt again with the current diff in its own file, while diffs from
-earlier prompts stay readable until a fresh reviewer starts; a blocked one (for example waiting on
-a plan or trust prompt) and one with an unknown status are focused instead,
-never typed into. A live reviewer keeps its original harness and options; a new
+that in the pane.
+
+A repeated `I` never starts a second reviewer, and it checks the existing
+reviewer's Herdr identity and status before anything could change what that
+reviewer reads. A working reviewer, a blocked one (for example waiting on a
+plan or trust prompt), and one with an unknown status are only focused, even
+if the PR has advanced: PR `I` does not fetch the PR, move the review worktree
+or ref, or write or remove diffs, and types nothing into it; press `I` again
+once it is idle or done. An ambiguous or conflicting reviewer identity is
+reported as an error, without a fetch, prompt, or change to the review
+worktree, ref, or diffs, and no agent is closed. An idle or finished reviewer gets
+one deliberate re-review: the clean worktree moves to the newly captured PR
+head, and the prompt names that exact revision and its own diff file, while
+diffs from earlier prompts stay readable until a fresh reviewer starts. A live reviewer keeps its original harness and options; a new
 `mf-config` choice applies once you exit it in its pane and press `I` again.
 Herdr does not report a live reviewer's launch options, so PR `I` cannot verify
 that a reused reviewer is still read-only: it warns that it may not be, and
@@ -965,6 +981,8 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    first): each starts in its read-only mode, reads the diff file, and reports
    findings or "no actionable findings" only in its pane. The PR gets no new
    comment, review, or draft/ready change, and the review worktree stays clean.
+   Pressing `I` again while a reviewer is still working only focuses it; its
+   worktree stays at the head it is reviewing.
 6. From the clone, `make update` fast-forwards (or reports already up to date),
    offers only the native upgrades that match each tool's installation, and
    ends with setup's doctor report. `ghd update` from another directory does
