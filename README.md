@@ -332,8 +332,8 @@ and `--config service_tier=...`, and Claude Code `--effort`. A fresh launch
 refuses an option the installed CLI does not offer. The PR reviewer always
 starts in its native interactive read-only mode (see
 [What the workflows do](#what-the-workflows-do)), and a fresh launch refuses a
-CLI whose help does not offer that mode; only its model/effort/Fast are
-appended. `make setup PR_REVIEW_AGENT=...` saves a bare reviewer harness (or,
+CLI whose help does not offer that mode; only its model/effort/Fast (and the Codex
+update-check opt-out below) are appended. `make setup PR_REVIEW_AGENT=...` saves a bare reviewer harness (or,
 for `codex`, removes the override), keeping saved options for the same harness. A working, blocked, or idle agent is
 reused with its original harness and options and is never restarted because
 settings differ. To apply new preferences, close it (exit the agent in its
