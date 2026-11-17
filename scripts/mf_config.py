@@ -163,6 +163,9 @@ def effective(role, profiles, shared):
 def native_arguments(profile):
     """Only explicit knobs become options; an unset knob keeps the native default."""
     agent, argv = profile["agent"], []
+    if agent == "codex":
+        # Always: Codex's interactive startup update prompt would block the Herdr prompt. Updates stay manual.
+        argv += ["--config", "check_for_update_on_startup=false"]
     if "model" in profile:
         argv += ["--model", profile["model"]]
     if agent == "codex":
@@ -214,18 +217,23 @@ def require_support(profile, role):
     """Refuse a fresh launch whose explicit knobs, or reviewer read-only mode, the installed CLI cannot accept."""
     agent = profile["agent"]
     needed = ["--model"] if "model" in profile else []
-    if agent == "codex" and ("effort" in profile or "fast" in profile):
-        needed.append("--config")
     if agent == "claude" and "effort" in profile:
         needed.append("--effort")
     review = REVIEW_MODES[agent] if role == "pr-review" else None
     if review:
         needed += [flag for flag in review[0] if flag not in needed]
+    # Every fresh Codex launch needs --config, if only to skip the startup update check.
+    if agent == "codex" and "--config" not in needed:
+        needed.append("--config")
     if not needed:
         return
     command, label = COMMANDS[agent], HARNESSES[agent]
     help_text = probe([command, "--help"])
     if help_text is None:
+        if agent == "codex":
+            raise ConfigError("cannot read codex --help to verify the Codex " + ("read-only reviewer " if review else "")
+                              + "launch options; repair or update Codex, or choose another "
+                              + ("PR reviewer" if review else "agent") + " with mf-config")
         raise ConfigError("cannot read " + command + " --help to verify the " + label
                           + (" read-only reviewer launch" if review else " saved options") + "; repair "
                           + label + " or choose native defaults with mf-config")
@@ -238,6 +246,10 @@ def require_support(profile, role):
             raise ConfigError("the installed " + command + " does not offer " + ", ".join(missing) + ", needed for "
                               "the interactive read-only PR reviewer (" + REVIEW_MODE_NAMES[agent] + "); update "
                               + label + " or choose another PR reviewer with mf-config")
+        if "--config" in missing:
+            raise ConfigError("the installed codex does not offer " + ", ".join(missing) + ", needed to start Codex"
+                              " without its interactive startup update check; update Codex or choose another agent"
+                              " with mf-config")
         raise ConfigError("the installed " + command + " does not offer " + ", ".join(missing)
                           + "; update " + label + " or choose native defaults with mf-config")
     if agent == "codex" and "fast" in profile:

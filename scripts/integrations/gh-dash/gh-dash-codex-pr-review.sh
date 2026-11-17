@@ -1525,7 +1525,8 @@ if [ "$agent_present" -eq 0 ]; then
 	cursor) reviewer_args=(--mode ask --add-dir "$review_context_directory") ;;
 	esac
 	# Only a fresh reviewer reads the saved profile. mf-config first verifies that the installed CLI offers
-	# its read-only mode, then emits only model/effort/Fast options, appended after the read-only options.
+	# its read-only mode, then emits only model/effort/Fast options (plus Codex's startup update-check
+	# opt-out), appended after the read-only options.
 	review_output="$(python3 -I -B "$mf_config_helper" launch-args pr-review "$reviewer_kind" 2>&1)" ||
 		die "unable to start the read-only $reviewer_label reviewer; agent not started and prompt not sent: $review_output"
 	if [ -n "$review_output" ]; then

@@ -82,13 +82,14 @@ read_issue_agent_setting() {
 	manager_label="$(agent_label "$manager_kind")"
 }
 
-# Saved model/effort/Fast knobs are read only for a fresh agent; a retained agent keeps its own.
+# Launch options (saved model/effort/Fast knobs, and Codex's startup update-check opt-out) are read only
+# for a fresh agent; a retained agent keeps its own.
 read_launch_arguments() {
 	local output argument
 
 	agent_arguments=()
 	output="$(python3 -I -B "$mf_config_helper" launch-args "$profile_role" "$manager_kind" 2>&1)" ||
-		die "unable to apply the saved $manager_label launch preferences; agent not started and prompt not sent: $output"
+		die "unable to apply the $manager_label launch options; agent not started and prompt not sent: $output"
 	[ -n "$output" ] || return 0
 	while IFS= read -r argument; do
 		agent_arguments[${#agent_arguments[@]}]="$argument"

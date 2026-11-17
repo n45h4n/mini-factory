@@ -1412,8 +1412,10 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         fetches = [c["args"] for c in self.calls("git") if "fetch" in c["args"]]
         self.assertEqual(len(fetches), 1)
         self.assertEqual(fetches[0][-1], "+refs/heads/feature/friend:refs/gh-dash-issue-implement/repo-6-friend-6-target-issue-8")
+        # A fresh default Codex agent skips its interactive startup update check, and nothing else changes.
         self.assertEqual(self.herdr_calls("agent", "start"), [["agent", "start", "target-8", "--kind", "codex",
-                                                                "--pane", "issue-pane", "--timeout", "30000"]])
+                                                                "--pane", "issue-pane", "--timeout", "30000",
+                                                                "--", "--config", "check_for_update_on_startup=false"]])
         prompts = self.herdr_calls("agent", "prompt")
         self.assertEqual(len(prompts), 1)
         self.assertEqual(prompts[0][:3] + prompts[0][4:], ["agent", "prompt", "issue-pane",
@@ -1524,9 +1526,12 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.log.write_text("")
                 self.assert_success(self.issue_helper(**route))
                 self.assert_success(self.issue_helper("prepare", **route))
+                # Only Codex gets an option without a saved profile: its startup update check is skipped.
+                native = ["--", "--config", "check_for_update_on_startup=false"] if kind == "codex" else []
                 self.assertEqual(self.herdr_calls("agent", "start"), [
-                    ["agent", "start", "target-8", "--kind", kind, "--pane", "issue-pane", "--timeout", "30000"],
-                    ["agent", "start", "target-prep-8", "--kind", kind, "--pane", "prep-pane", "--timeout", "30000"]])
+                    ["agent", "start", "target-8", "--kind", kind, "--pane", "issue-pane", "--timeout", "30000", *native],
+                    ["agent", "start", "target-prep-8", "--kind", kind, "--pane", "prep-pane", "--timeout", "30000",
+                     *native]])
                 prompts = self.herdr_calls("agent", "prompt")
                 self.assertEqual([args[2] for args in prompts], ["issue-pane", "prep-pane"])
                 implement, prepare = (args[3] for args in prompts)
@@ -3069,9 +3074,10 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 path.mkdir()
             else:
                 path.write_text(invalid)
-            for profiles, source, arguments in (({}, "default", ""),
+            skip_update = "--config\ncheck_for_update_on_startup=false\n"
+            for profiles, source, arguments in (({}, "default", skip_update),
                     ({"pr-review": {"agent": "codex", "model": "review-model", "effort": "high"}},
-                     "override", '--model\nreview-model\n--config\nmodel_reasoning_effort="high"\n')):
+                     "override", skip_update + '--model\nreview-model\n--config\nmodel_reasoning_effort="high"\n')):
                 with self.subTest(invalid=invalid, profiles=profiles):
                     self.profiles_file(profiles)
                     result = self.mf_config("agent", "pr-review")
@@ -3297,7 +3303,8 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assert_success(self.issue_helper("prepare", **route))
         self.assertEqual(self.herdr_calls("agent", "start"), [
             ["agent", "start", "target-8", "--kind", "codex", "--pane", "issue-pane", "--timeout", "30000",
-             "--", "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="xhigh"',
+             "--", "--config", "check_for_update_on_startup=false",
+             "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="xhigh"',
              "--config", 'service_tier="default"'],
             ["agent", "start", "target-prep-8", "--kind", "claude", "--pane", "prep-pane", "--timeout", "30000",
              "--", "--model", "opus", "--effort", "high"]])
@@ -3327,10 +3334,14 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         route = self.issue_environment(repo, git, cwd=repo)
         cases = ((("issue-implement", {"agent": "claude", "effort": "max"}), {"MOCK_AGENT_HELP": "old"}, "--effort"),
                  (("issue-implement", {"agent": "codex", "fast": True}), {}, "Codex 0.154.0 or newer"),
+                 # Default Codex needs --config too, to skip its interactive startup update check.
+                 (("issue-implement", None), {"MOCK_AGENT_HELP": "old"},
+                  "does not offer --config, needed to start Codex without its interactive startup update check; "
+                  "update Codex or choose another agent with mf-config"),
                  (("issue-implement", {"agent": "cursor", "model": "auto"}), {"MOCK_AGENT_HELP": "old"}, None))
         for (role, profile), overrides, refusal in cases:
             with self.subTest(profile=profile):
-                self.profiles_file({role: profile})
+                self.profiles_file({role: profile} if profile else {})
                 self.log.write_text("")
                 result = self.issue_helper(**dict(route, **overrides))
                 if refusal is None:
@@ -3372,10 +3383,12 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         codex = ["--ask-for-approval", "never", "--strict-config", "--cd", str(worktree),
                  "--config", 'default_permissions="gh_dash_pr_review"',
                  "--config", 'permissions.gh_dash_pr_review={extends=":read-only"}']
+        # Codex also skips its interactive startup update check, after the read-only options.
+        skip_update = ["--config", "check_for_update_on_startup=false"]
         cases = (
-            ("codex", None, codex),
+            ("codex", None, [*codex, *skip_update]),
             ("codex", {"agent": "codex", "model": "gpt-test-fast", "effort": "high", "fast": True},
-             [*codex, "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="high"',
+             [*codex, *skip_update, "--model", "gpt-test-fast", "--config", 'model_reasoning_effort="high"',
               "--config", 'service_tier="fast"', "--config", "features.fast_mode=true"]),
             ("claude", {"agent": "claude", "model": "opus", "effort": "high"},
              ["--permission-mode", "plan", "--setting-sources", "user", "--add-dir", str(context), "--model", "opus",
