@@ -339,6 +339,12 @@ reused with its original harness and options and is never restarted because
 settings differ. To apply new preferences, close it (exit the agent in its
 pane), then press the key again.
 
+Every fresh Codex agent (issue `i`/`I` and PR `I`, with or without a saved
+profile) also starts with `--config check_for_update_on_startup=false`, so
+Codex's interactive update prompt cannot block the launch; a Codex without
+`--config` is refused before the agent starts. Your `~/.codex/config.toml` is
+untouched, and Codex updates stay manual (`make update` or `codex update`).
+
 ## Git transport for PR reviews and issue preparation
 
 The existing PR worker, and the published-branch fetch of issue preparation and
