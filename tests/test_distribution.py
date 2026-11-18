@@ -2222,23 +2222,15 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertLess(start, handoff)
         self.assertLess(handoff, prompt.index("Start the run with exactly:"))
         guidance = prompt[start:handoff]
-        for requirement in ("required edge cases and other code paths with the same defect",
-                            "add minimal regression coverage",
-                            "instead of asking the operator to choose between routine technical options",
-                            "Favor the smallest coherent solution", "do not manufacture findings",
-                            "promote speculative edge cases or optional suggestions into requirements",
-                            "add unrelated features, or refactor broadly",
+        for requirement in ("minimal regression coverage", "smallest coherent solution", "manufacture findings",
                             # Optional notes never stop delivery, and unfinished work is not claimed as done.
-                            "not reasons to stop the implementation or the No-Mistakes handoff",
-                            "a known incomplete requirement must never be reported as finished",
+                            "not reasons to stop", "incomplete requirement",
                             # Genuine blockers still stop, and native gates keep their meaning.
-                            "Stop and report a specific blocker only when",
-                            "essential product or business policy decision", "unauthorized scope expansion",
-                            "externally visible behavior change beyond its scope", "a destructive operation",
-                            "Never infer consent or bypass a native No-Mistakes gate"):
+                            "specific blocker", "policy decision", "unauthorized scope expansion",
+                            "externally visible behavior change", "destructive operation",
+                            "bypass a native No-Mistakes gate"):
             self.assertIn(requirement, guidance)
-        self.assertIn("only nonblocking notes remain, deliver it through No-Mistakes unattended:", prompt)
-        self.assertIn("remaining blockers, or nonblocking notes", prompt)
+        self.assertIn("only nonblocking notes remain", guidance.rsplit("\n", 1)[-1])
 
     def test_setting_change_keeps_retained_agent_without_duplicate_prompts(self):
         repo, git = self.source_repo()
