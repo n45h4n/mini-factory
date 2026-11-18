@@ -5021,6 +5021,37 @@ os.execv(executable, [executable, *args])
         self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", result.stdout.splitlines())
         self.assertEqual([c["args"] for c in self.calls("acpx")], [["--version"]])
 
+    def test_omarchy_setup_checks_a_shell_only_acpx_launcher_as_the_tool_it_runs(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # With the default acpx_path, the daemon's PATH finds no acpx; only your shell's PATH finds one, a launcher
+        # that writes your global mise configuration every run.
+        self.acpx.unlink()
+        launcher = self.root / "shell only/acpx"
+        text = self.configuring_launcher(launcher, "acpx")
+        self.env["PATH"] += os.pathsep + str(launcher.parent)
+
+        def setup():
+            self.log.write_text("")
+            result = self.interactive_setup("y")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertFalse(self.npm_changes())
+            self.assertEqual(launcher.read_text(), text)
+            return result
+
+        # Until its tool is installed, setup reports it and never runs it, even with consent.
+        result = setup()
+        self.assertIn("Remaining action: " + str(launcher) + " is a mise launcher whose tool is not installed yet",
+                      result.stdout)
+        self.assertFalse(self.calls("acpx"))
+        # Installed, setup runs the acpx it would run, which still does not run for the daemon.
+        (self.mock / "mise-installed-acpx").write_text("yes")
+        result = setup()
+        self.assertIn("Remaining action: " + str(launcher) + " runs only from your current shell PATH", result.stdout)
+        self.assertEqual([c["args"] for c in self.calls("acpx")], [["--version"]])
+
     def test_omarchy_doctor_skips_native_doctor_only_when_its_github_profile_could_run_a_lazy_gh(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         self.assert_success(self.interactive_setup("y"))
@@ -5174,8 +5205,10 @@ os.execv(executable, [executable, *args])
         self.assert_success(self.interactive_setup("y"))
         self.assertTrue((self.home / ".local/bin/claude").is_symlink())
         self.log.write_text("")
-        result = self.interactive_update(["y"] * 8)
+        # Omarchy's gh has an auto-update due; approving the gh-dash upgrade does not approve updating gh.
+        result = self.interactive_update(["y"] * 8, MOCK_MISE_AUTO_UPDATE="gh")
         self.assert_success(result)
+        self.assertFalse(list(self.mock.glob("auto-updated-*")))
         for label, name in (("GitHub CLI", "gh"), ("Codex", "codex"), ("Cursor CLI", "cursor-agent"),
                             ("Node.js and npm", "node")):
             self.assertIn(label + ": manual update only: " + str(shims / name) + " is managed by mise for Omarchy: "

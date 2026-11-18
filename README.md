@@ -871,7 +871,8 @@ checks.
   `make update` has no system or Omarchy upgrade stage; its setup run offers
   only genuinely missing dependencies, under setup's consent rules. Independent
   user-level installations (for example your own native Claude Code), setup's
-  `acpx`, No-Mistakes, and the gh-dash extension keep their consented updates.
+  `acpx`, No-Mistakes, and the gh-dash extension keep their consented updates;
+  the gh-dash upgrade runs mise offline, so it never updates a mise-managed `gh`.
   Discovery never runs a lazy tool that is not installed yet; it reports it,
   and setup asks before installing it.
 

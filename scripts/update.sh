@@ -449,7 +449,9 @@ run_plan() {
 		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
 	npm) PATH="$bin_directory:$PATH" probe_npm "${plan_targets[@]}" ;;
-	extension) probe gh extension upgrade dash ;;
+	# Offline for mise only: a mise gh with an auto-update due would otherwise update itself first; gh itself still
+	# fetches the extension.
+	extension) MISE_OFFLINE=1 probe gh extension upgrade dash ;;
 	# Keeping the bin directory on PATH avoids the native installers' profile-editing branches, as in setup.
 	native) PATH="$bin_directory:$PATH" "$plan_path" update ;;
 	esac

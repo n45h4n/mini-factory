@@ -924,10 +924,24 @@ acpx_runs_for_daemon() {
 	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx"
 }
 
+# The acpx your shell's PATH finds, checked as acpx_runs_for_daemon checks the daemon's: a launcher that runs mise use
+# is checked as the installed tool it would run, and one whose tool is not installed does not run (status 2).
+acpx_runs_for_shell() {
+	local acpx=acpx
+	command -v acpx >/dev/null 2>&1 || return 1
+	if [ -n "$shell_probes" ]; then
+		acpx="$(mf_configuring_launcher_tool acpx)" || {
+			[ "$?" -ne 2 ] || return 2
+			acpx=acpx
+		}
+	fi
+	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$acpx" --version >/dev/null 2>&1
+}
+
 # Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the
 # pipeline agent or any review role) through acpx, so choosing Cursor later needs no new install.
 ensure_node_and_acpx() {
-	local prefix found daemon_node
+	local prefix found daemon_node status=0
 	local npm_arguments=(install -g acpx@latest)
 	resolve_daemon_path
 	# A lazy mise Node.js installs itself when run (acpx runs it too), so nothing below may run it first.
@@ -991,7 +1005,11 @@ ensure_node_and_acpx() {
 			acpx_runs_for_daemon && return 0
 		fi
 	fi
-	if ! command -v acpx >/dev/null 2>&1 || ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" acpx --version >/dev/null 2>&1; then
+	acpx_runs_for_shell || status=$?
+	if [ "$status" -eq 2 ]; then
+		notice "Remaining action: $(command -v acpx) is a mise launcher whose tool is not installed yet, and running it would install it first (or write your global mise configuration); install it with mise yourself, then rerun make setup"
+		pending=1
+	elif [ "$status" -ne 0 ]; then
 		notice "Remaining action: npm ${npm_arguments[*]} (acpx, the ACP runner No-Mistakes uses for Cursor), then rerun make setup"
 		pending=1
 	else
