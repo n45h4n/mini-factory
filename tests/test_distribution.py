@@ -5052,6 +5052,28 @@ os.execv(executable, [executable, *args])
         self.assertIn("Remaining action: " + str(launcher) + " runs only from your current shell PATH", result.stdout)
         self.assertEqual([c["args"] for c in self.calls("acpx")], [["--version"]])
 
+    def test_omarchy_setup_never_runs_an_uninstalled_acpx_mise_shim(self):
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # acpx is mise's shim, on your shell's PATH and the daemon's, and the version mise selects is not installed.
+        self.acpx.unlink()
+        (shims / "acpx").symlink_to(system / "usr/bin/mise")
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: " + str(shims / "acpx") + " is a mise launcher whose tool is not installed yet",
+                      result.stdout)
+        self.assertFalse(self.calls("acpx"))
+        self.assertFalse(self.npm_changes())
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse(self.mise_installs())
+        # Installed, the shim runs for both checks.
+        (self.mock / "mise-installed-acpx").write_text("yes")
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y"))
+        self.assertIn(["--version"], [c["args"] for c in self.calls("acpx")])
+        self.assertEqual(self.lazy_triggered(), [])
+
     def test_omarchy_doctor_skips_native_doctor_only_when_its_github_profile_could_run_a_lazy_gh(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         self.assert_success(self.interactive_setup("y"))

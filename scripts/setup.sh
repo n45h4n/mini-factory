@@ -913,8 +913,10 @@ acpx_runs_for_daemon() {
 	local acpx="$acpx_path"
 	[ -n "$acpx" ] || return 1
 	# acpx_path runs verbatim, which no PATH prefix redirects: a launcher that runs mise use, found from the daemon's
-	# PATH, is checked as the installed tool it would run, and one whose tool is not installed does not run.
+	# PATH, is checked as the installed tool it would run, and one whose tool is not installed does not run, nor does
+	# any other lazy mise launcher (such as mise's shim) whose tool is not installed yet.
 	if [ -n "$daemon_probes" ]; then
+		[ -z "$(daemon_lazy_pending "$acpx_path")" ] || return 1
 		acpx="$(PATH="$daemon_path" mf_configuring_launcher_tool "$acpx_path")" || {
 			[ "$?" -ne 2 ] || return 1
 			acpx="$acpx_path"
@@ -925,11 +927,13 @@ acpx_runs_for_daemon() {
 }
 
 # The acpx your shell's PATH finds, checked as acpx_runs_for_daemon checks the daemon's: a launcher that runs mise use
-# is checked as the installed tool it would run, and one whose tool is not installed does not run (status 2).
+# is checked as the installed tool it would run, and a lazy mise launcher whose tool is not installed does not run
+# (status 2).
 acpx_runs_for_shell() {
 	local acpx=acpx
 	command -v acpx >/dev/null 2>&1 || return 1
 	if [ -n "$shell_probes" ]; then
+		[ -z "$(mf_lazy_pending acpx)" ] || return 2
 		acpx="$(mf_configuring_launcher_tool acpx)" || {
 			[ "$?" -ne 2 ] || return 2
 			acpx=acpx
