@@ -28,6 +28,12 @@ duty_agents=()
 service_path="$bin_directory:$HOME/go/bin:$HOME/.cargo/bin:$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 acpx_path=acpx
 daemon_path="$service_path"
+# On Arch and Omarchy, read-only login, gh-dash, and Node.js checks run your shell's PATH (and the Node.js checks the
+# daemon's) behind these prefixes (a private directory and a colon; empty elsewhere), each from its own PATH: see
+# link_configuring_launchers.
+shell_probes=''
+daemon_probes=''
+probe_directory=''
 stage=''
 backup=''
 launcher_stage=''
@@ -85,6 +91,7 @@ cleanup() {
 	fi
 	[ -z "$stage" ] || rm -rf -- "$stage"
 	[ -z "$launcher_stage" ] || rm -f -- "$launcher_stage"
+	[ -z "$probe_directory" ] || rm -rf -- "$probe_directory"
 	if [ -n "$backup" ] && [ ! -d "$backup/runtime" ]; then
 		rmdir -- "$backup" 2>/dev/null || true
 	fi
@@ -294,8 +301,11 @@ gum_is_suitable() {
 }
 
 gh_is_suitable() {
+	local probe
 	command -v gh >/dev/null 2>&1 || return 1
-	gh --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 47))}'
+	# A launcher that runs mise use would write your global mise configuration: check the tool it runs instead.
+	probe="$(mf_configuring_launcher_tool gh)" || probe=gh
+	"$probe" --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 47))}'
 }
 
 install_dependencies() {
@@ -754,10 +764,10 @@ install_optional_launcher() {
 
 agent_is_authenticated() {
 	case "$1" in
-	claude) claude auth status >/dev/null 2>&1 ;;
-	codex) codex login status >/dev/null 2>&1 ;;
+	claude) PATH="$shell_probes$PATH" claude auth status >/dev/null 2>&1 ;;
+	codex) PATH="$shell_probes$PATH" codex login status >/dev/null 2>&1 ;;
 	# Cursor's status exits 0 while logged out; read only its boolean, never display it.
-	cursor) cursor-agent status --format json 2>/dev/null | jq -e '.isAuthenticated == true' >/dev/null 2>&1 ;;
+	cursor) PATH="$shell_probes$PATH" cursor-agent status --format json 2>/dev/null | jq -e '.isAuthenticated == true' >/dev/null 2>&1 ;;
 	esac
 }
 
@@ -789,7 +799,7 @@ node_version_is_suitable() {
 # Your shell's node and npm install acpx.
 node_is_suitable() {
 	command -v node >/dev/null 2>&1 &&
-		node --version 2>/dev/null | node_version_is_suitable
+		PATH="$shell_probes$PATH" node --version 2>/dev/null | node_version_is_suitable
 }
 
 resolve_daemon_path() {
@@ -805,7 +815,19 @@ daemon_lazy_pending() {
 
 # acpx starts the node that the daemon's PATH finds first, whichever node your shell finds.
 daemon_node_is_suitable() {
-	env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null | node_version_is_suitable
+	env PATH="$daemon_probes$daemon_path" /bin/sh -c 'node --version' 2>/dev/null | node_version_is_suitable
+}
+
+# Links, in a new directory (the first argument), each named command's launcher that PATH (the second argument) finds
+# and that runs mise use, and so writes your global mise configuration every run, to the installed tool it would
+# run, as doctor's probes and update's discovery present them. Every other command is unchanged.
+link_configuring_launchers() {
+	local directory="$1" path="$2" name tool
+	shift 2
+	mkdir -- "$directory"
+	while IFS=$'\t' read -r name tool; do
+		ln -s -- "$tool" "$directory/$name"
+	done < <(PATH="$path" mf_configuring_launchers "$@")
 }
 
 # madison lists repository-provided versions only (as for Gum); any configured source counts, such as NodeSource.
@@ -869,7 +891,7 @@ install_node() {
 acpx_runs_for_daemon() {
 	[ -n "$acpx_path" ] || return 1
 	# shellcheck disable=SC2016 # Expanded by the child shell with the daemon's PATH.
-	env PATH="$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx_path"
+	env PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx_path"
 }
 
 # Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the
@@ -887,10 +909,17 @@ ensure_node_and_acpx() {
 	if ! command -v node >/dev/null 2>&1 || arch_npm_missing; then
 		install_node || true
 	fi
+	# An installed node or npm launcher that runs mise use is checked as the tool it would run, which your shell's
+	# PATH (see configure_native_tools) and the daemon's each resolve on their own; messages still name what that PATH
+	# finds.
+	if [ -n "$probe_directory" ]; then
+		link_configuring_launchers "$probe_directory/daemon" "$daemon_path" node npm
+		daemon_probes="$probe_directory/daemon:"
+	fi
 	if ! node_is_suitable || ! command -v npm >/dev/null 2>&1; then
 		found='Node.js is missing'
 		if command -v node >/dev/null 2>&1; then
-			found="$(command -v node) is Node.js $(node --version 2>/dev/null || printf 'of unknown version')"
+			found="$(command -v node) is Node.js $(PATH="$shell_probes$PATH" node --version 2>/dev/null || printf 'of unknown version')"
 			command -v npm >/dev/null 2>&1 || found="$found without npm"
 		fi
 		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, sudo pacman -Syu --needed nodejs npm on Arch, Omarchy's mise Node.js, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
@@ -902,7 +931,7 @@ ensure_node_and_acpx() {
 		daemon_node="$(env PATH="$daemon_path" /bin/sh -c 'command -v node' 2>/dev/null)" || daemon_node=''
 		found='no Node.js'
 		if [ -n "$daemon_node" ]; then
-			found="$daemon_node, Node.js $(env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null || printf 'of unknown version')"
+			found="$daemon_node, Node.js $(env PATH="$daemon_probes$daemon_path" /bin/sh -c 'node --version' 2>/dev/null || printf 'of unknown version')"
 		fi
 		notice "Remaining action: the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories) finds $found first, but acpx runs with that PATH and needs Node.js 22.13+; your current shell's $(command -v node) does not count. Setup never replaces an existing Node.js or version manager: put a Node.js 22.13+ first on that PATH yourself (for example by activating your version manager's 22.13+ default in your login shell's startup files, or by upgrading the Node.js found there with the tool that installed it), then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
@@ -916,7 +945,7 @@ ensure_node_and_acpx() {
 		return 0
 	fi
 	if ! command -v acpx >/dev/null 2>&1; then
-		prefix="$(npm prefix -g 2>/dev/null || true)"
+		prefix="$(PATH="$shell_probes$PATH" npm prefix -g 2>/dev/null || true)"
 		# A global prefix that is root-owned (system Node) or outside the daemon's PATH (such as a per-shell
 		# fnm path) gets a user-owned acpx in $bin_directory instead; npm's configured prefix is never changed.
 		case ":$daemon_path:" in
@@ -925,14 +954,14 @@ ensure_node_and_acpx() {
 		esac
 		[ -n "$prefix" ] || npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
 		if consent "acpx is the ACP runner No-Mistakes uses for Cursor. Install it with its documented npm ${npm_arguments[*]}?"; then
-			npm "${npm_arguments[@]}" || true
+			PATH="$shell_probes$PATH" npm "${npm_arguments[@]}" || true
 			PATH="$PATH:$bin_directory"
 			export PATH
 			hash -r
 			acpx_runs_for_daemon && return 0
 		fi
 	fi
-	if ! command -v acpx >/dev/null 2>&1 || ! acpx --version >/dev/null 2>&1; then
+	if ! command -v acpx >/dev/null 2>&1 || ! PATH="$shell_probes$PATH" acpx --version >/dev/null 2>&1; then
 		notice "Remaining action: npm ${npm_arguments[*]} (acpx, the ACP runner No-Mistakes uses for Cursor), then rerun make setup"
 		pending=1
 	else
@@ -955,7 +984,14 @@ explain_git_transport() {
 
 configure_native_tools() {
 	local codex_directory integration kind description login_arguments login_kinds github_ready=1
-	if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+	# Read-only checks run an installed tool, not a launcher that runs mise use (see link_configuring_launchers);
+	# the logins and installations you approve run your commands as before.
+	if [ "$platform" = arch ] || [ "$platform" = omarchy ]; then
+		probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-setup.XXXXXX")"
+		link_configuring_launchers "$probe_directory/shell" "$PATH" gh codex claude cursor-agent node npm
+		shell_probes="$probe_directory/shell:"
+	fi
+	if ! PATH="$shell_probes$PATH" gh auth status --hostname github.com >/dev/null 2>&1; then
 		if consent 'GitHub authentication is pending. Run gh auth login --hostname github.com --web now? Follow its native device-code instructions in a browser on this or another machine. Choose Git transport yourself; setup will not configure Git credentials.'; then
 			login_arguments=(auth login --hostname github.com --web)
 			if consent "Optional: also request GitHub's project scope (only for GitHub Projects access)? Ordinary issue and PR actions do not need it."; then
@@ -969,7 +1005,7 @@ configure_native_tools() {
 		fi
 	fi
 	[ "$github_ready" -eq 0 ] || explain_git_transport
-	if ! gh dash --version >/dev/null 2>&1; then
+	if ! PATH="$shell_probes$PATH" gh dash --version >/dev/null 2>&1; then
 		if consent 'Install the gh-dash extension with gh extension install dlvhdr/gh-dash? Existing gh-dash configuration is preserved; ghd uses the bundled config explicitly.'; then
 			gh extension install dlvhdr/gh-dash || pending=1
 		else

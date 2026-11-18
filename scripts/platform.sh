@@ -133,26 +133,34 @@ mf_is_mise_wrapper() {
 	return 1
 }
 
+# The file a path ends at once its symbolic links are followed (portably: no readlink -f). Only read, never run.
+mf_link_target() {
+	local path="$1" target count=0
+	while [ -L "$path" ] && [ "$count" -lt 40 ]; do
+		target="$(readlink "$path")" || return 1
+		case "$target" in
+		/*) path="$target" ;;
+		*) path="$(dirname "$path")/$target" ;;
+		esac
+		count=$((count + 1))
+	done
+	printf '%s\n' "$path"
+}
+
 # A mise launcher installs its tool first whenever it runs (Omarchy's lazy tools): a mise shim (a link to mise),
-# a mise command wrapper, or an omarchy-mise-install script that runs mise use or mise x. Only read, never run.
+# a mise command wrapper, or an omarchy-mise-install script that runs mise use or mise x, also through your own link
+# to that script. Only read, never run.
 mf_is_mise_launcher() {
-	local path="$1" data target count=0
+	local path="$1" data
 	mf_is_mise_wrapper "$path" && return 0
 	while IFS= read -r data; do
 		case "$path" in "$data/shims/"*) return 0 ;; esac
 	done < <(mf_mise_data_directories)
 	if [ -L "$path" ]; then
-		# Any other link is the user's own command unless it ends at mise itself.
-		while [ -L "$path" ] && [ "$count" -lt 40 ]; do
-			target="$(readlink "$path")" || return 1
-			case "$target" in
-			/*) path="$target" ;;
-			*) path="$(dirname "$path")/$target" ;;
-			esac
-			count=$((count + 1))
-		done
-		[ "$(basename "$path")" = mise ]
-		return
+		# A link that ends at mise itself is a shim; any other is read as the file it ends at, so a link to a native
+		# executable stays your own command.
+		path="$(mf_link_target "$path")" || return 1
+		[ "$(basename "$path")" != mise ] || return 0
 	fi
 	# Process substitution, not a pipe: grep -q may stop reading early, which pipefail would report as failure.
 	[ -f "$path" ] && LC_ALL=C grep -aqE 'mise (use|x) ' < <(head -c 4096 -- "$path" 2>/dev/null)
@@ -195,14 +203,20 @@ mf_wrapper_provider() {
 	return 1
 }
 
-# The installed tool behind a launcher script that runs mise use (as omarchy-mise-install does), read without
-# running it. Such a script writes your global mise configuration (mise use -g) every time it runs, even once its
-# tool is installed and offline, so read-only checks run the tool it would run instead. Fails for any other command
-# (such as mise's shims, which only run their tool) or while the tool is not installed yet.
+# The installed tool behind a launcher script that runs mise use (as omarchy-mise-install does), also through your
+# own link to that script, read without running it. Such a script writes your global mise configuration (mise use -g)
+# every time it runs, even once its tool is installed and offline, so read-only checks run the tool it would run
+# instead. Fails for any other command (such as mise's shims, links to mise that only run their tool) or while the
+# tool is not installed yet.
 mf_configuring_launcher_tool() {
 	local path
 	path="$(command -v "$1" 2>/dev/null)" || return 1
-	[ -f "$path" ] && [ ! -L "$path" ] && ! mf_is_mise_wrapper "$path" || return 1
+	! mf_is_mise_wrapper "$path" || return 1
+	if [ -L "$path" ]; then
+		path="$(mf_link_target "$path")" || return 1
+		[ "$(basename "$path")" != mise ] || return 1
+	fi
+	[ -f "$path" ] || return 1
 	LC_ALL=C grep -aqE 'mise use ' < <(head -c 4096 -- "$path" 2>/dev/null) || return 1
 	mf_mise_installed "$1"
 }
