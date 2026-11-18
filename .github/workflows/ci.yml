@@ -19,3 +19,15 @@ jobs:
           persist-credentials: false
       # The runner image provides Bash, Git, Make, jq, and Python 3; the tests mock every external CLI.
       - run: make test
+
+  arch-smoke:
+    name: Arch container smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Docker is test infrastructure only (make test and installation never need it): setup runs with real
+      # pacman packages and inert agents in a disposable Arch container, from a read-only mount of this checkout.
+      - run: tests/arch-smoke.sh
