@@ -147,6 +147,14 @@ mf_link_target() {
 	printf '%s\n' "$path"
 }
 
+# Whether a script runs mise with one of the given subcommands (an extended regular expression, such as use|x) as
+# a statement, as omarchy-mise-install's launchers do (mise use -g ..., exec mise x ...); a comment or text that only
+# mentions one does not count. Only read, never run.
+mf_runs_mise() {
+	# Process substitution, not a pipe: grep -q may stop reading early, which pipefail would report as failure.
+	LC_ALL=C grep -aqE "^[[:space:]]*(exec[[:space:]]+)?mise[[:space:]]+($2)[[:space:]]" < <(head -c 4096 -- "$1" 2>/dev/null)
+}
+
 # A mise launcher installs its tool first whenever it runs (Omarchy's lazy tools): a mise shim (a link to mise),
 # a mise command wrapper, or an omarchy-mise-install script that runs mise use or mise x, also through your own link
 # to that script. Only read, never run.
@@ -162,17 +170,45 @@ mf_is_mise_launcher() {
 		path="$(mf_link_target "$path")" || return 1
 		[ "$(basename "$path")" != mise ] || return 0
 	fi
-	# Process substitution, not a pipe: grep -q may stop reading early, which pipefail would report as failure.
-	[ -f "$path" ] && LC_ALL=C grep -aqE 'mise (use|x) ' < <(head -c 4096 -- "$path" 2>/dev/null)
+	[ -f "$path" ] && mf_runs_mise "$path" 'use|x'
+}
+
+# The tool request and executable of a launcher script's mise x statement as omarchy-mise-install writes it,
+# exec mise x "PACKAGE" -- "BIN" "$@" (PACKAGE may pin a version, such as gh@2.46.0), printed as REQUEST<TAB>BIN;
+# fails for a script without one. Only read, never run.
+mf_launcher_request() {
+	local line pattern='^[[:space:]]*(exec[[:space:]]+)?mise[[:space:]]+x[[:space:]]+"?([^"[:space:]]+)"?[[:space:]]+--[[:space:]]+"?([^"[:space:]]+)"?([[:space:]]|$)'
+	mf_runs_mise "$1" x || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		[[ "$line" =~ $pattern ]] || continue
+		printf '%s\t%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+		return 0
+	done < <(head -c 4096 -- "$1" 2>/dev/null)
+	return 1
+}
+
+# The installed executable that the mise launcher at the second argument's path runs for the named command, resolved
+# as mf_mise_installed resolves it. A launcher script's own mise x statement decides it (its explicit gh@2.46.0 runs
+# that version, whichever one mise selects here); any other launcher runs the version mise selects for the command.
+mf_launcher_installed() {
+	local path request
+	path="$(mf_link_target "$2")" || return 1
+	if ! mf_is_mise_wrapper "$2" && [ "$(basename "$path")" != mise ] && [ -f "$path" ] &&
+		request="$(mf_launcher_request "$path")"; then
+		mf_mise_installed "${request#*$'\t'}" "${request%%$'\t'*}"
+	else
+		mf_mise_installed "${1##*/}"
+	fi
 }
 
 # The installed executable behind a mise launcher, resolved offline in the current directory and environment, as
 # a launcher run from here selects its version: mise which prints only an already installed binary, so this
-# fails while the selected version is not installed (even if another directory's version is).
+# fails while the selected version is not installed (even if another directory's version is). An optional tool
+# request (the second argument, such as gh@2.46.0) selects that version instead, as mise x runs it.
 mf_mise_installed() {
 	local mise resolved
 	mise="$(mf_mise_command)" || return 1
-	resolved="$(MISE_OFFLINE=1 "$mise" which "$1" 2>/dev/null)" || return 1
+	resolved="$(MISE_OFFLINE=1 "$mise" which ${2:+"--tool=$2"} "$1" 2>/dev/null)" || return 1
 	case "$resolved" in
 	/*) ;;
 	*) return 1 ;;
@@ -206,8 +242,8 @@ mf_wrapper_provider() {
 # The installed tool behind a launcher script that runs mise use (as omarchy-mise-install does), also through your
 # own link to that script, read without running it. Such a script writes your global mise configuration (mise use -g)
 # every time it runs, even once its tool is installed and offline, so read-only checks run the tool it would run
-# instead. Fails for any other command (such as mise's shims, links to mise that only run their tool) or while the
-# tool is not installed yet.
+# instead. Fails (1) for any other command (such as mise's shims, links to mise that only run their tool), and (2)
+# for such a launcher whose tool cannot be resolved, as while it is not installed yet: running it is never safe.
 mf_configuring_launcher_tool() {
 	local path
 	path="$(command -v "$1" 2>/dev/null)" || return 1
@@ -216,17 +252,20 @@ mf_configuring_launcher_tool() {
 		path="$(mf_link_target "$path")" || return 1
 		[ "$(basename "$path")" != mise ] || return 1
 	fi
-	[ -f "$path" ] || return 1
-	LC_ALL=C grep -aqE 'mise use ' < <(head -c 4096 -- "$path" 2>/dev/null) || return 1
-	mf_mise_installed "$1"
+	[ -f "$path" ] && mf_runs_mise "$path" use || return 1
+	mf_launcher_installed "$1" "$path" || return 2
 }
 
-# Prints NAME<TAB>TOOL for each named command whose launcher writes mise configuration (see above).
+# Prints NAME<TAB>TOOL for each named command whose launcher writes mise configuration (see above), and NAME alone
+# for such a launcher whose tool cannot be resolved, which no check may run.
 mf_configuring_launchers() {
 	local name tool
 	for name in "$@"; do
-		tool="$(mf_configuring_launcher_tool "$name")" || continue
-		printf '%s\t%s\n' "$name" "$tool"
+		if tool="$(mf_configuring_launcher_tool "$name")"; then
+			printf '%s\t%s\n' "$name" "$tool"
+		elif [ "$?" -eq 2 ]; then
+			printf '%s\n' "$name"
+		fi
 	done
 	return 0
 }
@@ -238,7 +277,7 @@ mf_lazy_pending() {
 	for name in "$@"; do
 		path="$(command -v "$name" 2>/dev/null)" || continue
 		mf_is_mise_launcher "$path" || continue
-		mf_mise_installed "$name" >/dev/null && continue
+		mf_launcher_installed "$name" "$path" >/dev/null && continue
 		mf_is_mise_wrapper "$path" && mf_wrapper_provider "$name" >/dev/null && continue
 		printf '%s\n' "$name"
 	done

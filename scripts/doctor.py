@@ -52,6 +52,9 @@ PLATFORM_HELPER = Path(__file__).resolve().parent / "platform.sh"
 BASH = shutil.which("bash") or "/bin/bash"
 # The tools Omarchy can provide as lazy mise tools, which install themselves the first time they run.
 LAZY_TOOLS = ("gh", "codex", "claude", "cursor-agent", "node", "npm")
+# Every command doctor runs as a version or capability probe. Any of them may be a mise launcher (Omarchy's lazy
+# tools, or your own mise's), so lazy mise tool discovery covers them all.
+PROBED_TOOLS = ("git", "jq", "herdr", "gum", "no-mistakes") + LAZY_TOOLS
 
 
 def agent_authenticated(kind):
@@ -134,6 +137,16 @@ def acpx_executable(config):
     return result.stdout.rstrip("\n")
 
 
+def github_forge_profiles(config):
+    """Whether native no-mistakes doctor runs gh auth status, as it does for each forge profile with a gh_config_dir,
+    read by the bundled nm-config; assumed when the file cannot be read."""
+    if not config.exists():
+        return False
+    helper = Path(__file__).resolve().parent / "nm_config.py"
+    text = output([sys.executable, "-I", "-B", str(helper), "gh-profiles", str(config)])
+    return text is None or bool(text.strip())
+
+
 def daemon_path():
     """The PATH the No-Mistakes daemon resolves (login-shell PATH plus SERVICE_PATH), read by the bundled nm-config."""
     helper = Path(__file__).resolve().parent / "nm_config.py"
@@ -160,25 +173,30 @@ def lazy_pending(names, path=None):
     launchers; running one, even for --version, would install its tool first."""
     environment = None if path is None else dict(os.environ, PATH=path)
     text = output([BASH, str(PLATFORM_HELPER), "lazy", *names], environment)
-    return None if text is None else set(text.split())
+    return None if text is None else set(text.splitlines())
 
 
-def probe_path(path):
-    """The given PATH for doctor's probes, behind a private directory that links each LAZY_TOOLS launcher script
-    that runs mise use (and so writes your global mise configuration every run) to the installed tool it would run,
-    or None when the helper fails or times out. Every other command, and the PATH your workflow uses, is unchanged;
-    the directory is removed on exit."""
-    text = output([BASH, str(PLATFORM_HELPER), "configuring", *LAZY_TOOLS], dict(os.environ, PATH=path))
+def probe_path(path, names=PROBED_TOOLS):
+    """(PATH, tools, unsafe) for doctor's probes of the named commands, or None when the helper fails or times out.
+    Each named launcher script that runs mise use (and so writes your global mise configuration every run) is in tools,
+    mapped to the installed tool it would run, which PATH (the given one behind a private directory, removed on exit)
+    finds first for a command name; unsafe names such a launcher whose tool cannot be resolved, which no probe may run.
+    Every other command, and the PATH your workflow uses, is unchanged."""
+    text = output([BASH, str(PLATFORM_HELPER), "configuring", *names], dict(os.environ, PATH=path))
     if text is None:
         return None
-    links = [line.split("\t", 1) for line in text.splitlines() if "\t" in line]
-    if not links:
-        return path
-    directory = tempfile.mkdtemp(prefix="mini-factory-doctor-")
-    atexit.register(shutil.rmtree, directory, True)
-    for name, tool in links:
-        os.symlink(tool, os.path.join(directory, name))
-    return directory + os.pathsep + path
+    lines = text.splitlines()
+    tools = dict(line.split("\t", 1) for line in lines if "\t" in line)
+    unsafe = {line for line in lines if line and "\t" not in line}
+    # A configured path (such as an absolute acpx_path) is run as its tool instead; only names go on PATH.
+    links = {name: tool for name, tool in tools.items() if os.sep not in name}
+    if links:
+        directory = tempfile.mkdtemp(prefix="mini-factory-doctor-")
+        atexit.register(shutil.rmtree, directory, True)
+        for name, tool in links.items():
+            os.symlink(tool, os.path.join(directory, name))
+        path = directory + os.pathsep + path
+    return path, tools, unsafe
 
 
 def node_version(text):
@@ -431,18 +449,20 @@ def main():
     guarded = platform not in ("macos", "ubuntu")
     lazy, undiscovered = set(), False
     if guarded:
-        lazy = lazy_pending(LAZY_TOOLS)
+        lazy = lazy_pending(PROBED_TOOLS)
         probes = None if lazy is None else probe_path(os.environ.get("PATH", ""))
         if probes is None:
             # Failed discovery is not an empty result: any of these may be such a launcher, so none of them runs.
-            lazy, undiscovered = set(LAZY_TOOLS), True
+            lazy, undiscovered = set(PROBED_TOOLS), True
             check(False, "", "lazy mise tool discovery failed (" + str(PLATFORM_HELPER) + " did not complete), so "
-                  "doctor runs none of " + ", ".join(LAZY_TOOLS) + ", acpx, or native no-mistakes doctor, as any of "
-                  "them could install a lazy mise tool or write your global mise configuration; run make setup")
+                  "doctor runs none of " + ", ".join(PROBED_TOOLS) + ", acpx, or native no-mistakes doctor, as any "
+                  "of them could install a lazy mise tool or write your global mise configuration; run make setup")
         else:
             # Probes, including native no-mistakes doctor, run an installed tool directly rather than through a
-            # launcher that writes mise configuration (as omarchy-mise-install does).
-            os.environ["PATH"] = NO_MISTAKES_ENVIRONMENT["PATH"] = probes
+            # launcher that writes mise configuration (as omarchy-mise-install does); such a launcher whose tool
+            # cannot be resolved runs no more than one whose tool is not installed yet.
+            os.environ["PATH"] = NO_MISTAKES_ENVIRONMENT["PATH"] = probes[0]
+            lazy |= probes[2]
     # Why doctor runs none of the commands in lazy.
     not_run = " was not run (lazy mise tool discovery failed)" if undiscovered else " is not installed yet"
     # All three agent CLIs, Node.js/npm, and acpx are baseline, whichever roles use them. Only the daemon runs
@@ -451,11 +471,18 @@ def main():
     for name in ("bash", "git", "make", "gh", "jq", "python3", "herdr", "curl", "tar", "gum",
                  "env", "tr", "mkdir", "rmdir", "rm", "date", "chmod", "sleep", "nohup", "stat", *commands):
         check(shutil.which(name), name + " available", name + " missing; run make setup")
-    for name in LAZY_TOOLS:
-        if name in lazy and not undiscovered:
+    for name in PROBED_TOOLS:
+        if name not in lazy or undiscovered:
+            continue
+        if name in LAZY_TOOLS:
             check(False, "", name + " is a lazy mise tool that is not installed yet (running it would install "
                   "it first); setup pending: run make setup, which asks before mise install "
                   + ("node" if name == "npm" else name))
+        else:
+            # Setup installs no other tool through mise; its owner does.
+            check(False, "", name + " is a mise launcher whose tool is not installed yet (running it would install "
+                  "it first, or write your global mise configuration); install it with mise yourself (mise install "
+                  + name + "), then run make doctor")
     for name in ("git", "gh", "jq", "herdr", "gum", *commands):
         if name in lazy:
             continue
@@ -472,13 +499,21 @@ def main():
         acpx, acpx_problem = None, str(error)
     path = daemon_path()
     # acpx runs node, so neither runs while the daemon's PATH (or this shell's) would install a lazy Node.js first,
-    # nor while discovery for either PATH failed. Probes run the daemon's PATH as probe_path presents it, so no
-    # launcher writes mise configuration.
-    run_path, node_lazy, node_undiscovered = path, bool(lazy & {"node", "npm"}), undiscovered
+    # nor while discovery for either PATH failed; nor does acpx while the acpx the daemon runs (acpx_path, else acpx
+    # from its PATH) is itself such a launcher. Probes run the daemon's PATH as probe_path presents it, and acpx as
+    # the installed tool it would run, so no launcher writes mise configuration.
+    run_path, run_acpx, acpx_lazy = path, acpx, False
+    node_lazy, node_undiscovered = bool(lazy & {"node", "npm"}), undiscovered
     if guarded and not node_lazy:
-        daemon_lazy = lazy_pending(["node"], path)
-        run_path = probe_path(path) if daemon_lazy == set() else None
-        node_lazy, node_undiscovered = run_path is None, not daemon_lazy and run_path is None
+        names = ["node"] + ([acpx] if acpx else [])
+        daemon_lazy = lazy_pending(names, path)
+        probes = None if daemon_lazy is None else probe_path(path, names)
+        if probes is None:
+            run_path, node_lazy, node_undiscovered = None, True, True
+        else:
+            run_path, tools, unsafe = probes
+            daemon_lazy |= unsafe
+            node_lazy, acpx_lazy, run_acpx = "node" in daemon_lazy, acpx in daemon_lazy, tools.get(acpx, acpx)
     if node_lazy:
         check(False, "", "Node.js and acpx not checked from the No-Mistakes daemon's PATH (" + path + "): "
               + ("lazy mise tool discovery failed, so running node or acpx could install a lazy mise Node.js or "
@@ -495,22 +530,29 @@ def main():
               + (found[0] + " " + found[1].strip() if len(found) == 2 else "no Node.js")
               + "; your shell's Node.js does not count. Put a 22.13+ first on that PATH, then run make setup for the "
               "exact action and restart the No-Mistakes daemon, which keeps the PATH it started with")
-        service = acpx and output(["env", "PATH=" + run_path, "/bin/sh", "-c",
-                                   'command -v "$1" >/dev/null && "$1" --version', "sh", acpx])
         configured = "" if acpx in (None, "acpx") else " (acpx_path: " + acpx + ")"
-        check(bool(service and service.strip()), "acpx runs from the No-Mistakes daemon's PATH" + configured,
-              "cannot read acpx_path (" + str(acpx_problem) + "); write it as one plain value" if acpx_problem else
-              "acpx" + configured + " or its Node.js does not run from the No-Mistakes daemon's PATH (" + path
-              + "); run make setup for the exact action")
+        if acpx_lazy:
+            check(False, "", "acpx" + configured + " not checked from the No-Mistakes daemon's PATH (" + path + "): "
+                  "it is a mise launcher whose tool is not installed yet, and running it would install it first (or "
+                  "write your global mise configuration); install it with mise yourself, then run make doctor")
+        else:
+            service = acpx and output(["env", "PATH=" + run_path, "/bin/sh", "-c",
+                                       'command -v "$1" >/dev/null && "$1" --version', "sh", run_acpx])
+            check(bool(service and service.strip()), "acpx runs from the No-Mistakes daemon's PATH" + configured,
+                  "cannot read acpx_path (" + str(acpx_problem) + "); write it as one plain value" if acpx_problem
+                  else "acpx" + configured + " or its Node.js does not run from the No-Mistakes daemon's PATH ("
+                  + path + "); run make setup for the exact action")
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
-    help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
-    check(all(flag_available(help_text, flag) for flag in ("--intent", "--base-branch", "--yes")),
-          "No-Mistakes unattended AXI run (--intent, --base-branch, --yes) available",
-          "No-Mistakes axi run --intent/--base-branch/--yes capability missing; run make setup (offers the native stable no-mistakes update)")
-    git_version = output(["git", "--version"]) or ""
-    match = re.search(r"git version (\d+)\.(\d+)", git_version)
-    check(match and tuple(map(int, match.groups())) >= (2, 29),
-          "Git supports --no-write-fetch-head", "Git >= 2.29 required for PR fetch isolation")
+    if "no-mistakes" not in lazy:
+        help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
+        check(all(flag_available(help_text, flag) for flag in ("--intent", "--base-branch", "--yes")),
+              "No-Mistakes unattended AXI run (--intent, --base-branch, --yes) available",
+              "No-Mistakes axi run --intent/--base-branch/--yes capability missing; run make setup (offers the native stable no-mistakes update)")
+    if "git" not in lazy:
+        git_version = output(["git", "--version"]) or ""
+        match = re.search(r"git version (\d+)\.(\d+)", git_version)
+        check(match and tuple(map(int, match.groups())) >= (2, 29),
+              "Git supports --no-write-fetch-head", "Git >= 2.29 required for PR fetch isolation")
     if "gh" not in lazy:
         gh_version = output(["gh", "--version"]) or ""
         match = re.search(r"gh version (\d+)\.(\d+)", gh_version)
@@ -567,8 +609,9 @@ def main():
             continue
         check(agent_authenticated(kind), label + " authenticated",
               label + " authentication/setup pending: " + login)
-    integration = output(["herdr", "integration", "status"]) or ""
-    for kind in role_kinds:
+    # A herdr that is not run is already reported above.
+    integration = "" if "herdr" in lazy else output(["herdr", "integration", "status"]) or ""
+    for kind in ([] if "herdr" in lazy else role_kinds):
         lines = [line for line in integration.splitlines() if line.startswith(kind + ":")]
         check(len(lines) == 1 and lines[0].startswith(kind + ": current "),
               "Herdr " + AGENTS[kind][1] + " integration current",
@@ -577,7 +620,11 @@ def main():
     check(problem is None, "No-Mistakes config links to your clone: " + str(no_mistakes_config),
           "No-Mistakes config link pending (" + str(problem) + "); rerun make setup from your clone")
     # Native doctor checks that the pipeline agent runs, which would install a lazy agent (or acpx's Node.js) first.
-    if node_lazy or lazy & {command for command, _, _ in AGENTS.values()}:
+    # It also runs git --version, and gh auth status for each GitHub forge profile (gh_config_dir) from PATH.
+    delegated = lazy & {"git", "no-mistakes", *(command for command, _, _ in AGENTS.values())}
+    if "gh" in lazy and github_forge_profiles(no_mistakes_config):
+        delegated.add("gh")
+    if node_lazy or delegated:
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor could start "
               + ("a launcher that lazy mise tool discovery could not check" if undiscovered or node_undiscovered
                  else "a lazy mise tool that is not installed yet") + "; run make setup")
@@ -624,6 +671,10 @@ def main():
             if "gh" in lazy:
                 raise ValueError("gh" + not_run + ", so the target GitHub repository cannot be resolved; run "
                                  "make setup")
+            for name in ("herdr", "git"):
+                if name in lazy:
+                    raise ValueError(name + not_run + ", so the inherited Herdr route and target repository cannot "
+                                     "be checked")
             fetch_url = route_check(role_kinds)
             print("OK: inherited Herdr route, compatible server, source repository and agent detection")
         except (OSError, ValueError) as error:

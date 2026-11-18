@@ -131,6 +131,8 @@ prepare_probes() {
 	local name tool
 	case "$platform" in macos | ubuntu) return 0 ;; esac
 	while IFS=$'\t' read -r name tool; do
+		# Such a launcher whose tool is not installed is lazy: discovery reports it and never runs it.
+		[ -n "$tool" ] || continue
 		if [ -z "$probe_directory" ]; then
 			probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-update.XXXXXX")" ||
 				die 'cannot create a temporary directory for the discovery probes; nothing was changed by them'

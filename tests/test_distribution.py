@@ -41,7 +41,7 @@ root = pathlib.Path(os.environ["MOCK_BIN"])
 entry = {"tool": name, "args": args, "cwd": os.getcwd(),
          "env": {k: v for k, v in os.environ.items()
                  if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND",
-                                                            "GUM_CONFIRM_TIMEOUT")}}
+                                                            "GUM_CONFIRM_TIMEOUT", "NPM_CONFIG_REGISTRY")}}
 with open(os.environ["MOCK_LOG"], "a") as stream:
     stream.write(json.dumps(entry) + "\n")
 def fail(message="forbidden external action"):
@@ -62,6 +62,20 @@ def mise_installed_marker(tool):
     here = pathlib.Path.cwd().resolve()
     selected = project and (here == pathlib.Path(project).resolve() or pathlib.Path(project).resolve() in here.parents)
     return root / ("mise-installed-" + {"npm": "node"}.get(tool, tool) + ("@project" if selected else ""))
+def mise_request(request):
+    # A tool request: TOOL runs the version this directory selects, TOOL@VERSION its own installation of that version.
+    tool, _, version = request.partition("@")
+    tool = {"npm": "node"}.get(tool, tool)
+    if version:
+        return root / ("mise-installed-" + tool + "@" + version), mise_data / "installs" / tool / version
+    return mise_installed_marker(tool), mise_data / "installs" / tool / "latest"
+def mise_binary(directory, name):
+    binary = directory / "bin" / name
+    if not binary.exists():
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / "mock-cli", binary)
+        binary.chmod(0o755)
+    return binary
 def provide(packages):
     # A package installation places what its packages provide: mock CLIs, or the real tool for system utilities.
     mocked = {"gh": ("gh",), "github-cli": ("gh",), "gum": ("gum",), "node": ("node", "npm"), "nodejs": ("node",),
@@ -108,7 +122,9 @@ if name == "uname":
           else os.environ.get("MOCK_OS", "Darwin"))
 elif name == "gh":
     if args == ["--version"]:
-        print("gh version 2.88.1 (test)")
+        # mise's installation of an explicit version reports it; any other gh is the current release.
+        installed = re.search(r"/installs/gh/(\d[\w.]*)/bin/gh$", os.path.realpath(sys.argv[0]))
+        print("gh version " + (installed.group(1) if installed else "2.88.1") + " (test)")
     elif args[:2] == ["repo", "view"]:
         if "GH_REPO" in os.environ:
             fail("inherited GH_REPO contaminated repository resolution")
@@ -322,6 +338,12 @@ elif name == "apt-cache":
             candidate = "0.17.0-1"
         print("gum:\n  Installed: " + ("0.17.0-1" if installed else "(none)") + "\n  Candidate: "
               + candidate + "\n  Version table:")
+    else:
+        fail()
+elif name == "jq":
+    # Only mise's installation of jq is this mock; the jq on PATH is the real one.
+    if args == ["--version"]:
+        print("jq-1.7.1")
     else:
         fail()
 elif name == "acpx":
@@ -762,19 +784,28 @@ elif name == "omarchy":
     provide(args[2:])
 elif name == "mise":
     tool = {"npm": "node"}.get(args[-1], args[-1]) if args else ""
-    if args[:1] == ["which"] and len(args) == 2:
-        # Like native mise which, only an installed tool resolves; offline, it never fetches or installs.
+    if args[:1] == ["which"] and (len(args) == 2 or len(args) == 3 and args[1].startswith("--tool=")):
+        # Like native mise which, only an installed tool resolves (with --tool, that tool request's installation);
+        # offline, it never fetches or installs.
         if os.environ.get("MISE_OFFLINE") != "1":
             fail("mise which must stay offline")
-        if not mise_installed_marker(tool).exists():
-            print("mise ERROR " + args[1] + " is not installed", file=sys.stderr)
+        marker, installation = mise_request(args[1][len("--tool="):] if len(args) == 3 else tool)
+        if not marker.exists():
+            print("mise ERROR " + args[-1] + " is not installed", file=sys.stderr)
             sys.exit(1)
-        binary = mise_data / "installs" / tool / "latest/bin" / args[1]
-        if not binary.exists():
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / "mock-cli", binary)
-            binary.chmod(0o755)
-        print(binary)
+        print(mise_binary(installation, args[-1]))
+    elif args[:1] == ["x"] and len(args) >= 4 and args[2] == "--":
+        # A launcher's own mise x statement without its mise use: offline, an installed tool runs with the
+        # environment mise gives it (MOCK_MISE_ENV models mise's [env]).
+        if os.environ.get("MISE_OFFLINE") != "1":
+            fail("mise x must stay offline")
+        marker, installation = mise_request(args[1])
+        if not marker.exists():
+            (root / "lazy-triggered-mise").write_text(" ".join(args))
+            fail("lazy installation triggered by mise x " + args[1])
+        binary = mise_binary(installation, args[3])
+        os.execve(str(binary), [str(binary), *args[4:]],
+                  dict(os.environ, **json.loads(os.environ.get("MOCK_MISE_ENV", "{}"))))
     elif args[:1] == ["current"] and len(args) == 2:
         # The version mise selects here, read offline; none for a tool you disabled.
         if os.environ.get("MISE_OFFLINE") != "1":
@@ -4694,6 +4725,8 @@ os.execv(executable, [executable, *args])
             self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
             return result.stdout
 
+        # Every command doctor probes, and acpx; none of them runs while discovery for it failed.
+        probed = ("git", "jq", "herdr", "gum", "no-mistakes", "gh", "codex", "claude", "cursor-agent", "node", "npm")
         # Without the helper (a damaged installation), or when its configuring-launcher call fails, an unknown result
         # is not an empty one: doctor runs none of the tools it guards, nor acpx or native no-mistakes doctor.
         helper.unlink()
@@ -4701,22 +4734,20 @@ os.execv(executable, [executable, *args])
         self.assertIn("FAIL: bundle integrity: missing regular bundle file: " + str(helper), output)
         self.assertIn("FAIL: lazy mise tool discovery failed", output)
         self.assertNotIn("is a lazy mise tool that is not installed yet", output)
-        self.assertFalse([c for c in self.calls() if c["tool"] in ("gh", "codex", "claude", "cursor-agent", "node",
-                                                                    "npm", "acpx")])
-        output = doctor("configuring gh codex claude cursor-agent node npm")
+        self.assertFalse([c for c in self.calls() if c["tool"] in probed + ("acpx",)])
+        output = doctor("configuring " + " ".join(probed))
         self.assertIn("OK: platform: omarchy", output.splitlines())
         self.assertIn("FAIL: lazy mise tool discovery failed", output)
         self.assertIn("FAIL: Node.js and acpx not checked from the No-Mistakes daemon's PATH", output)
         self.assertIn("FAIL: No-Mistakes pipeline agent not checked", output)
-        self.assertFalse([c for c in self.calls() if c["tool"] in ("gh", "codex", "claude", "cursor-agent", "node",
-                                                                    "npm", "acpx")])
+        self.assertFalse([c for c in self.calls() if c["tool"] in probed + ("acpx",)])
         # Behind your own shell Node.js, only the lookup for the No-Mistakes daemon's PATH fails, which finds mise's
         # Node.js that is not installed yet: neither it nor acpx (or native no-mistakes doctor) runs.
         (self.mock / "mise-installed-node").unlink()
         for name in ("node", "npm"):
             shutil.copyfile(self.mock / "mock-cli", self.mock / name)
             (self.mock / name).chmod(0o755)
-        output = doctor("lazy node")
+        output = doctor("lazy node acpx")
         self.assertNotIn("FAIL: lazy mise tool discovery failed", output)
         self.assertIn("FAIL: gh is a lazy mise tool that is not installed yet", output)
         self.assertIn("OK: cursor-agent version responds", output.splitlines())
@@ -4724,6 +4755,9 @@ os.execv(executable, [executable, *args])
         [daemon] = [line for line in output.splitlines() if line.startswith("FAIL: Node.js and acpx not checked")]
         self.assertIn("): lazy mise tool discovery failed", daemon)
         self.assertIn("FAIL: No-Mistakes pipeline agent not checked", output)
+        # Neither delegated probe that could start that Node.js ran; No-Mistakes' own version and capability did.
+        self.assertFalse(self.calls("acpx"))
+        self.assertEqual([c["args"] for c in self.calls("no-mistakes")], [["--version"], ["axi", "run", "--help"]])
 
     def test_omarchy_setup_checks_github_cli_behind_a_configuration_writing_launcher_directly(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
@@ -4790,7 +4824,9 @@ os.execv(executable, [executable, *args])
 
         def unchanged():
             self.assertEqual(self.lazy_triggered(), [])
-            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            # Only npm runs through its launcher's own mise x statement (offline), never its mise use.
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] == ["use"]
+                              or c["args"][:1] == ["x"] and c["args"][1:4] != ["node", "--", "npm"]])
             for path, text in texts.items():
                 self.assertEqual(path.read_text(), text)
 
@@ -4802,12 +4838,18 @@ os.execv(executable, [executable, *args])
                       result.stdout.splitlines())
         self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", result.stdout.splitlines())
         unchanged()
-        # So do npm's prefix check and the acpx installation you approve.
+        # npm's prefix check and the acpx installation you approve run as the npm launcher's own mise x statement
+        # runs npm, with the environment mise gives it (here a registry from mise's [env]), but without its mise use.
         self.acpx.unlink()
         self.log.write_text("")
-        self.assert_success(self.interactive_setup("y"))
-        self.assertEqual([c["args"] for c in self.npm_changes()],
-                         [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
+        registry = "https://registry.internal.example/"
+        self.assert_success(self.interactive_setup("y", MOCK_MISE_ENV=json.dumps({"NPM_CONFIG_REGISTRY": registry})))
+        install = ["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]
+        self.assertEqual([c["args"] for c in self.npm_changes()], [install])
+        self.assertEqual([c["env"].get("NPM_CONFIG_REGISTRY") for c in self.calls("npm")
+                          if c["args"] in (["prefix", "-g"], install)], [registry, registry])
+        self.assertEqual([c["args"][1:4] for c in self.calls("mise") if c["args"][:1] == ["x"]],
+                         [["node", "--", "npm"]] * 2)
         unchanged()
         # Your shell's launcher never stands in for the Node.js 18 the daemon's PATH finds first.
         texts.pop(daemon_node)
@@ -4821,6 +4863,175 @@ os.execv(executable, [executable, *args])
         self.assertIn("OK: Node.js 22.13+ for acpx", result.stdout.splitlines())
         unchanged()
         self.assert_no_apt()
+
+    def test_launcher_classification_reads_statements_not_comments(self):
+        self.arch_system()
+        helper = self.bundle / "scripts/platform.sh"
+        scripts = self.home / "dotfiles bin"
+        scripts.mkdir()
+        # Your own native gh wrapper, linked into ~/.local/bin, only mentions mise in comments and text.
+        wrapper = scripts / "gh-wrapper"
+        wrapper.write_text('#!/bin/sh\n# Do not run mise use -g here; mise x would install another gh.\n'
+                           'echo "never mise use -g" >/dev/null\nexec "' + str(self.mock / "gh") + '" "$@"\n')
+        wrapper.chmod(0o755)
+        (self.home / ".local/bin/gh").symlink_to(wrapper)
+        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout, "")
+        self.assertEqual(self.run_script(helper, "configuring", "gh").stdout, "")
+        # A linked launcher script whose statements run mise is still one (here with no mise to resolve it).
+        self.configuring_launcher(scripts / "omarchy-codex", "codex")
+        (self.home / ".local/bin/codex").symlink_to(scripts / "omarchy-codex")
+        self.assertEqual(self.run_script(helper, "lazy", "gh", "codex").stdout.splitlines(), ["codex"])
+        self.assertEqual(self.run_script(helper, "configuring", "gh", "codex").stdout.splitlines(), ["codex"])
+        self.assertFalse(self.calls("gh") + self.calls("codex"))
+
+    def test_omarchy_checks_resolve_the_tool_version_a_launcher_pins(self):
+        self.clone_fixture()
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # Your launcher runs mise x gh@2.46.0 -- gh, not the gh 2.88.1 mise selects here.
+        launcher = self.home / ".local/bin/gh"
+        text = self.configuring_launcher(launcher, "gh", "gh@2.46.0")
+        helper = self.installed / "scripts/platform.sh"
+        installs = self.home / ".local/share/mise/installs"
+        # Until that version is installed, running the launcher would install it: pending, never run.
+        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout.splitlines(), ["gh"])
+        self.assertEqual(self.run_script(helper, "configuring", "gh").stdout.splitlines(), ["gh"])
+        self.log.write_text("")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertIn("FAIL: gh is a lazy mise tool that is not installed yet", doctor.stdout)
+        self.assertFalse(self.calls("gh"))
+        # Installed, checks run that version, which is too old.
+        (self.mock / "mise-installed-gh@2.46.0").write_text("yes")
+        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout, "")
+        self.assertEqual(self.run_script(helper, "configuring", "gh").stdout.splitlines(),
+                         ["gh\t" + str(installs / "gh/2.46.0/bin/gh")])
+        self.log.write_text("")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertIn("FAIL: GitHub CLI >= 2.47 required", doctor.stdout)
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(launcher) + " cannot run or is not GitHub CLI 2.47+", result.stderr)
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+        self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_doctor_runs_no_configuration_writing_launcher_whose_tool_it_cannot_resolve(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        launcher = self.home / ".local/bin/gh"
+        text = self.configuring_launcher(launcher, "gh")
+        # The lazy mise tool check finds gh installed, but the configuring-launcher lookup that follows cannot
+        # resolve it (as when mise reads a configuration that a launcher is rewriting at that moment).
+        helper = self.installed / "scripts/platform.sh"
+        helper.write_text(helper.read_text().replace("\tconfiguring)\n\t\tshift\n",
+                                                     "\tconfiguring)\n\t\tshift\n\t\tmf_mise_installed() { return 1; }\n", 1))
+        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout, "")
+        self.assertEqual(self.run_script(helper, "configuring", "gh", "codex").stdout.splitlines(), ["gh"])
+        self.log.write_text("")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: gh is a lazy mise tool that is not installed yet", doctor.stdout)
+        self.assertIn("FAIL: GitHub authentication not checked: gh is not installed yet", doctor.stdout)
+        self.assertFalse(self.calls("gh"))
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+        self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_doctor_checks_every_probed_command_for_mise_launchers(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # Your jq is a launcher that writes your global mise configuration every run.
+        launcher = self.home / ".local/bin/jq"
+        text = self.configuring_launcher(launcher, "jq")
+        self.log.write_text("")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: jq is a mise launcher whose tool is not installed yet", doctor.stdout)
+        self.assertNotIn("jq version", doctor.stdout)
+        self.assertFalse(self.calls("jq"))
+        # Installed, doctor runs the jq it would run; your other commands are probed as usual.
+        (self.mock / "mise-installed-jq").write_text("yes")
+        self.log.write_text("")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assert_success(doctor)
+        self.assertIn("OK: jq version responds", doctor.stdout.splitlines())
+        self.assertEqual([c["args"] for c in self.calls("jq")], [["--version"]])
+        self.assertIn("OK: herdr version responds", doctor.stdout.splitlines())
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+        self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_doctor_checks_the_acpx_the_daemon_runs_for_mise_launchers(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        source = self.bundle / "no-mistakes/config.yaml"
+        original = source.read_text()
+        # acpx_path names a launcher that writes your global mise configuration every run.
+        launcher = self.root / "custom acpx/acpx"
+        text = self.configuring_launcher(launcher, "acpx")
+        source.write_text(original + "acpx_path: " + json.dumps(str(launcher)) + "\n")
+        configured = "acpx (acpx_path: " + str(launcher) + ")"
+
+        def doctor():
+            self.log.write_text("")
+            result = self.run_script(self.installed / "scripts/doctor.sh")
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertEqual(launcher.read_text(), text)
+            return result
+
+        result = doctor()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: " + configured + " not checked from the No-Mistakes daemon's PATH", result.stdout)
+        self.assertIn("OK: Node.js 22.13+ runs from the No-Mistakes daemon's freshly resolved PATH",
+                      result.stdout.splitlines())
+        self.assertFalse(self.calls("acpx"))
+        # Installed, doctor runs the acpx it would run.
+        (self.mock / "mise-installed-acpx").write_text("yes")
+        result = doctor()
+        self.assert_success(result)
+        self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH (acpx_path: " + str(launcher) + ")",
+                      result.stdout.splitlines())
+        self.assertEqual([c["args"] for c in self.calls("acpx")], [["--version"]])
+        # So does the acpx the daemon's PATH finds.
+        source.write_text(original)
+        self.acpx.unlink()
+        self.configuring_launcher(self.acpx, "acpx")
+        result = doctor()
+        self.assert_success(result)
+        self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", result.stdout.splitlines())
+        self.assertEqual([c["args"] for c in self.calls("acpx")], [["--version"]])
+
+    def test_omarchy_doctor_skips_native_doctor_only_when_its_github_profile_could_run_a_lazy_gh(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        source = self.bundle / "no-mistakes/config.yaml"
+        original = source.read_text()
+        profile = original + "forge_profiles:\n  github.com:\n    gh_config_dir: " + json.dumps(str(self.home / "gh")) + "\n"
+
+        def native_doctor(text):
+            source.write_text(text)
+            self.log.write_text("")
+            result = self.run_script(self.installed / "scripts/doctor.sh")
+            self.assertEqual(self.lazy_triggered(), [])
+            return result, ["doctor"] in [c["args"] for c in self.calls("no-mistakes")]
+
+        # With gh installed, native doctor checks the GitHub profile with it.
+        result, ran = native_doctor(profile)
+        self.assert_success(result)
+        self.assertTrue(ran)
+        # Once mise's gh is not installed any more, native doctor still runs without such a profile.
+        (self.mock / "mise-installed-gh").unlink()
+        result, ran = native_doctor(original)
+        self.assertIn("FAIL: gh is a lazy mise tool that is not installed yet", result.stdout)
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+        self.assertTrue(ran)
+        # With one, native doctor would run gh auth status through mise's lazy gh, so it does not run.
+        result, ran = native_doctor(profile)
+        self.assertIn("FAIL: No-Mistakes pipeline agent not checked: native no-mistakes doctor could start a lazy "
+                      "mise tool that is not installed yet", result.stdout)
+        self.assertFalse(ran)
+        self.assertFalse(self.calls("gh"))
 
     def test_mocked_arch_guards_your_own_lazy_mise_tools_by_ownership(self):
         self.clone_fixture()
@@ -4963,6 +5174,11 @@ os.execv(executable, [executable, *args])
         # Omarchy's agents auto-update when they run with an update check due; installed, they are not lazy.
         self.env["MOCK_MISE_AUTO_UPDATE"] = "gh codex claude cursor-agent node"
         auto_updated = lambda: sorted(path.name for path in self.mock.glob("auto-updated-*"))
+        # Setup's read-only version, login, gh-dash, Node.js, and acpx checks run them offline too.
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y"))
+        self.assertTrue(self.calls("codex") and self.calls("gh") and self.calls("node"))
+        self.assertEqual(auto_updated(), [])
         self.log.write_text("")
         self.assert_success(self.run_script(self.installed / "scripts/doctor.sh"))
         self.assertEqual(auto_updated(), [])
