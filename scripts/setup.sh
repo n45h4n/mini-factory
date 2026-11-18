@@ -560,16 +560,23 @@ install_tools() {
 				die "$command_name installation pending"
 			fi
 		fi
-		# A launcher that runs mise use would write your global mise configuration: check the tool it runs instead.
-		probe="$(mf_configuring_launcher_tool "$command_name")" || probe="$command_name"
+		# A launcher that runs mise use would write your global mise configuration: check the tool it runs instead,
+		# and never run one whose tool is not installed (it would install it first).
+		probe="$(mf_configuring_launcher_tool "$command_name")" || {
+			[ "$?" -ne 2 ] ||
+				die "$command_name is a mise launcher whose tool is not installed yet; $(repair_hint "$command_name"), then rerun make setup"
+			probe="$command_name"
+		}
 		MISE_OFFLINE=1 "$probe" --version >/dev/null 2>&1 || die "$command_name is installed but cannot run; $(repair_hint "$command_name")"
 	done
 }
 
 # A capability check, not a version floor: stable releases document axi run --intent, --base-branch, and --yes.
 no_mistakes_is_suitable() {
-	local help flag pattern
-	help="$(MISE_OFFLINE=1 NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 no-mistakes axi run --help 2>/dev/null)" || return 1
+	local help flag pattern probe
+	# As in install_tools: a launcher that runs mise use is checked as the tool it runs.
+	probe="$(mf_configuring_launcher_tool no-mistakes)" || probe=no-mistakes
+	help="$(MISE_OFFLINE=1 NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$probe" axi run --help 2>/dev/null)" || return 1
 	for flag in --intent --base-branch --yes; do
 		# An exact flag: --intent-file alone is not the stable interface.
 		pattern="${flag}([^[:alnum:]_-]|\$)"
@@ -836,9 +843,8 @@ link_configuring_launchers() {
 # [env]) but not that mise use, which writes your global mise configuration; that mise runs offline, so it installs
 # or updates nothing. Any other npm runs as the read-only checks run it.
 shell_npm() {
-	local path request
-	if [ -n "$shell_probes" ] && mf_configuring_launcher_tool npm >/dev/null && path="$(command -v npm)" &&
-		path="$(mf_link_target "$path")" && request="$(mf_launcher_request "$path")"; then
+	local request
+	if [ -n "$shell_probes" ] && request="$(mf_configuring_launcher_request npm)"; then
 		MISE_OFFLINE=1 "$(mf_mise_command)" x "${request%%$'\t'*}" -- "${request#*$'\t'}" "$@"
 	else
 		PATH="$shell_probes$PATH" npm "$@"
@@ -904,9 +910,18 @@ install_node() {
 }
 
 acpx_runs_for_daemon() {
-	[ -n "$acpx_path" ] || return 1
+	local acpx="$acpx_path"
+	[ -n "$acpx" ] || return 1
+	# acpx_path runs verbatim, which no PATH prefix redirects: a launcher that runs mise use, found from the daemon's
+	# PATH, is checked as the installed tool it would run, and one whose tool is not installed does not run.
+	if [ -n "$daemon_probes" ]; then
+		acpx="$(PATH="$daemon_path" mf_configuring_launcher_tool "$acpx_path")" || {
+			[ "$?" -ne 2 ] || return 1
+			acpx="$acpx_path"
+		}
+	fi
 	# shellcheck disable=SC2016 # Expanded by the child shell with the daemon's PATH.
-	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx_path"
+	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx"
 }
 
 # Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the

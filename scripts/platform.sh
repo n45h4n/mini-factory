@@ -256,6 +256,15 @@ mf_configuring_launcher_tool() {
 	mf_launcher_installed "$1" "$path" || return 2
 }
 
+# REQUEST<TAB>BIN of the mise x statement in the launcher that writes mise configuration (see above) a command runs,
+# once its tool is installed, so the approved npm actions can run that statement without the launcher's mise use;
+# fails for any other command. Only read, never run.
+mf_configuring_launcher_request() {
+	local path
+	mf_configuring_launcher_tool "$1" >/dev/null && path="$(command -v "$1")" && path="$(mf_link_target "$path")" &&
+		mf_launcher_request "$path"
+}
+
 # Prints NAME<TAB>TOOL for each named command whose launcher writes mise configuration (see above), and NAME alone
 # for such a launcher whose tool cannot be resolved, which no check may run.
 mf_configuring_launchers() {

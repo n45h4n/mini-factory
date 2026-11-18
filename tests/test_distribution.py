@@ -4646,7 +4646,9 @@ os.execv(executable, [executable, *args])
         self.assertIn(["extension", "list"], [c["args"] for c in self.calls("gh")])
         self.assertIn(["prefix", "-g"], [c["args"] for c in self.calls("npm")])
         self.assertEqual(self.lazy_triggered(), [])
-        self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+        # npm's global prefix is read as its launcher's own mise x statement runs npm (offline), never its mise use.
+        self.assertEqual([c["args"] for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])],
+                         [["x", "node", "--", "npm", "prefix", "-g"]])
         for path, content in launchers.values():
             self.assertEqual(path.read_text(), content)
         self.assert_safe_clone_actions()
@@ -4689,7 +4691,9 @@ os.execv(executable, [executable, *args])
         self.assertIn(["extension", "list"], [c["args"] for c in self.calls("gh")])
         self.assertIn(["prefix", "-g"], [c["args"] for c in self.calls("npm")])
         self.assertEqual(self.lazy_triggered(), [])
-        self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+        # npm's global prefix is read as its linked launcher's own mise x statement runs npm (offline), never its mise use.
+        self.assertEqual([c["args"] for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])],
+                         [["x", "node", "--", "npm", "prefix", "-g"]])
         # Once mise's gh is not installed any more, its linked launcher would install it first: pending, never run.
         (self.mock / "mise-installed-gh").unlink()
         self.assertEqual(self.run_script(helper, "lazy", "gh", "claude").stdout.splitlines(), ["gh"])
@@ -4875,8 +4879,9 @@ os.execv(executable, [executable, *args])
                            'echo "never mise use -g" >/dev/null\nexec "' + str(self.mock / "gh") + '" "$@"\n')
         wrapper.chmod(0o755)
         (self.home / ".local/bin/gh").symlink_to(wrapper)
-        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout, "")
-        self.assertEqual(self.run_script(helper, "configuring", "gh").stdout, "")
+        for mode in ("lazy", "configuring"):
+            result = self.run_script(helper, mode, "gh")
+            self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         # A linked launcher script whose statements run mise is still one (here with no mise to resolve it).
         self.configuring_launcher(scripts / "omarchy-codex", "codex")
         (self.home / ".local/bin/codex").symlink_to(scripts / "omarchy-codex")
@@ -4980,14 +4985,27 @@ os.execv(executable, [executable, *args])
             self.assertEqual(launcher.read_text(), text)
             return result
 
+        def setup():
+            self.log.write_text("")
+            result = self.setup()
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertEqual(launcher.read_text(), text)
+            return result
+
+        result = setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Remaining action: acpx_path " + str(launcher) + " in the No-Mistakes config does not run",
+                      result.stdout)
         result = doctor()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FAIL: " + configured + " not checked from the No-Mistakes daemon's PATH", result.stdout)
         self.assertIn("OK: Node.js 22.13+ runs from the No-Mistakes daemon's freshly resolved PATH",
                       result.stdout.splitlines())
         self.assertFalse(self.calls("acpx"))
-        # Installed, doctor runs the acpx it would run.
+        # Installed, setup and doctor run the acpx it would run.
         (self.mock / "mise-installed-acpx").write_text("yes")
+        self.assert_success(setup())
         result = doctor()
         self.assert_success(result)
         self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH (acpx_path: " + str(launcher) + ")",
@@ -4997,6 +5015,7 @@ os.execv(executable, [executable, *args])
         source.write_text(original)
         self.acpx.unlink()
         self.configuring_launcher(self.acpx, "acpx")
+        self.assert_success(setup())
         result = doctor()
         self.assert_success(result)
         self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", result.stdout.splitlines())
@@ -5032,6 +5051,58 @@ os.execv(executable, [executable, *args])
                       "mise tool that is not installed yet", result.stdout)
         self.assertFalse(ran)
         self.assertFalse(self.calls("gh"))
+
+    def test_omarchy_setup_checks_a_no_mistakes_launcher_as_the_tool_it_runs(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # Your No-Mistakes is a launcher that writes your global mise configuration every run.
+        launcher = self.home / ".local/bin/no-mistakes"
+        text = self.configuring_launcher(launcher, "no-mistakes")
+
+        def unchanged():
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertEqual(launcher.read_text(), text)
+
+        # Until its tool is installed, running it would install it: setup stops before running it.
+        self.log.write_text("")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no-mistakes is a mise launcher whose tool is not installed yet; Omarchy manages it with mise",
+                      result.stderr)
+        self.assertFalse(self.calls("no-mistakes"))
+        unchanged()
+        # Installed, its version and axi run capability checks run the No-Mistakes it would run.
+        (self.mock / "mise-installed-no-mistakes").write_text("yes")
+        self.log.write_text("")
+        self.assert_success(self.setup())
+        calls = [c["args"] for c in self.calls("no-mistakes")]
+        self.assertIn(["--version"], calls)
+        self.assertIn(["axi", "run", "--help"], calls)
+        unchanged()
+
+    def test_omarchy_update_runs_an_npm_launcher_with_its_mise_environment(self):
+        self.clone_fixture()
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # Setup's npm install -g --prefix ~/.local acpx, updated through your npm launcher that writes your global
+        # mise configuration every run; mise's [env] gives npm the only registry it can reach.
+        self.native_layouts("acpx")
+        launcher = self.home / ".local/bin/npm"
+        text = self.configuring_launcher(launcher, "npm", "node")
+        registry = "https://registry.internal.example/"
+        # Only make update's own upgrades run here: without make, its later setup phase cannot start.
+        (self.mock / "make").unlink()
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8, MOCK_MISE_ENV=json.dumps({"NPM_CONFIG_REGISTRY": registry}))
+        self.assertIn("acpx (0.20.0): npm package acpx", result.stdout)
+        install = ["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]
+        self.assertEqual([(c["args"], c["env"].get("NPM_CONFIG_REGISTRY")) for c in self.npm_changes()],
+                         [(install, registry)])
+        self.assertEqual([c["args"][:4] for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])],
+                         [["x", "node", "--", "npm"]])
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertEqual(launcher.read_text(), text)
 
     def test_mocked_arch_guards_your_own_lazy_mise_tools_by_ownership(self):
         self.clone_fixture()

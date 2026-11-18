@@ -151,6 +151,18 @@ probe() {
 	fi
 }
 
+# npm as probe runs it, except that a launcher that runs mise use runs as its own mise x statement does (as setup's
+# shell_npm): with the environment mise gives npm (such as a registry from mise's [env]), but without that mise use,
+# and offline for mise, so it installs or updates nothing else.
+probe_npm() {
+	local request
+	if [ -n "$probe_directory" ] && request="$(mf_configuring_launcher_request npm)"; then
+		MISE_OFFLINE=1 "$(mf_mise_command)" x "${request%%$'\t'*}" -- "${request#*$'\t'}" "$@"
+	else
+		probe npm "$@"
+	fi
+}
+
 # Discovery probes run offline for mise, whose launchers would otherwise install a due update of their tool
 # (Omarchy's agents auto-update) before running it; offline, they run the installed version.
 tool_version() {
@@ -257,7 +269,7 @@ plan_acpx() {
 		plan_targets=(install -g --prefix "$HOME/.local" acpx@latest)
 		;;
 	*)
-		prefix="$(MISE_OFFLINE=1 probe npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
+		prefix="$(MISE_OFFLINE=1 probe_npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
 		case "$real" in
 		"$prefix/lib/node_modules/acpx/"*)
 			if [ ! -w "$prefix/lib/node_modules" ]; then
@@ -436,7 +448,7 @@ run_plan() {
 		fi
 		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
-	npm) PATH="$bin_directory:$PATH" probe npm "${plan_targets[@]}" ;;
+	npm) PATH="$bin_directory:$PATH" probe_npm "${plan_targets[@]}" ;;
 	extension) probe gh extension upgrade dash ;;
 	# Keeping the bin directory on PATH avoids the native installers' profile-editing branches, as in setup.
 	native) PATH="$bin_directory:$PATH" "$plan_path" update ;;
