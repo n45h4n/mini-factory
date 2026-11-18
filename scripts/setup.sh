@@ -457,6 +457,7 @@ install_lazy_tools() {
 	local name tool required='' remaining
 	local tools=()
 	case "$platform" in arch | omarchy) ;; *) return 0 ;; esac
+	resolve_daemon_path
 	while IFS= read -r name; do
 		case "$name" in
 		npm) tool=node ;;
@@ -464,19 +465,25 @@ install_lazy_tools() {
 		esac
 		contains "$tool" "${tools[@]+"${tools[@]}"}" || tools+=("$tool")
 		case "$name" in node | npm) ;; *) required="$required $name" ;; esac
-	done < <(mf_lazy_pending gh codex claude cursor-agent node npm)
+	done < <(lazy_tools_pending)
 	[ "${#tools[@]}" -gt 0 ] || return 0
 	if consent "Your mise configuration (on Omarchy, Omarchy's) provides ${tools[*]} as lazy mise tools that install on first use. Install them now with mise install ${tools[*]}? mise installs the versions its configuration selects here (Omarchy's own hook may add each agent's Herdr integration); other lazy tools, your mise configuration, and Omarchy's default agent stay unchanged."; then
 		"$(mf_mise_command)" install "${tools[@]}" ||
 			die "mise install ${tools[*]} did not complete; resolve the problem mise reported (for example network access), then rerun make setup"
 		hash -r
-		remaining="$(mf_lazy_pending gh codex claude cursor-agent node npm | tr '\n' ' ')"
+		remaining="$(lazy_tools_pending | awk '!seen[$0]++' | tr '\n' ' ')"
 		[ -z "$remaining" ] ||
 			die "mise install did not provide: $remaining; repair it with mise or omarchy update, then rerun make setup"
 	elif [ -n "$required" ]; then
 		# A declined Node.js alone is reported later as a remaining action, as on other platforms.
 		die "lazy mise tools pending:$required; rerun make setup in a terminal to install them with mise install ${tools[*]}"
 	fi
+}
+
+# The required lazy tools from your shell's PATH, and Node.js as the No-Mistakes daemon's PATH resolves it.
+lazy_tools_pending() {
+	mf_lazy_pending gh codex claude cursor-agent node npm
+	daemon_lazy_pending node
 }
 
 # How to repair an installed tool that cannot run, by its owner; setup never replaces a managed installation.
@@ -785,6 +792,11 @@ node_is_suitable() {
 		node --version 2>/dev/null | node_version_is_suitable
 }
 
+resolve_daemon_path() {
+	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
+	[ -n "$daemon_path" ] || daemon_path="$service_path"
+}
+
 # The lazy launchers among the named commands as the No-Mistakes daemon's PATH resolves them.
 daemon_lazy_pending() {
 	local PATH="$daemon_path"
@@ -865,8 +877,7 @@ acpx_runs_for_daemon() {
 ensure_node_and_acpx() {
 	local prefix found daemon_node
 	local npm_arguments=(install -g acpx@latest)
-	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
-	[ -n "$daemon_path" ] || daemon_path="$service_path"
+	resolve_daemon_path
 	# A lazy mise Node.js installs itself when run (acpx runs it too), so nothing below may run it first.
 	if { [ "$platform" = arch ] || [ "$platform" = omarchy ]; } && [ -n "$(mf_lazy_pending node npm)$(daemon_lazy_pending node)" ]; then
 		notice "Remaining action: Node.js, a lazy mise tool, is not installed yet; acpx, the ACP runner No-Mistakes uses for Cursor, needs it from your shell and from the No-Mistakes daemon's PATH $daemon_path. Rerun make setup in a terminal and accept mise install node (or run it yourself), then rerun make doctor."

@@ -4872,6 +4872,29 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.lazy_triggered(), [])
         self.assert_no_apt()
 
+    def test_omarchy_setup_offers_the_daemons_lazy_node_behind_your_own_shell_node(self):
+        self.clone_fixture()
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent"))
+        # Your own Node.js and npm come first in this shell, while the login shell the No-Mistakes daemon adopts
+        # puts mise's shims first, whose selected Node.js is not installed yet.
+        for name in ("node", "npm"):
+            shutil.copyfile(self.mock / "mock-cli", self.mock / name)
+            (self.mock / name).chmod(0o755)
+        self.log.write_text("")
+        result = self.setup()
+        self.assertIn("Remaining action: Node.js, a lazy mise tool, is not installed yet", result.stdout)
+        self.assertFalse(self.mise_installs())
+        self.assertEqual(self.lazy_triggered(), [])
+        # With consent, setup installs that Node.js through mise before anything runs it.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertEqual(self.mise_installs(), [["install", "node"]])
+        self.assertNotIn("Node.js, a lazy mise tool, is not installed yet", result.stdout)
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertEqual(os.readlink(shims / "node"), str(system / "usr/bin/mise"))
+        self.assert_no_apt()
+
     def test_omarchy_update_discovery_never_runs_an_uninstalled_lazy_npm_behind_your_own_node(self):
         self.clone_fixture()
         system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
