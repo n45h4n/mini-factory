@@ -41,9 +41,9 @@ USAGE = """usage: nm-config [show | --help]
 #   nm-config acpx-path FILE
 #                           print the acpx executable No-Mistakes runs for ACP agents: acpx_path, else acpx
 #   nm-config daemon-path   print the PATH the No-Mistakes daemon resolves at startup (see daemon_path)
-#   nm-config gh-profiles FILE
-#                           print each forge_profiles host with a gh_config_dir, for which native
-#                           no-mistakes doctor runs gh auth status
+#   nm-config gh-profiles FILE | glab-profiles FILE
+#                           print each forge_profiles host with a gh_config_dir (or glab_config_dir), for
+#                           which native no-mistakes doctor runs gh (or glab) auth status
 
 # Native No-Mistakes harnesses (v1.84.0 global config reference), independent of mf-config's issue agents.
 HARNESSES = {"codex": "Codex", "claude": "Claude Code", "grok": "Grok", "opencode": "OpenCode", "pi": "Pi",
@@ -1110,12 +1110,12 @@ def main(argv):
     if argv == ["daemon-path"]:
         print(daemon_path())
         return 0
-    if len(argv) == 2 and argv[0] == "gh-profiles":
+    if len(argv) == 2 and argv[0] in ("gh-profiles", "glab-profiles"):
         target = Path(argv[1])
         try:
             document = load(read(target)[1], target)
             for host in mapping(document, ("forge_profiles",)):
-                path = ("forge_profiles", host, "gh_config_dir")
+                path = ("forge_profiles", host, argv[0].split("-")[0] + "_config_dir")
                 node = mapping(document, path[:2]).get(path[2])
                 if not is_null(node) and scalar(node, path) != "":
                     print(host)

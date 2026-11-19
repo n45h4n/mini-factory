@@ -201,6 +201,22 @@ mf_launcher_installed() {
 	fi
 }
 
+# The mise tool request that mise install installs for the launcher at the second argument's path, as
+# mf_launcher_installed resolves it: a launcher script's own mise x request (its explicit gh@2.88.1 is exactly that
+# version), any other launcher's command tool (npm's is node), the version mise selects here. Only read, never run.
+mf_launcher_install_request() {
+	local path request
+	path="$(mf_link_target "$2")" || return 1
+	if ! mf_is_mise_wrapper "$2" && [ "$(basename "$path")" != mise ] && [ -f "$path" ] &&
+		request="$(mf_launcher_request "$path")"; then
+		printf '%s\n' "${request%%$'\t'*}"
+	elif [ "${1##*/}" = npm ]; then
+		printf 'node\n'
+	else
+		printf '%s\n' "${1##*/}"
+	fi
+}
+
 # The installed executable behind a mise launcher, resolved offline in the current directory and environment, as
 # a launcher run from here selects its version: mise which prints only an already installed binary, so this
 # fails while the selected version is not installed (even if another directory's version is). An optional tool

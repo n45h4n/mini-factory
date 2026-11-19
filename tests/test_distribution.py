@@ -38,7 +38,8 @@ ISSUE_BODY = ISSUE_BODY_LITERAL
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 root = pathlib.Path(os.environ["MOCK_BIN"])
-entry = {"tool": name, "args": args, "cwd": os.getcwd(),
+# path is the executable that ran (links followed), such as the installed version behind a launcher.
+entry = {"tool": name, "args": args, "cwd": os.getcwd(), "path": os.path.realpath(sys.argv[0]),
          "env": {k: v for k, v in os.environ.items()
                  if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND",
                                                             "GUM_CONFIRM_TIMEOUT", "NPM_CONFIG_REGISTRY")}}
@@ -351,6 +352,11 @@ elif name == "acpx":
         print("0.20.0")
     else:
         fail()
+elif name == "glab":
+    if args == ["auth", "status"]:
+        print("gitlab.com: logged in")
+    else:
+        fail()
 elif name == "node":
     if args == ["--version"]:
         print(os.environ.get("MOCK_NODE_VERSION", "v24.11.0"))
@@ -447,6 +453,14 @@ elif name == "no-mistakes":
             print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
         else:
             print("  \u2713 gate validation  codex is runnable")
+        # Like native doctor, check each forge profile's CLI login from PATH: gh for gh_config_dir, glab for
+        # glab_config_dir.
+        for cli in ("gh", "glab"):
+            if config.exists() and re.search(r"^\s+" + cli + r"_config_dir:", config.read_text(), re.M):
+                try:
+                    subprocess.run([cli, "auth", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
     elif args == ["update"]:
         # The native updater refuses to restart the daemon while runs are active (without --force).
         if os.environ.get("MOCK_NM_ACTIVE_RUNS"):
@@ -813,10 +827,12 @@ elif name == "mise":
         if tool not in os.environ.get("MOCK_MISE_UNSELECTED", "").split():
             print("latest")
     elif args[:1] == ["install"] and len(args) > 1:
-        if any(arg.startswith("-") or arg not in ("gh", "codex", "claude", "cursor-agent", "node") for arg in args[1:]):
+        # Tool requests setup may install: TOOL (the version selected here) or TOOL@VERSION (exactly that version).
+        if any(arg.startswith("-") or arg.partition("@")[0] not in ("gh", "gum", "codex", "claude", "cursor-agent", "node")
+               for arg in args[1:]):
             fail("unexpected mise installation: " + " ".join(args[1:]))
-        for tool in args[1:]:
-            mise_installed_marker(tool).write_text("yes")
+        for request in args[1:]:
+            mise_request(request)[0].write_text("yes")
     else:
         # Lazy installs (use, x, exec), configuration changes, and upgrades all belong to the user or Omarchy.
         (root / "lazy-triggered-mise").write_text(" ".join(args))
@@ -5155,6 +5171,239 @@ os.execv(executable, [executable, *args])
         self.assertEqual([c["args"][:4] for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])],
                          [["x", "node", "--", "npm"]])
         self.assertEqual(self.lazy_triggered(), [])
+        self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_setup_never_runs_a_lazy_or_configuration_writing_gum_before_approval(self):
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        # Your own mise provides Gum (in place of Omarchy's gum package) lazily: its shim installs Gum when first run.
+        (self.mock / "gum").unlink()
+        (shims / "gum").symlink_to(system / "usr/bin/mise")
+        config = self.home / ".config/mise/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('[tools]\ngum = "latest"\n')
+
+        def unchanged():
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertFalse(self.calls("sudo") + self.calls("omarchy"))
+            self.assertEqual(config.read_text(), '[tools]\ngum = "latest"\n')
+
+        # Without a terminal, or declined at the plain prompt (Gum cannot ask yet), nothing runs or installs Gum.
+        for run in (self.setup, lambda: self.interactive_setup("n")):
+            self.log.write_text("")
+            result = run()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("lazy mise tools pending: gum; rerun make setup in a terminal to install them with mise "
+                          "install gum", result.stdout + result.stderr)
+            self.assertFalse(self.calls("gum"))
+            self.assertFalse(self.mise_installs())
+            unchanged()
+        # Approved, mise installs only Gum, with no competing gum package; the later confirmations use it.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertIn("Proceed? [y/N]", result.stdout)
+        self.assertEqual(self.mise_installs(), [["install", "gum"]])
+        self.assertTrue(self.gum_confirms())
+        unchanged()
+        # A Gum launcher that writes your global mise configuration every run asks as the installed Gum it would run.
+        launcher = self.home / ".local/bin/gum"
+        text = self.configuring_launcher(launcher, "gum")
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y", MOCK_GH_AUTH="pending"))
+        self.assertTrue(self.gum_confirms())
+        self.assertEqual({c["path"] for c in self.calls("gum")},
+                         {str(self.home / ".local/share/mise/installs/gum/latest/bin/gum")})
+        self.assertFalse(self.mise_installs())
+        unchanged()
+        self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_update_asks_only_with_an_installed_gum_and_never_through_its_mise_launcher(self):
+        self.clone_fixture()
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node", "gum"))
+        # Your own mise provides Gum (in place of Omarchy's gum package) through its shim.
+        (self.mock / "gum").unlink()
+        (shims / "gum").symlink_to(system / "usr/bin/mise")
+        self.assert_success(self.interactive_setup("y"))
+        # Only make update's own upgrades run here: without make, its later setup phase cannot start.
+        (self.mock / "make").unlink()
+        # Once the Gum mise selects is not installed any more, asking would install it: update skips, running nothing.
+        (self.mock / "mise-installed-gum").unlink()
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8)
+        self.assertIn("gh-dash extension (v4.15.0): the dlvhdr/gh-dash GitHub CLI extension", result.stdout)
+        self.assertIn("Skipped: Gum 0.15 or later is required to ask for consent; no approval was assumed.",
+                      result.stdout)
+        self.assertFalse(self.calls("gum"))
+        self.assertNotIn(["extension", "upgrade", "dash"], [c["args"] for c in self.calls("gh")])
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse(self.mise_installs())
+        # A Gum launcher that writes your global mise configuration every run asks as the installed Gum it would run.
+        (self.mock / "mise-installed-gum").write_text("yes")
+        launcher = self.home / ".local/bin/gum"
+        text = self.configuring_launcher(launcher, "gum")
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8)
+        self.assertTrue(self.gum_confirms())
+        self.assertEqual({c["path"] for c in self.calls("gum")},
+                         {str(self.home / ".local/share/mise/installs/gum/latest/bin/gum")})
+        self.assertIn(["extension", "upgrade", "dash"], [c["args"] for c in self.calls("gh")])
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+        self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_setup_runs_approved_logins_and_gh_dash_as_the_installed_tools_offline(self):
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node", "gh@2.88.1"))
+        installs = self.home / ".local/share/mise/installs"
+        # Your gh launcher pins gh@2.88.1, and it and your Codex launcher write your global mise configuration every
+        # run. Cursor stays mise's shim, which like your others would update its tool first when run online.
+        launchers = {self.home / ".local/bin/gh": ("gh", "gh@2.88.1"), self.home / ".local/bin/codex": ("codex", "codex")}
+        texts = {path: self.configuring_launcher(path, *names) for path, names in launchers.items()}
+        roles = dict(ISSUE_AGENT="codex", PR_REVIEW_AGENT="cursor")
+        self.assert_success(self.interactive_setup("y", **roles))
+        pending = dict(roles, MOCK_GH_AUTH="pending", MOCK_EXTENSION="missing", MOCK_CODEX_AUTH="pending",
+                       MOCK_CURSOR_AUTH="pending", MOCK_MISE_AUTO_UPDATE="gh codex cursor-agent")
+        actions = {"gh": (["auth", "login"], ["extension", "install"]), "codex": (["login", "--device-auth"],),
+                   "cursor-agent": (["login"],)}
+
+        def approved():
+            return {tool: [c for c in self.calls(tool) if any(c["args"][:len(a)] == a for a in prefixes)]
+                    for tool, prefixes in actions.items()}
+
+        def unchanged():
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertFalse(list(self.mock.glob("auto-updated-*")))
+            for path, text in texts.items():
+                self.assertEqual(path.read_text(), text)
+
+        # Without a terminal, or declined, each stays a remaining action and nothing runs it.
+        for run in (lambda: self.setup(**pending), lambda: self.interactive_setup("n", **pending)):
+            self.log.write_text("")
+            result = run()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            for action in ("gh auth login --hostname github.com --web", "gh extension install dlvhdr/gh-dash",
+                           "codex login --device-auth", "cursor-agent login"):
+                self.assertIn("Remaining action: " + action + "\n", result.stdout.replace("\r\n", "\n"))
+            self.assertEqual(approved(), {"gh": [], "codex": [], "cursor-agent": []})
+            unchanged()
+        # Approved, each runs the installed tool its launcher would run, at the version you selected, with mise offline.
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y", **pending))
+        ran = approved()
+        self.assertEqual([c["args"] for c in ran["gh"]],
+                         [["auth", "login", "--hostname", "github.com", "--web", "--scopes", "project"],
+                          ["extension", "install", "dlvhdr/gh-dash"]])
+        self.assertEqual({c["path"] for c in ran["gh"]}, {str(installs / "gh/2.88.1/bin/gh")})
+        self.assertEqual([c["path"] for c in ran["codex"]], [str(installs / "codex/latest/bin/codex")])
+        self.assertEqual([c["path"] for c in ran["cursor-agent"]], [str(system / "usr/bin/mise")])
+        for marker in ("gh-authenticated", "extension-installed", "codex-authenticated", "cursor-authenticated"):
+            self.assertTrue((self.mock / marker).exists(), marker)
+        unchanged()
+        # gh's launcher whose installed tool cannot be linked (as when mise reads a configuration being rewritten at
+        # that moment) is unavailable: its login and extension stay pending, and nothing runs or replaces it.
+        setup = self.bundle / "scripts/setup.sh"
+        original = setup.read_text()
+        patched = original.replace('\t\t[ -z "$tool" ] || ln -s', '\t\t[ -z "$tool" ] || [ "$name" = gh ] || ln -s', 1)
+        self.assertNotEqual(patched, original)
+        setup.write_text(patched)
+        for marker in ("gh-authenticated", "extension-installed"):
+            (self.mock / marker).unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", **pending)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: gh auth login --hostname github.com --web and gh extension install "
+                      "dlvhdr/gh-dash, once gh can run: " + str(self.home / ".local/bin/gh") + " is a mise launcher "
+                      "whose tool is unavailable, which setup never runs", result.stdout)
+        self.assertEqual(approved()["gh"], [])
+        unchanged()
+
+    def test_omarchy_setup_installs_the_exact_version_a_lazy_launcher_requests(self):
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        config = self.home / ".config/mise/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('[tools]\ngh = "latest"\n')
+        # Your gh launcher writes your global mise configuration every run and pins gh@2.88.1, which is not installed,
+        # unlike the gh mise selects here.
+        launcher = self.home / ".local/bin/gh"
+        text = self.configuring_launcher(launcher, "gh", "gh@2.88.1")
+        helper = self.bundle / "scripts/platform.sh"
+        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout.splitlines(), ["gh"])
+
+        def unchanged():
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertEqual(launcher.read_text(), text)
+            self.assertEqual(config.read_text(), '[tools]\ngh = "latest"\n')
+
+        # Without a terminal, or declined, nothing installs that version, and the launcher never runs.
+        for run in (self.setup, lambda: self.interactive_setup("n")):
+            self.log.write_text("")
+            result = run()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("lazy mise tools pending: gh; rerun make setup in a terminal to install them with mise "
+                          "install gh@2.88.1", result.stdout + result.stderr)
+            self.assertFalse(self.mise_installs())
+            self.assertFalse(self.calls("gh"))
+            unchanged()
+        # Approved, mise installs exactly the version the launcher requests, which the launcher then finds.
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assert_success(result)
+        self.assertIn("Install them now with mise install gh@2.88.1?", result.stdout)
+        self.assertEqual(self.mise_installs(), [["install", "gh@2.88.1"]])
+        self.assertEqual(self.run_script(helper, "lazy", "gh").stdout, "")
+        self.assertEqual({c["path"] for c in self.calls("gh") if c["args"] == ["--version"]},
+                         {str(self.home / ".local/share/mise/installs/gh/2.88.1/bin/gh")})
+        unchanged()
+
+    def test_omarchy_doctor_guards_the_glab_a_gitlab_forge_profile_makes_native_doctor_run(self):
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        source = self.bundle / "no-mistakes/config.yaml"
+        original = source.read_text()
+        profile = (original + "forge_profiles:\n  gitlab.com:\n    glab_config_dir: " + json.dumps(str(self.home / "glab"))
+                   + "\n")
+        # Your own mise provides glab lazily: its shim installs glab the first time it runs.
+        (shims / "glab").symlink_to(system / "usr/bin/mise")
+
+        def native_doctor(text, **env):
+            source.write_text(text)
+            self.log.write_text("")
+            result = self.run_script(self.installed / "scripts/doctor.sh", env=env)
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse(self.mise_installs())
+            self.assertFalse([c for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])])
+            self.assertFalse(list(self.mock.glob("auto-updated-*")))
+            return result, ["doctor"] in [c["args"] for c in self.calls("no-mistakes")]
+
+        # Without a GitLab forge profile, native doctor never runs glab, and doctor leaves it alone.
+        result, ran = native_doctor(original)
+        self.assert_success(result)
+        self.assertTrue(ran)
+        self.assertNotIn("glab", result.stdout)
+        # With one, native doctor would run glab auth status through the lazy shim: reported, and it does not run.
+        result, ran = native_doctor(profile)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: glab is a mise launcher whose tool is not installed yet", result.stdout)
+        self.assertIn("FAIL: No-Mistakes pipeline agent not checked: native no-mistakes doctor could start a lazy "
+                      "mise tool that is not installed yet", result.stdout)
+        self.assertFalse(ran)
+        self.assertFalse(self.calls("glab"))
+        # Installed, native doctor checks the profile with it, offline, so a due auto-update does not start.
+        (self.mock / "mise-installed-glab").write_text("yes")
+        result, ran = native_doctor(profile, MOCK_MISE_AUTO_UPDATE="glab")
+        self.assert_success(result)
+        self.assertTrue(ran)
+        self.assertEqual([c["args"] for c in self.calls("glab")], [["auth", "status"]])
+        # A glab launcher that writes your global mise configuration every run is run as the installed glab instead.
+        launcher = self.home / ".local/bin/glab"
+        text = self.configuring_launcher(launcher, "glab")
+        result, ran = native_doctor(profile)
+        self.assert_success(result)
+        self.assertTrue(ran)
+        self.assertEqual([(c["args"], c["path"]) for c in self.calls("glab")],
+                         [(["auth", "status"], str(self.home / ".local/share/mise/installs/glab/latest/bin/glab"))])
         self.assertEqual(launcher.read_text(), text)
 
     def test_mocked_arch_guards_your_own_lazy_mise_tools_by_ownership(self):

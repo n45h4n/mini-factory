@@ -51,15 +51,15 @@ notice() {
 }
 
 consent() {
-	local answer status=0
+	local answer gum status=0
 	notice "$1"
 	if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
 		notice 'Consent pending: rerun make setup in an interactive terminal. No approval was assumed.'
 		return 1
 	fi
-	if gum_is_suitable; then
+	if gum_is_suitable && gum="$(gum_command)"; then
 		# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-		GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false 'Proceed?' || status=$?
+		GUM_CONFIRM_TIMEOUT=0 MISE_OFFLINE=1 "$gum" confirm --default=false 'Proceed?' || status=$?
 		[ "$status" -ne 0 ] || return 0
 		if [ "$status" -eq 130 ]; then
 			notice 'Cancelled; setup stopped without this change.'
@@ -294,10 +294,30 @@ git_is_suitable() {
 	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
+# The Gum setup runs. On Arch and Omarchy, a mise launcher whose Gum is not installed yet never runs (it would install
+# Gum first), and one that runs mise use runs as the installed Gum it would run, so neither a check nor a confirmation
+# installs Gum or writes your global mise configuration before you approve anything.
+gum_command() {
+	local tool
+	command -v gum >/dev/null 2>&1 || return 1
+	case "$platform" in
+	arch | omarchy)
+		[ -z "$(mf_lazy_pending gum)" ] || return 1
+		tool="$(mf_configuring_launcher_tool gum)" || {
+			[ "$?" -ne 2 ] || return 1
+			tool=gum
+		}
+		printf '%s\n' "$tool"
+		;;
+	*) printf 'gum\n' ;;
+	esac
+}
+
 # Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
 gum_is_suitable() {
-	command -v gum >/dev/null 2>&1 || return 1
-	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+	local gum
+	gum="$(gum_command)" || return 1
+	MISE_OFFLINE=1 "$gum" --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 gh_is_suitable() {
@@ -410,7 +430,7 @@ install_dependencies() {
 # transaction. Arch does not support partial upgrades, so on ordinary Arch that transaction is a full
 # sudo pacman -Syu --needed; Omarchy's own route, omarchy pkg add, installs from its current package databases.
 install_arch_dependencies() {
-	local name gh_path
+	local name gh_path gum_path
 	local packages=()
 	for name in "$@"; do
 		case "$name" in
@@ -421,7 +441,12 @@ install_arch_dependencies() {
 	# The native installers unpack with gzip, part of Arch's base like their other tools.
 	command -v gzip >/dev/null 2>&1 || packages+=(gzip)
 	[ -r /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
-	gum_is_suitable || packages+=(gum)
+	# A mise-managed Gum, like a mise-managed gh below, is installed through mise (never run before that), not
+	# replaced by a competing gum package.
+	gum_path="$(command -v gum 2>/dev/null)" || gum_path=''
+	if [ -z "$gum_path" ] || ! mf_is_mise_launcher "$gum_path"; then
+		gum_is_suitable || packages+=(gum)
+	fi
 	# A mise-managed gh (Omarchy's lazy gh, or your own) is installed through mise below, and is never run before
 	# that; a github-cli package would compete with it. Omarchy owns its gh even when the launcher is missing, so
 	# setup never falls back to a github-cli package there (a restored launcher would shadow it).
@@ -460,40 +485,49 @@ install_arch_dependencies() {
 	hash -r
 }
 
-# gh, the agent CLIs, and Node.js may be lazy mise tools (Omarchy's, or your own mise's on Arch) whose launchers
-# install them on first run. Setup asks first, installs only these through mise, in this directory as the later
-# probes select them, and runs none of them before that; other lazy tools are left alone.
+# gh, Gum, the agent CLIs, and Node.js may be lazy mise tools (Omarchy's, or your own mise's on Arch) whose launchers
+# install them on first run. Setup asks first, installs only these through mise, each as its launcher requests it (in
+# this directory as the later probes select them, or the exact version a launcher names), and runs none of them before
+# that; other lazy tools are left alone.
 install_lazy_tools() {
-	local name tool required='' remaining
-	local tools=()
+	local name request required='' remaining
+	local requests=()
 	case "$platform" in arch | omarchy) ;; *) return 0 ;; esac
 	resolve_daemon_path
-	while IFS= read -r name; do
-		case "$name" in
-		npm) tool=node ;;
-		*) tool="$name" ;;
-		esac
-		contains "$tool" "${tools[@]+"${tools[@]}"}" || tools+=("$tool")
+	while IFS=$'\t' read -r name request; do
+		contains "$request" "${requests[@]+"${requests[@]}"}" || requests+=("$request")
 		case "$name" in node | npm) ;; *) required="$required $name" ;; esac
 	done < <(lazy_tools_pending)
-	[ "${#tools[@]}" -gt 0 ] || return 0
-	if consent "Your mise configuration (on Omarchy, Omarchy's) provides ${tools[*]} as lazy mise tools that install on first use. Install them now with mise install ${tools[*]}? mise installs the versions its configuration selects here (Omarchy's own hook may add each agent's Herdr integration); other lazy tools, your mise configuration, and Omarchy's default agent stay unchanged."; then
-		"$(mf_mise_command)" install "${tools[@]}" ||
-			die "mise install ${tools[*]} did not complete; resolve the problem mise reported (for example network access), then rerun make setup"
+	[ "${#requests[@]}" -gt 0 ] || return 0
+	if consent "Your mise configuration (on Omarchy, Omarchy's) provides ${requests[*]} as lazy mise tools that install on first use. Install them now with mise install ${requests[*]}? mise installs the versions its configuration selects here, or the exact version a launcher requests (Omarchy's own hook may add each agent's Herdr integration); other lazy tools, your mise configuration, and Omarchy's default agent stay unchanged."; then
+		"$(mf_mise_command)" install "${requests[@]}" ||
+			die "mise install ${requests[*]} did not complete; resolve the problem mise reported (for example network access), then rerun make setup"
 		hash -r
-		remaining="$(lazy_tools_pending | awk '!seen[$0]++' | tr '\n' ' ')"
+		# Each launcher must now find the tool it requests, read offline as before; nothing changes mise's configuration.
+		remaining="$(lazy_tools_pending | cut -f1 | awk '!seen[$0]++' | tr '\n' ' ')"
 		[ -z "$remaining" ] ||
 			die "mise install did not provide: $remaining; repair it with mise or omarchy update, then rerun make setup"
 	elif [ -n "$required" ]; then
 		# A declined Node.js alone is reported later as a remaining action, as on other platforms.
-		die "lazy mise tools pending:$required; rerun make setup in a terminal to install them with mise install ${tools[*]}"
+		die "lazy mise tools pending:$required; rerun make setup in a terminal to install them with mise install ${requests[*]}"
 	fi
+}
+
+# NAME<TAB>REQUEST for each named command that PATH (the first argument) finds as a lazy mise launcher whose tool is not
+# installed yet, where REQUEST is what mise install installs for it (see mf_launcher_install_request).
+lazy_requests() {
+	local PATH="$1" name request
+	shift
+	while IFS= read -r name; do
+		request="$(mf_launcher_install_request "$name" "$(command -v "$name")")" || request="$name"
+		printf '%s\t%s\n' "$name" "$request"
+	done < <(mf_lazy_pending "$@")
 }
 
 # The required lazy tools from your shell's PATH, and Node.js as the No-Mistakes daemon's PATH resolves it.
 lazy_tools_pending() {
-	mf_lazy_pending gh codex claude cursor-agent node npm
-	daemon_lazy_pending node
+	lazy_requests "$PATH" gh gum codex claude cursor-agent node npm
+	lazy_requests "$daemon_path" node
 }
 
 # How to repair an installed tool that cannot run, by its owner; setup never replaces a managed installation.
@@ -778,19 +812,48 @@ agent_is_authenticated() {
 	esac
 }
 
+# Whether the named command is a mise launcher whose tool is unavailable to setup's login and gh-dash checks (through
+# shell_probes): one not installed yet, or one that runs mise use whose installed tool was not linked there. Running it
+# would install its tool or write your global mise configuration (replacing the version you selected), so neither a
+# check nor an action you approve runs it; it stays pending.
+shell_tool_unavailable() {
+	[ -n "$shell_probes" ] && [ ! -e "${shell_probes%:}/$1" ] || return 1
+	[ -z "$(mf_lazy_pending "$1")" ] || return 0
+	mf_configuring_launcher_tool "$1" >/dev/null || [ "$?" -eq 2 ]
+}
+
+# Runs a login or extension installation you approved with the installed tool that setup's checks ran: a launcher that
+# runs mise use runs as the tool it would run (see link_configuring_launchers), so your mise configuration and the
+# version it selects stay unchanged, and mise stays offline, so no mise launcher updates its tool first. The tool itself
+# runs as usual (its browser or device login, or gh fetching the extension).
+run_approved() {
+	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$@"
+}
+
+# The reason a pending action waits for a command that shell_tool_unavailable reports.
+unavailable_reason() {
+	printf '%s is a mise launcher whose tool is unavailable, which setup never runs; %s, then rerun make setup' \
+		"$(command -v "$1")" "$(repair_hint "$1")"
+}
+
 login_agent() {
-	local kind="$1" command_text detail
+	local kind="$1" command_name command_text detail
 	case "$kind" in
-	claude) command_text='claude auth login'; detail='Open its URL in a browser on this or another machine.' ;;
-	codex) command_text='codex login --device-auth'; detail='Enable device-code login in ChatGPT security settings/workspace permissions first, then use a browser on this or another machine.' ;;
-	cursor) command_text='cursor-agent login'; detail='On a headless server set NO_OPEN_BROWSER=1 and open its URL in a browser on another machine.' ;;
+	claude) command_name=claude; command_text='claude auth login'; detail='Open its URL in a browser on this or another machine.' ;;
+	codex) command_name=codex; command_text='codex login --device-auth'; detail='Enable device-code login in ChatGPT security settings/workspace permissions first, then use a browser on this or another machine.' ;;
+	cursor) command_name=cursor-agent; command_text='cursor-agent login'; detail='On a headless server set NO_OPEN_BROWSER=1 and open its URL in a browser on another machine.' ;;
 	esac
+	if shell_tool_unavailable "$command_name"; then
+		notice "Remaining action: $command_text, once it can run: $(unavailable_reason "$command_name")"
+		pending=1
+		return 0
+	fi
 	agent_is_authenticated "$kind" && return 0
 	if consent "$kind authentication is pending. Run $command_text now? $detail Authentication stays in the native CLI; do not paste credentials here."; then
 		case "$kind" in
-		claude) claude auth login || pending=1 ;;
-		codex) codex login --device-auth || pending=1 ;;
-		cursor) cursor-agent login || pending=1 ;;
+		claude) run_approved claude auth login || pending=1 ;;
+		codex) run_approved codex login --device-auth || pending=1 ;;
+		cursor) run_approved cursor-agent login || pending=1 ;;
 		esac
 	else
 		notice "Remaining action: $command_text"
@@ -1035,21 +1098,27 @@ explain_git_transport() {
 }
 
 configure_native_tools() {
-	local codex_directory integration kind description login_arguments login_kinds github_ready=1
-	# Read-only checks run an installed tool, not a launcher that runs mise use (see link_configuring_launchers);
-	# the logins and installations you approve run your commands as before.
+	local codex_directory integration kind description login_arguments login_kinds github_ready=1 gh_runs=1
+	# Read-only checks, and the logins and gh-dash installation you approve (see run_approved), run an installed tool,
+	# not a launcher that runs mise use (see link_configuring_launchers); other installations you approve run your
+	# commands as before (npm as shell_npm runs it).
 	if [ "$platform" = arch ] || [ "$platform" = omarchy ]; then
 		probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-setup.XXXXXX")"
 		link_configuring_launchers "$probe_directory/shell" "$PATH" gh codex claude cursor-agent node npm
 		shell_probes="$probe_directory/shell:"
 	fi
-	if ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" gh auth status --hostname github.com >/dev/null 2>&1; then
+	if shell_tool_unavailable gh; then
+		notice "Remaining action: gh auth login --hostname github.com --web and gh extension install dlvhdr/gh-dash, once gh can run: $(unavailable_reason gh)"
+		pending=1
+		github_ready=0
+		gh_runs=0
+	elif ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" gh auth status --hostname github.com >/dev/null 2>&1; then
 		if consent 'GitHub authentication is pending. Run gh auth login --hostname github.com --web now? Follow its native device-code instructions in a browser on this or another machine. Choose Git transport yourself; setup will not configure Git credentials.'; then
 			login_arguments=(auth login --hostname github.com --web)
 			if consent "Optional: also request GitHub's project scope (only for GitHub Projects access)? Ordinary issue and PR actions do not need it."; then
 				login_arguments=(auth login --hostname github.com --web --scopes project)
 			fi
-			gh "${login_arguments[@]}" || { pending=1; github_ready=0; }
+			run_approved gh "${login_arguments[@]}" || { pending=1; github_ready=0; }
 		else
 			notice 'Remaining action: gh auth login --hostname github.com --web'
 			pending=1
@@ -1057,9 +1126,9 @@ configure_native_tools() {
 		fi
 	fi
 	[ "$github_ready" -eq 0 ] || explain_git_transport
-	if ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" gh dash --version >/dev/null 2>&1; then
+	if [ "$gh_runs" -eq 1 ] && ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" gh dash --version >/dev/null 2>&1; then
 		if consent 'Install the gh-dash extension with gh extension install dlvhdr/gh-dash? Existing gh-dash configuration is preserved; ghd uses the bundled config explicitly.'; then
-			gh extension install dlvhdr/gh-dash || pending=1
+			run_approved gh extension install dlvhdr/gh-dash || pending=1
 		else
 			notice 'Remaining action: gh extension install dlvhdr/gh-dash'
 			pending=1

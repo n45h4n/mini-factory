@@ -125,8 +125,8 @@ fast_forward() {
 }
 
 # A launcher script that runs mise use (as omarchy-mise-install's do) writes your global mise configuration every
-# run, even offline once its tool is installed. As in doctor, gh, npm, and the node acpx starts run behind a private
-# directory linking each such launcher of these tools to the installed tool it would run; it is removed on exit.
+# run, even offline once its tool is installed. As in doctor, gh, Gum, npm, and the node acpx starts run behind a
+# private directory linking each such launcher of these tools to the installed tool it would run; it is removed on exit.
 prepare_probes() {
 	local name tool
 	case "$platform" in macos | ubuntu) return 0 ;; esac
@@ -139,7 +139,7 @@ prepare_probes() {
 			trap 'rm -rf -- "$probe_directory"' EXIT
 		fi
 		ln -s -- "$tool" "$probe_directory/$name"
-	done < <(mf_configuring_launchers gh codex claude cursor-agent node npm)
+	done < <(mf_configuring_launchers gh gum codex claude cursor-agent node npm)
 }
 
 # Runs a command with PATH presented as prepare_probes arranged it.
@@ -457,10 +457,12 @@ run_plan() {
 	esac
 }
 
-# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
+# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1). Gum runs as probe presents it, and a lazy mise
+# Gum (not installed yet) never runs, so asking installs no Gum and writes no mise configuration before you approve.
 gum_is_suitable() {
 	command -v gum >/dev/null 2>&1 || return 1
-	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+	! lazy_pending gum || return 1
+	MISE_OFFLINE=1 probe gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 offer_upgrade() {
@@ -484,7 +486,7 @@ offer_upgrade() {
 		return 0
 	fi
 	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-	GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
+	GUM_CONFIRM_TIMEOUT=0 MISE_OFFLINE=1 probe gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
 	if [ "$status" -eq 130 ]; then
 		notice "  Cancelled; $label was left unchanged and make update stopped before rerunning setup."
 		exit 130

@@ -175,7 +175,13 @@ packages and tools, and setup reuses them:
   command does not mean it is installed, because the first run installs it.
   Setup asks before installing exactly these with `mise install`, then checks
   them; it installs no other optional lazy tool, and Omarchy's own mise hook may
-  add each agent's Herdr integration as it installs.
+  add each agent's Herdr integration as it installs. A launcher that requests an
+  exact version (such as `gh@2.88.1`) gets exactly that request installed, and a
+  lazy mise Gum of your own is installed the same way instead of a `gum` package.
+- Checks, Gum confirmations, and the logins and gh-dash installation you approve
+  run the installed tool a mise launcher would run, with mise offline, so none of
+  them installs or updates a tool or writes your mise configuration; a managed
+  tool that is unavailable stays a remaining action.
 - Whatever your PATH selects is what setup uses. A compatible installation of
   your own (for example a native Cursor CLI listed in mise's `disable_tools`) is
   reused. Setup never installs a competing copy, overwrites a managed launcher,
@@ -873,8 +879,9 @@ checks.
   user-level installations (for example your own native Claude Code), setup's
   `acpx`, No-Mistakes, and the gh-dash extension keep their consented updates;
   the gh-dash upgrade runs mise offline, so it never updates a mise-managed `gh`.
-  Discovery never runs a lazy tool that is not installed yet; it reports it,
-  and setup asks before installing it.
+  Discovery never runs a lazy tool that is not installed yet (Gum included: a
+  lazy Gum leaves the upgrades unasked); it reports it, and setup asks before
+  installing it.
 
 - **Stable only.** No-Mistakes is updated with plain `no-mistakes update`, never
   `--beta`, `--force`, or `--yes`. Its updater reports a newer prerelease you
@@ -945,7 +952,8 @@ Arch, or Omarchy, detected as setup does). On Arch and Omarchy, a lazy mise
 tool (Omarchy's, or your own mise's) whose version selected in the checked
 directory is not installed yet is reported as setup pending without being run,
 so no version, help, or login probe installs it; run `make setup`, which asks
-first.
+first. This includes `glab` when a GitLab forge profile (`glab_config_dir`) makes
+native `no-mistakes doctor` run it.
 It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's

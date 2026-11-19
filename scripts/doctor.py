@@ -137,13 +137,14 @@ def acpx_executable(config):
     return result.stdout.rstrip("\n")
 
 
-def github_forge_profiles(config):
-    """Whether native no-mistakes doctor runs gh auth status, as it does for each forge profile with a gh_config_dir,
-    read by the bundled nm-config; assumed when the file cannot be read."""
+def forge_profiles(config, cli):
+    """Whether native no-mistakes doctor runs cli (gh or glab) auth status, as it does for each forge profile with a
+    gh_config_dir (GitHub) or glab_config_dir (GitLab), read by the bundled nm-config; assumed when the file cannot be
+    read."""
     if not config.exists():
         return False
     helper = Path(__file__).resolve().parent / "nm_config.py"
-    text = output([sys.executable, "-I", "-B", str(helper), "gh-profiles", str(config)])
+    text = output([sys.executable, "-I", "-B", str(helper), cli + "-profiles", str(config)])
     return text is None or bool(text.strip())
 
 
@@ -447,15 +448,18 @@ def main():
     # not installed yet (nor on an unrecognized platform): each is setup pending, and the probes that would run it
     # are skipped.
     guarded = platform not in ("macos", "ubuntu")
+    # Native no-mistakes doctor runs glab from PATH for a GitLab forge profile, so glab is then discovered and run as
+    # doctor's own probed commands are.
+    probed = PROBED_TOOLS + (("glab",) if guarded and forge_profiles(no_mistakes_config, "glab") else ())
     lazy, undiscovered = set(), False
     if guarded:
-        lazy = lazy_pending(PROBED_TOOLS)
-        probes = None if lazy is None else probe_path(os.environ.get("PATH", ""))
+        lazy = lazy_pending(probed)
+        probes = None if lazy is None else probe_path(os.environ.get("PATH", ""), probed)
         if probes is None:
             # Failed discovery is not an empty result: any of these may be such a launcher, so none of them runs.
-            lazy, undiscovered = set(PROBED_TOOLS), True
+            lazy, undiscovered = set(probed), True
             check(False, "", "lazy mise tool discovery failed (" + str(PLATFORM_HELPER) + " did not complete), so "
-                  "doctor runs none of " + ", ".join(PROBED_TOOLS) + ", acpx, or native no-mistakes doctor, as any "
+                  "doctor runs none of " + ", ".join(probed) + ", acpx, or native no-mistakes doctor, as any "
                   "of them could install a lazy mise tool or write your global mise configuration; run make setup")
         else:
             # Probes, including native no-mistakes doctor, run an installed tool directly rather than through a
@@ -471,7 +475,7 @@ def main():
     for name in ("bash", "git", "make", "gh", "jq", "python3", "herdr", "curl", "tar", "gum",
                  "env", "tr", "mkdir", "rmdir", "rm", "date", "chmod", "sleep", "nohup", "stat", *commands):
         check(shutil.which(name), name + " available", name + " missing; run make setup")
-    for name in PROBED_TOOLS:
+    for name in probed:
         if name not in lazy or undiscovered:
             continue
         if name in LAZY_TOOLS:
@@ -620,9 +624,10 @@ def main():
     check(problem is None, "No-Mistakes config links to your clone: " + str(no_mistakes_config),
           "No-Mistakes config link pending (" + str(problem) + "); rerun make setup from your clone")
     # Native doctor checks that the pipeline agent runs, which would install a lazy agent (or acpx's Node.js) first.
-    # It also runs git --version, and gh auth status for each GitHub forge profile (gh_config_dir) from PATH.
-    delegated = lazy & {"git", "no-mistakes", *(command for command, _, _ in AGENTS.values())}
-    if "gh" in lazy and github_forge_profiles(no_mistakes_config):
+    # It also runs git --version, gh auth status for each GitHub forge profile (gh_config_dir), and glab auth status for
+    # each GitLab forge profile (glab_config_dir) from PATH; glab is probed only for such a profile.
+    delegated = lazy & {"git", "glab", "no-mistakes", *(command for command, _, _ in AGENTS.values())}
+    if "gh" in lazy and forge_profiles(no_mistakes_config, "gh"):
         delegated.add("gh")
     if node_lazy or delegated:
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor could start "
