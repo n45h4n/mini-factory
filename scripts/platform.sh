@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Platform and tool-ownership evidence shared by setup.sh and update.sh (which source this file) and
-# doctor.py (which runs: bash platform.sh detect | lazy COMMAND...). Everything here only reads local
-# evidence: nothing installs, updates, or runs the tools it inspects.
+# doctor.py (which runs: bash platform.sh detect | lazy COMMAND... | probes DIRECTORY COMMAND...). Everything here
+# only reads local evidence (probes also writes its private directory): nothing installs, updates, or runs the tools
+# it inspects.
 
 # Isolated tests point this at a synthetic system root; it is empty (the real /) otherwise.
 mf_root="${MINI_FACTORY_TEST_ROOT:-}"
@@ -295,6 +296,30 @@ mf_configuring_launchers() {
 	return 0
 }
 
+# Prints what mf_configuring_launchers prints and places in the directory (the first argument) a probe for each such
+# command name whose tool resolves, so checks and approved actions run that tool behind the directory on PATH. A probe
+# runs the launcher's own mise x statement, offline and without its mise use, on the installed tool: the version the
+# launcher selects, with the environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]), as the
+# launcher (and so ghd) runs it, while mise installs, updates, and configures nothing. A launcher without such a
+# statement gets a link to its installed tool. A configured path (such as an absolute acpx_path) gets no probe. Fails
+# when a probe cannot be placed, so no caller runs that launcher instead.
+mf_link_configuring_launchers() {
+	local directory="$1" name tool request mise
+	shift
+	while IFS=$'\t' read -r name tool; do
+		printf '%s\n' "$name${tool:+$'\t'$tool}"
+		[ -n "$tool" ] || continue
+		case "$name" in */*) continue ;; esac
+		if request="$(mf_configuring_launcher_request "$name")" && mise="$(mf_mise_command)"; then
+			printf '#!/bin/sh\nMISE_OFFLINE=1 exec %q x %q -- %q "$@"\n' "$mise" "${request%%$'\t'*}" "$tool" \
+				>"$directory/$name" && chmod 755 "$directory/$name" || return 1
+		else
+			ln -s -- "$tool" "$directory/$name" || return 1
+		fi
+	done < <(mf_configuring_launchers "$@")
+	return 0
+}
+
 # Prints each named command that PATH resolves to a mise launcher whose tool is not installed yet, so running
 # it, even for --version or --help, would install it first.
 mf_lazy_pending() {
@@ -323,8 +348,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 		shift
 		mf_configuring_launchers "$@"
 		;;
+	probes)
+		[ "$#" -ge 2 ] && [ -d "$2" ] || exit 2
+		shift
+		mf_link_configuring_launchers "$@"
+		;;
 	*)
-		printf 'usage: platform.sh detect | lazy COMMAND... | configuring COMMAND...\n' >&2
+		printf 'usage: platform.sh detect | lazy COMMAND... | configuring COMMAND... | probes DIRECTORY COMMAND...\n' >&2
 		exit 2
 		;;
 	esac

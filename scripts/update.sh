@@ -126,20 +126,15 @@ fast_forward() {
 
 # A launcher script that runs mise use (as omarchy-mise-install's do) writes your global mise configuration every
 # run, even offline once its tool is installed. As in doctor, gh, Gum, npm, and the node acpx starts run behind a
-# private directory linking each such launcher of these tools to the installed tool it would run; it is removed on exit.
+# private directory with a probe for each such launcher of these tools: the installed tool it would run, with the
+# environment mise gives it (see mf_link_configuring_launchers); it is removed on exit. Such a launcher whose tool is
+# not installed is lazy and gets no probe: discovery reports it and never runs it.
 prepare_probes() {
-	local name tool
 	case "$platform" in macos | ubuntu) return 0 ;; esac
-	while IFS=$'\t' read -r name tool; do
-		# Such a launcher whose tool is not installed is lazy: discovery reports it and never runs it.
-		[ -n "$tool" ] || continue
-		if [ -z "$probe_directory" ]; then
-			probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-update.XXXXXX")" ||
-				die 'cannot create a temporary directory for the discovery probes; nothing was changed by them'
-			trap 'rm -rf -- "$probe_directory"' EXIT
-		fi
-		ln -s -- "$tool" "$probe_directory/$name"
-	done < <(mf_configuring_launchers gh gum codex claude cursor-agent node npm)
+	probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-update.XXXXXX")" ||
+		die 'cannot create a temporary directory for the discovery probes; nothing was changed by them'
+	trap 'rm -rf -- "$probe_directory"' EXIT
+	mf_link_configuring_launchers "$probe_directory" gh gum codex claude cursor-agent node npm >/dev/null
 }
 
 # Runs a command with PATH presented as prepare_probes arranged it.
@@ -448,7 +443,9 @@ run_plan() {
 		fi
 		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
-	npm) PATH="$bin_directory:$PATH" probe_npm "${plan_targets[@]}" ;;
+	# Offline for mise only, as for the extension below: a mise npm or Node.js with an auto-update due would otherwise
+	# update Node.js first; npm itself still downloads acpx.
+	npm) MISE_OFFLINE=1 PATH="$bin_directory:$PATH" probe_npm "${plan_targets[@]}" ;;
 	# Offline for mise only: a mise gh with an auto-update due would otherwise update itself first; gh itself still
 	# fetches the extension.
 	extension) MISE_OFFLINE=1 probe gh extension upgrade dash ;;

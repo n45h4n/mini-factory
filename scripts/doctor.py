@@ -181,21 +181,19 @@ def probe_path(path, names=PROBED_TOOLS):
     """(PATH, tools, unsafe) for doctor's probes of the named commands, or None when the helper fails or times out.
     Each named launcher script that runs mise use (and so writes your global mise configuration every run) is in tools,
     mapped to the installed tool it would run, which PATH (the given one behind a private directory, removed on exit)
-    finds first for a command name; unsafe names such a launcher whose tool cannot be resolved, which no probe may run.
-    Every other command, and the PATH your workflow uses, is unchanged."""
-    text = output([BASH, str(PLATFORM_HELPER), "configuring", *names], dict(os.environ, PATH=path))
+    finds first for a command name, run with the environment mise gives it (such as GH_CONFIG_DIR from mise's [env]), as
+    the bundled helper's probes present it; unsafe names such a launcher whose tool cannot be resolved, which no probe
+    may run. Every other command, and the PATH your workflow uses, is unchanged."""
+    directory = tempfile.mkdtemp(prefix="mini-factory-doctor-")
+    atexit.register(shutil.rmtree, directory, True)
+    # A configured path (such as an absolute acpx_path) is run as its tool instead; only names get a probe.
+    text = output([BASH, str(PLATFORM_HELPER), "probes", directory, *names], dict(os.environ, PATH=path))
     if text is None:
         return None
     lines = text.splitlines()
     tools = dict(line.split("\t", 1) for line in lines if "\t" in line)
     unsafe = {line for line in lines if line and "\t" not in line}
-    # A configured path (such as an absolute acpx_path) is run as its tool instead; only names go on PATH.
-    links = {name: tool for name, tool in tools.items() if os.sep not in name}
-    if links:
-        directory = tempfile.mkdtemp(prefix="mini-factory-doctor-")
-        atexit.register(shutil.rmtree, directory, True)
-        for name, tool in links.items():
-            os.symlink(tool, os.path.join(directory, name))
+    if os.listdir(directory):
         path = directory + os.pathsep + path
     return path, tools, unsafe
 

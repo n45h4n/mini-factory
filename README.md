@@ -178,10 +178,15 @@ packages and tools, and setup reuses them:
   add each agent's Herdr integration as it installs. A launcher that requests an
   exact version (such as `gh@2.88.1`) gets exactly that request installed, and a
   lazy mise Gum of your own is installed the same way instead of a `gum` package.
-- Checks, Gum confirmations, and the logins and gh-dash installation you approve
-  run the installed tool a mise launcher would run, with mise offline, so none of
-  them installs or updates a tool or writes your mise configuration; a managed
-  tool that is unavailable stays a remaining action.
+- Checks, Gum confirmations, and the logins, gh-dash installation, and Herdr
+  integrations you approve run the installed tool a mise launcher would run, with
+  mise offline, so none of them installs or updates a tool or writes your mise
+  configuration. Checks and approved actions keep the environment the launcher's
+  own `mise x` gives its tool (such as `GH_CONFIG_DIR` from mise's `[env]`), as
+  `ghd` runs it. The `acpx` installation you approve also runs npm with mise
+  offline, so no Node.js auto-update runs first. A managed tool that is
+  unavailable stays a remaining action, including a mise `acpx` the No-Mistakes
+  daemon finds before it is installed (setup installs no competing copy).
 - Whatever your PATH selects is what setup uses. A compatible installation of
   your own (for example a native Cursor CLI listed in mise's `disable_tools`) is
   reused. Setup never installs a competing copy, overwrites a managed launcher,
@@ -878,7 +883,8 @@ checks.
   only genuinely missing dependencies, under setup's consent rules. Independent
   user-level installations (for example your own native Claude Code), setup's
   `acpx`, No-Mistakes, and the gh-dash extension keep their consented updates;
-  the gh-dash upgrade runs mise offline, so it never updates a mise-managed `gh`.
+  the gh-dash and `acpx` upgrades run mise offline, so neither updates a
+  mise-managed `gh` or Node.js.
   Discovery never runs a lazy tool that is not installed yet (Gum included: a
   lazy Gum leaves the upgrades unasked); it reports it, and setup asks before
   installing it.

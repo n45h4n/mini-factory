@@ -812,20 +812,21 @@ agent_is_authenticated() {
 	esac
 }
 
-# Whether the named command is a mise launcher whose tool is unavailable to setup's login and gh-dash checks (through
-# shell_probes): one not installed yet, or one that runs mise use whose installed tool was not linked there. Running it
-# would install its tool or write your global mise configuration (replacing the version you selected), so neither a
-# check nor an action you approve runs it; it stays pending.
+# Whether the named command is a mise launcher whose tool is unavailable to setup's login, gh-dash, and Herdr checks
+# (through shell_probes): one not installed yet, or one that runs mise use whose installed tool has no probe there.
+# Running it would install its tool or write your global mise configuration (replacing the version you selected), so
+# neither a check nor an action you approve runs it; it stays pending.
 shell_tool_unavailable() {
 	[ -n "$shell_probes" ] && [ ! -e "${shell_probes%:}/$1" ] || return 1
 	[ -z "$(mf_lazy_pending "$1")" ] || return 0
 	mf_configuring_launcher_tool "$1" >/dev/null || [ "$?" -eq 2 ]
 }
 
-# Runs a login or extension installation you approved with the installed tool that setup's checks ran: a launcher that
-# runs mise use runs as the tool it would run (see link_configuring_launchers), so your mise configuration and the
-# version it selects stay unchanged, and mise stays offline, so no mise launcher updates its tool first. The tool itself
-# runs as usual (its browser or device login, or gh fetching the extension).
+# Runs a login, extension, or integration installation you approved with the installed tool that setup's checks ran: a
+# launcher that runs mise use runs as the tool it would run, with the environment mise gives it (such as GH_CONFIG_DIR;
+# see link_configuring_launchers), so your mise configuration and the version it selects stay unchanged, and mise stays
+# offline, so no mise launcher updates its tool first. The tool itself runs as usual (its browser or device login, or gh
+# fetching the extension).
 run_approved() {
 	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$@"
 }
@@ -888,17 +889,16 @@ daemon_node_is_suitable() {
 	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'node --version' 2>/dev/null | node_version_is_suitable
 }
 
-# Links, in a new directory (the first argument), each named command's launcher that PATH (the second argument) finds
-# and that runs mise use, and so writes your global mise configuration every run, to the installed tool it would
-# run, as doctor's probes and update's discovery present them. Every other command is unchanged, as is such a launcher
-# whose tool is not installed: setup's lazy mise tool checks have already stopped or reported it.
+# Places, in a new directory (the first argument), a probe for each named command's launcher that PATH (the second
+# argument) finds and that runs mise use, and so writes your global mise configuration every run: the installed tool it
+# would run, with the environment mise gives it (see mf_link_configuring_launchers), as doctor's probes and update's
+# discovery present them. Every other command is unchanged, as is such a launcher whose tool is not installed: setup's
+# lazy mise tool checks have already stopped or reported it.
 link_configuring_launchers() {
-	local directory="$1" path="$2" name tool
+	local directory="$1" path="$2"
 	shift 2
 	mkdir -- "$directory"
-	while IFS=$'\t' read -r name tool; do
-		[ -z "$tool" ] || ln -s -- "$tool" "$directory/$name"
-	done < <(PATH="$path" mf_configuring_launchers "$@")
+	PATH="$path" mf_link_configuring_launchers "$directory" "$@" >/dev/null
 }
 
 # Runs your shell's npm for its global prefix and the acpx installation you approve. A launcher that runs mise use
@@ -972,16 +972,16 @@ install_node() {
 	hash -r
 }
 
+# acpx_path runs verbatim, which no PATH prefix redirects: a launcher that runs mise use, found from the daemon's PATH,
+# is checked as the installed tool it would run, and one whose tool is not installed does not run, nor does any other
+# lazy mise launcher (such as mise's shim) whose tool is not installed yet (status 2).
 acpx_runs_for_daemon() {
 	local acpx="$acpx_path"
 	[ -n "$acpx" ] || return 1
-	# acpx_path runs verbatim, which no PATH prefix redirects: a launcher that runs mise use, found from the daemon's
-	# PATH, is checked as the installed tool it would run, and one whose tool is not installed does not run, nor does
-	# any other lazy mise launcher (such as mise's shim) whose tool is not installed yet.
 	if [ -n "$daemon_probes" ]; then
-		[ -z "$(daemon_lazy_pending "$acpx_path")" ] || return 1
+		[ -z "$(daemon_lazy_pending "$acpx_path")" ] || return 2
 		acpx="$(PATH="$daemon_path" mf_configuring_launcher_tool "$acpx_path")" || {
-			[ "$?" -ne 2 ] || return 1
+			[ "$?" -ne 2 ] || return 2
 			acpx="$acpx_path"
 		}
 	fi
@@ -1048,13 +1048,22 @@ ensure_node_and_acpx() {
 		pending=1
 	fi
 	# An existing acpx the daemon can run (from ~/bin, Homebrew, ... or acpx_path) is reused as is.
-	acpx_runs_for_daemon && return 0
+	acpx_runs_for_daemon || status=$?
+	[ "$status" -ne 0 ] || return 0
 	if [ "$acpx_path" != acpx ]; then
 		# An unreadable acpx_path was already reported.
 		[ -z "$acpx_path" ] || notice "Remaining action: acpx_path $acpx_path in the No-Mistakes config does not run (with the Node.js 22.13+ it needs) from the daemon's PATH $daemon_path. Fix that executable or setting yourself, then rerun make setup."
 		pending=1
 		return 0
 	fi
+	# The daemon's acpx is a mise launcher whose tool is not installed yet: mise provides it there, so setup installs no
+	# competing acpx (which the daemon would not run) and changes no mise configuration.
+	if [ "$status" -eq 2 ]; then
+		notice "Remaining action: $(PATH="$daemon_path" command -v acpx) is a mise launcher whose tool is not installed yet, found first by the No-Mistakes daemon's PATH $daemon_path; running it would install it first (or write your global mise configuration), and setup never installs a competing acpx. Install it with mise yourself, then rerun make setup"
+		pending=1
+		return 0
+	fi
+	status=0
 	if ! command -v acpx >/dev/null 2>&1; then
 		prefix="$(MISE_OFFLINE=1 shell_npm prefix -g 2>/dev/null || true)"
 		# A global prefix that is root-owned (system Node) or outside the daemon's PATH (such as a per-shell
@@ -1065,7 +1074,9 @@ ensure_node_and_acpx() {
 		esac
 		[ -n "$prefix" ] || npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
 		if consent "acpx is the ACP runner No-Mistakes uses for Cursor. Install it with its documented npm ${npm_arguments[*]}?"; then
-			shell_npm "${npm_arguments[@]}" || true
+			# Offline for mise only: a mise npm or Node.js with an auto-update due would otherwise update Node.js first;
+			# npm itself still downloads acpx.
+			MISE_OFFLINE=1 shell_npm "${npm_arguments[@]}" || true
 			PATH="$PATH:$bin_directory"
 			export PATH
 			hash -r
@@ -1099,12 +1110,12 @@ explain_git_transport() {
 
 configure_native_tools() {
 	local codex_directory integration kind description login_arguments login_kinds github_ready=1 gh_runs=1
-	# Read-only checks, and the logins and gh-dash installation you approve (see run_approved), run an installed tool,
-	# not a launcher that runs mise use (see link_configuring_launchers); other installations you approve run your
-	# commands as before (npm as shell_npm runs it).
+	# Read-only checks, and the logins, gh-dash installation, and Herdr integrations you approve (see run_approved), run
+	# an installed tool, not a launcher that runs mise use (see link_configuring_launchers); other installations you
+	# approve run your commands as before (npm as shell_npm runs it).
 	if [ "$platform" = arch ] || [ "$platform" = omarchy ]; then
 		probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-setup.XXXXXX")"
-		link_configuring_launchers "$probe_directory/shell" "$PATH" gh codex claude cursor-agent node npm
+		link_configuring_launchers "$probe_directory/shell" "$PATH" gh codex claude cursor-agent node npm herdr
 		shell_probes="$probe_directory/shell:"
 	fi
 	if shell_tool_unavailable gh; then
@@ -1148,7 +1159,13 @@ configure_native_tools() {
 	/*) ;;
 	*) die 'CODEX_HOME must be an absolute path before integration installation' ;;
 	esac
-	integration="$(herdr integration status 2>/dev/null || true)"
+	# Herdr's status check, and the integration installations you approve, run Herdr as the login checks run the agents.
+	if shell_tool_unavailable herdr; then
+		notice "Remaining action: herdr integration status, and herdr integration install for each of ${role_agents[*]} it does not report current, once herdr can run: $(unavailable_reason herdr)"
+		pending=1
+		return 0
+	fi
+	integration="$(MISE_OFFLINE=1 PATH="$shell_probes$PATH" herdr integration status 2>/dev/null || true)"
 	# Herdr detects the gh-dash roles' agents through native integrations; No-Mistakes needs none.
 	for kind in "${role_agents[@]}"; do
 		! printf '%s\n' "$integration" | grep -q "^$kind: current " || continue
@@ -1172,7 +1189,7 @@ configure_native_tools() {
 		cursor) description="Cursor's user hook files under $HOME/.cursor" ;;
 		esac
 		if consent "Run herdr integration install $kind? This native installer changes $description. Review native trust decisions yourself. Other settings remain owned by their native tools."; then
-			herdr integration install "$kind" || pending=1
+			run_approved herdr integration install "$kind" || pending=1
 		else
 			notice "Remaining action: herdr integration install $kind"
 			pending=1
