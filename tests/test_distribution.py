@@ -297,8 +297,11 @@ elif name == "gum":
             # Older Gum treats Ctrl+C as No, so callers must check compatibility before asking.
             sys.exit(1 if tuple(map(int, version.lstrip("v").split("."))) < (0, 15, 0) else 130)
         if key == "<timeout>":
-            # Model moving to Yes without submitting: an inherited timeout can accept that selection.
-            sys.exit(1 if os.environ.get("GUM_CONFIRM_TIMEOUT") == "0" else 0)
+            # Model moving to Yes without submitting: an inherited timeout can accept that selection. As in native Gum,
+            # a --timeout flag takes precedence over GUM_CONFIRM_TIMEOUT.
+            flag = next((arg for arg in args if arg.startswith("--timeout=")), None)
+            disabled = flag == "--timeout=0s" if flag else os.environ.get("GUM_CONFIRM_TIMEOUT") == "0"
+            sys.exit(1 if disabled else 0)
         if key == "":
             # Enter takes the default, which native Gum makes Yes unless --default=false.
             sys.exit(1 if "--default=false" in args else 0)
@@ -809,24 +812,35 @@ elif name == "mise":
             print("mise ERROR " + args[-1] + " is not installed", file=sys.stderr)
             sys.exit(1)
         print(mise_binary(installation, args[-1]))
-    elif args[:1] == ["x"] and len(args) >= 4 and args[2] == "--":
+    elif args == ["x", "--help"]:
+        print("Usage: mise x [OPTIONS] [TOOL@VERSION]... [-- <COMMAND>...]\n"
+              "      --no-deps             Skip automatic dependency preparation")
+    elif args[:1] == ["x"] and len(args) >= 4 and "--" in args[2:4]:
         # A launcher's own mise x statement without its mise use: offline, an installed tool runs with the
         # environment mise gives it. MOCK_MISE_ENV models your global [env], MOCK_MISE_PROJECT_ENV a project
         # configuration here, which MOCK_MISE_UNTRUSTED leaves untrusted: like native mise, a mise x you run then trusts
         # it and records that trust (marked here), while safe mode records no trust and ignores project configuration.
+        # MOCK_MISE_DEPS gives that configuration an automatic [deps] provider, which mise x prepares first (marked)
+        # unless it runs with --no-deps or in safe mode.
         if os.environ.get("MISE_OFFLINE") != "1":
             fail("mise x must stay offline")
-        marker, installation = mise_request(args[1])
+        no_deps = args[1] == "--no-deps"
+        request, separator, command, *rest = args[2:] if no_deps else args[1:]
+        if separator != "--":
+            fail("unexpected mise x arguments")
+        marker, installation = mise_request(request)
         if not marker.exists():
             (root / "lazy-triggered-mise").write_text(" ".join(args))
-            fail("lazy installation triggered by mise x " + args[1])
-        binary = mise_binary(installation, args[3])
+            fail("lazy installation triggered by mise x " + request)
+        binary = mise_binary(installation, command)
         environment = json.loads(os.environ.get("MOCK_MISE_ENV", "{}"))
         if os.environ.get("MISE_SAFE") != "1":
             if os.environ.get("MOCK_MISE_UNTRUSTED") == "1":
                 (root / "mise-trust-recorded").write_text(os.getcwd())
+            if os.environ.get("MOCK_MISE_DEPS") == "1" and not no_deps:
+                (root / "mise-deps-prepared").write_text(os.getcwd())
             environment.update(json.loads(os.environ.get("MOCK_MISE_PROJECT_ENV", "{}")))
-        os.execve(str(binary), [str(binary), *args[4:]], dict(os.environ, **environment))
+        os.execve(str(binary), [str(binary), *rest], dict(os.environ, **environment))
     elif args == ["env"]:
         # Read offline, recording nothing; without a terminal, a project configuration you have not trusted fails it.
         if os.environ.get("MISE_OFFLINE") != "1":
@@ -4688,7 +4702,8 @@ os.execv(executable, [executable, *args])
         # npm's global prefix is read as its launcher's own mise x statement runs npm (offline), never its mise use, as
         # the other probes run their launchers' installed tools.
         self.assertFalse(self.mise_changes())
-        self.assertIn(["x", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm"), "prefix", "-g"], [c["args"] for c in self.calls("mise")])
+        self.assertIn(["x", "--no-deps", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm"), "prefix", "-g"],
+                      [c["args"] for c in self.calls("mise")])
         for path, content in launchers.values():
             self.assertEqual(path.read_text(), content)
         self.assert_safe_clone_actions()
@@ -4733,7 +4748,8 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.lazy_triggered(), [])
         # npm's global prefix is read as its linked launcher's own mise x statement runs npm (offline), never its mise use.
         self.assertFalse(self.mise_changes())
-        self.assertIn(["x", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm"), "prefix", "-g"], [c["args"] for c in self.calls("mise")])
+        self.assertIn(["x", "--no-deps", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm"), "prefix", "-g"],
+                      [c["args"] for c in self.calls("mise")])
         # Once mise's gh is not installed any more, its linked launcher would install it first: pending, never run.
         (self.mock / "mise-installed-gh").unlink()
         self.assertEqual(self.run_script(helper, "lazy", "gh", "claude").stdout.splitlines(), ["gh"])
@@ -4804,6 +4820,17 @@ os.execv(executable, [executable, *args])
         # Neither delegated probe that could start that Node.js ran; No-Mistakes' own version and capability did.
         self.assertFalse(self.calls("acpx"))
         self.assertEqual([c["args"] for c in self.calls("no-mistakes")], [["--version"], ["axi", "run", "--help"]])
+        # Without a temporary directory for its probes, discovery fails the same way, rather than doctor crashing.
+        helper.write_text(original)
+        script = self.installed / "scripts/doctor.py"
+        text = script.read_text()
+        patched = text.replace('tempfile.mkdtemp(prefix="mini-factory-doctor-")',
+                               'tempfile.mkdtemp(prefix="mini-factory-doctor-", dir=' + repr(str(self.root / "missing")) + ')', 1)
+        self.assertNotEqual(patched, text)
+        script.write_text(patched)
+        output = doctor()
+        self.assertIn("FAIL: lazy mise tool discovery failed", output)
+        self.assertFalse([c for c in self.calls() if c["tool"] in probed + ("acpx",)])
 
     def test_omarchy_setup_checks_github_cli_behind_a_configuration_writing_launcher_directly(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
@@ -4934,8 +4961,8 @@ os.execv(executable, [executable, *args])
         self.assertEqual([c["env"].get("NPM_CONFIG_REGISTRY") for c in self.calls("npm")
                           if c["args"] in (["prefix", "-g"], install)], [registry, registry])
         npm = str(self.home / ".local/share/mise/installs/node/latest/bin/npm")
-        self.assertEqual([c["args"][1:] for c in self.calls("mise")
-                          if c["args"][:4] == ["x", "node", "--", npm] and c["args"][4:] != ["--version"]],
+        self.assertEqual([c["args"][2:] for c in self.calls("mise")
+                          if c["args"][:5] == ["x", "--no-deps", "node", "--", npm] and c["args"][5:] != ["--version"]],
                          [["node", "--", npm, "prefix", "-g"], ["node", "--", npm, *install]])
         unchanged()
         # Your shell's launcher never stands in for the Node.js 18 the daemon's PATH finds first.
@@ -5278,8 +5305,10 @@ os.execv(executable, [executable, *args])
         install = ["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]
         self.assertEqual([(c["args"], c["env"].get("NPM_CONFIG_REGISTRY")) for c in self.npm_changes()],
                          [(install, registry)])
-        self.assertEqual([c["args"][:4] for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])],
-                         [["x", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm")]])
+        # (The probe's own mise x --help, read when it is placed, runs nothing.)
+        self.assertEqual([c["args"][:5] for c in self.calls("mise")
+                          if c["args"][:1] in (["use"], ["x"]) and c["args"] != ["x", "--help"]],
+                         [["x", "--no-deps", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm")]])
         self.assertEqual(self.lazy_triggered(), [])
         self.assertEqual(launcher.read_text(), text)
 
@@ -5405,6 +5434,14 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.lazy_triggered(), [])
         self.assertFalse(self.mise_changes())
         self.assertEqual(launcher.read_text(), text)
+        # That Gum gets mise's environment, but a confirmation timeout from mise's [env] cannot accept a highlighted
+        # Yes that was never submitted: the timeout stays disabled on the command line.
+        self.log.write_text("")
+        result = self.interactive_update(["<timeout>"] * 8, MOCK_MISE_ENV=json.dumps({"GUM_CONFIRM_TIMEOUT": "30s"}))
+        self.assertTrue(self.gum_confirms())
+        self.assertIn("Declined; gh-dash extension was left unchanged.", result.stdout)
+        self.assertNotIn(["extension", "upgrade", "dash"], [c["args"] for c in self.calls("gh")])
+        self.assertFalse(self.mise_changes())
 
     def test_omarchy_setup_runs_approved_logins_and_gh_dash_as_the_installed_tools_offline(self):
         system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node", "gh@2.88.1"))
@@ -5539,7 +5576,7 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.run_script(helper, "probes", probes, "gh").stdout.splitlines(), ["gh\t" + installed])
         self.assertEqual(os.readlink(probes / "gh"), installed)
 
-    def test_omarchy_probes_never_record_mise_trust_for_a_checkout_you_have_not_trusted(self):
+    def test_omarchy_probes_never_trust_a_checkouts_mise_configuration_or_prepare_its_deps(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         # Your gh launcher writes your global mise configuration every run. Your global mise [env] selects one GitHub CLI
         # account configuration, and the checked directory's own mise configuration another.
@@ -5562,10 +5599,12 @@ os.execv(executable, [executable, *args])
         self.assertIn("OK: GitHub authenticated", result.stdout.splitlines())
         self.assertEqual(accounts(), {account})
         self.assertFalse((self.mock / "mise-trust-recorded").exists())
-        # Once you trust it, its own mise environment applies, as your launcher gives it there.
+        # Once you trust it, its own mise environment applies, as your launcher gives it there, but its automatic [deps]
+        # provider is never prepared (mise x --no-deps), so no check installs dependencies.
         self.log.write_text("")
-        self.assert_success(self.run_script(self.installed / "scripts/doctor.sh"))
+        self.assert_success(self.run_script(self.installed / "scripts/doctor.sh", env={"MOCK_MISE_DEPS": "1"}))
         self.assertEqual(accounts(), {project})
+        self.assertFalse((self.mock / "mise-deps-prepared").exists())
         self.assertEqual(self.lazy_triggered(), [])
         self.assertFalse(self.mise_changes())
         self.assertEqual(launcher.read_text(), text)
@@ -7224,7 +7263,8 @@ os.execv(executable, [executable, *args])
         result = self.interactive_update(["", ""])
         self.assert_success(result)
         self.assertEqual(self.gum_confirms(), [
-            ["confirm", "--default=false", "Run " + command + " now? It decides itself whether a newer release exists."]
+            ["confirm", "--timeout=0s", "--default=false",
+             "Run " + command + " now? It decides itself whether a newer release exists."]
             for command in ("gh extension upgrade dash", "herdr update")])
         self.assertIn("Declined (left unchanged): gh-dash herdr", result.stdout)
         self.assertNotIn("[y/N]", result.stdout)

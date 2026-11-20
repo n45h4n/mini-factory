@@ -477,8 +477,9 @@ offer_upgrade() {
 		unasked+=("$tool")
 		return 0
 	fi
-	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-	GUM_CONFIRM_TIMEOUT=0 MISE_OFFLINE=1 probe gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
+	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline. The timeout is disabled on the command
+	# line too, which mise's [env] for a Gum probe cannot override.
+	GUM_CONFIRM_TIMEOUT=0 MISE_OFFLINE=1 probe gum confirm --timeout=0s --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
 	if [ "$status" -eq 130 ]; then
 		notice "  Cancelled; $label was left unchanged and make update stopped before rerunning setup."
 		exit 130

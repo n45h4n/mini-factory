@@ -184,7 +184,10 @@ def probe_path(path, names=PROBED_TOOLS):
     finds first for a command name, run with the environment mise gives it (such as GH_CONFIG_DIR from mise's [env]), as
     the bundled helper's probes present it; unsafe names such a launcher whose tool cannot be resolved, which no probe
     may run. Every other command, and the PATH your workflow uses, is unchanged."""
-    directory = tempfile.mkdtemp(prefix="mini-factory-doctor-")
+    try:
+        directory = tempfile.mkdtemp(prefix="mini-factory-doctor-")
+    except OSError:
+        return None
     atexit.register(shutil.rmtree, directory, True)
     # A configured path (such as an absolute acpx_path) is run as its tool instead; only names get a probe.
     text = output([BASH, str(PLATFORM_HELPER), "probes", directory, *names], dict(os.environ, PATH=path))

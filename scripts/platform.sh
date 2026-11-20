@@ -307,15 +307,19 @@ mf_configuring_launchers() {
 # would skip the probe), gets a link to the installed tool. A configured path (such as an absolute acpx_path) gets no
 # probe. Fails when a probe cannot be placed, so no caller runs that launcher instead.
 mf_link_configuring_launchers() {
-	local directory="$1" name tool request mise
+	local directory="$1" name tool request mise deps
 	shift
 	while IFS=$'\t' read -r name tool; do
 		printf '%s\n' "$name${tool:+$'\t'$tool}"
 		[ -n "$tool" ] || continue
 		case "$name" in */*) continue ;; esac
 		if request="$(mf_configuring_launcher_request "$name")" && mise="$(mf_mise_command)"; then
-			printf '#!/bin/sh\nMISE_OFFLINE=1 %q env </dev/null >/dev/null 2>&1 || { MISE_SAFE=1; export MISE_SAFE; }\nMISE_OFFLINE=1 exec %q x %q -- %q "$@"\n' \
-				"$mise" "$mise" "${request%%$'\t'*}" "$tool" >"$directory/$name" && chmod 755 "$directory/$name" || return 1
+			# mise x first prepares a project's automatic [deps] (installing dependencies) unless told not to; a mise
+			# without that option has no [deps] to prepare. Its help runs nothing.
+			deps=''
+			case "$(MISE_OFFLINE=1 "$mise" x --help 2>/dev/null)" in *--no-deps*) deps=' --no-deps' ;; esac
+			printf '#!/bin/sh\nMISE_OFFLINE=1 %q env </dev/null >/dev/null 2>&1 || { MISE_SAFE=1; export MISE_SAFE; }\nMISE_OFFLINE=1 exec %q x%s %q -- %q "$@"\n' \
+				"$mise" "$mise" "$deps" "${request%%$'\t'*}" "$tool" >"$directory/$name" && chmod 755 "$directory/$name" || return 1
 			[ -x "$directory/$name" ] && continue
 			rm -f -- "$directory/$name" || return 1
 		fi
