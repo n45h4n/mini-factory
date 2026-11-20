@@ -901,17 +901,12 @@ link_configuring_launchers() {
 	PATH="$path" mf_link_configuring_launchers "$directory" "$@" >/dev/null
 }
 
-# Runs your shell's npm for its global prefix and the acpx installation you approve. A launcher that runs mise use
-# runs as its own mise x statement does, so npm gets the environment mise gives it (such as a registry from mise's
-# [env]) but not that mise use, which writes your global mise configuration; that mise runs offline, so it installs
-# or updates nothing. Any other npm runs as the read-only checks run it.
+# Runs your shell's npm for its global prefix and the acpx installation you approve, as the read-only checks run it: a
+# launcher that runs mise use runs as its probe (see link_configuring_launchers), so npm gets the environment mise gives
+# it (such as a registry from mise's [env]) but not that mise use, which writes your global mise configuration; that
+# mise runs offline, so it installs or updates nothing.
 shell_npm() {
-	local request
-	if [ -n "$shell_probes" ] && request="$(mf_configuring_launcher_request npm)"; then
-		MISE_OFFLINE=1 "$(mf_mise_command)" x "${request%%$'\t'*}" -- "${request#*$'\t'}" "$@"
-	else
-		PATH="$shell_probes$PATH" npm "$@"
-	fi
+	PATH="$shell_probes$PATH" npm "$@"
 }
 
 # madison lists repository-provided versions only (as for Gum); any configured source counts, such as NodeSource.
@@ -985,8 +980,9 @@ acpx_runs_for_daemon() {
 			acpx="$acpx_path"
 		}
 	fi
+	# A failing acpx is an ordinary failure, whatever its status; status 2 stays for the mise launcher above.
 	# shellcheck disable=SC2016 # Expanded by the child shell with the daemon's PATH.
-	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx"
+	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx" || return 1
 }
 
 # The acpx your shell's PATH finds, checked as acpx_runs_for_daemon checks the daemon's: a launcher that runs mise use
@@ -1002,7 +998,7 @@ acpx_runs_for_shell() {
 			acpx=acpx
 		}
 	fi
-	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$acpx" --version >/dev/null 2>&1
+	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$acpx" --version >/dev/null 2>&1 || return 1
 }
 
 # Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the

@@ -183,8 +183,10 @@ packages and tools, and setup reuses them:
   mise offline, so none of them installs or updates a tool or writes your mise
   configuration. Checks and approved actions keep the environment the launcher's
   own `mise x` gives its tool (such as `GH_CONFIG_DIR` from mise's `[env]`), as
-  `ghd` runs it. The `acpx` installation you approve also runs npm with mise
-  offline, so no Node.js auto-update runs first. A managed tool that is
+  `ghd` runs it. In a directory whose mise configuration you have not trusted,
+  they use mise's safe mode instead, which records no trust and ignores that
+  project configuration. The `acpx` installation you approve also runs npm with
+  mise offline, so no Node.js auto-update runs first. A managed tool that is
   unavailable stays a remaining action, including a mise `acpx` the No-Mistakes
   daemon finds before it is installed (setup installs no competing copy).
 - Whatever your PATH selects is what setup uses. A compatible installation of
@@ -958,8 +960,10 @@ Arch, or Omarchy, detected as setup does). On Arch and Omarchy, a lazy mise
 tool (Omarchy's, or your own mise's) whose version selected in the checked
 directory is not installed yet is reported as setup pending without being run,
 so no version, help, or login probe installs it; run `make setup`, which asks
-first. This includes `glab` when a GitLab forge profile (`glab_config_dir`) makes
-native `no-mistakes doctor` run it.
+first. Setup installs only its own lazy tools, so for any other one, such as
+`glab` when a GitLab forge profile (`glab_config_dir`) makes native
+`no-mistakes doctor` run it, doctor names the step to run yourself (for example
+`mise install glab`).
 It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's

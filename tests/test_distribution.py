@@ -811,7 +811,9 @@ elif name == "mise":
         print(mise_binary(installation, args[-1]))
     elif args[:1] == ["x"] and len(args) >= 4 and args[2] == "--":
         # A launcher's own mise x statement without its mise use: offline, an installed tool runs with the
-        # environment mise gives it (MOCK_MISE_ENV models mise's [env]).
+        # environment mise gives it. MOCK_MISE_ENV models your global [env], MOCK_MISE_PROJECT_ENV a project
+        # configuration here, which MOCK_MISE_UNTRUSTED leaves untrusted: like native mise, a mise x you run then trusts
+        # it and records that trust (marked here), while safe mode records no trust and ignores project configuration.
         if os.environ.get("MISE_OFFLINE") != "1":
             fail("mise x must stay offline")
         marker, installation = mise_request(args[1])
@@ -819,8 +821,21 @@ elif name == "mise":
             (root / "lazy-triggered-mise").write_text(" ".join(args))
             fail("lazy installation triggered by mise x " + args[1])
         binary = mise_binary(installation, args[3])
-        os.execve(str(binary), [str(binary), *args[4:]],
-                  dict(os.environ, **json.loads(os.environ.get("MOCK_MISE_ENV", "{}"))))
+        environment = json.loads(os.environ.get("MOCK_MISE_ENV", "{}"))
+        if os.environ.get("MISE_SAFE") != "1":
+            if os.environ.get("MOCK_MISE_UNTRUSTED") == "1":
+                (root / "mise-trust-recorded").write_text(os.getcwd())
+            environment.update(json.loads(os.environ.get("MOCK_MISE_PROJECT_ENV", "{}")))
+        os.execve(str(binary), [str(binary), *args[4:]], dict(os.environ, **environment))
+    elif args == ["env"]:
+        # Read offline, recording nothing; without a terminal, a project configuration you have not trusted fails it.
+        if os.environ.get("MISE_OFFLINE") != "1":
+            fail("mise env must stay offline")
+        if os.environ.get("MOCK_MISE_UNTRUSTED") == "1":
+            fail("mise ERROR Config files in " + os.getcwd() + " are not trusted.")
+        for key, value in {**json.loads(os.environ.get("MOCK_MISE_ENV", "{}")),
+                           **json.loads(os.environ.get("MOCK_MISE_PROJECT_ENV", "{}"))}.items():
+            print("export " + key + "=" + value)
     elif args[:1] == ["current"] and len(args) == 2:
         # The version mise selects here, read offline; none for a tool you disabled.
         if os.environ.get("MISE_OFFLINE") != "1":
@@ -959,7 +974,7 @@ class DistributionTests(unittest.TestCase):
         or update its tool first. A launcher's own mise x statement, run offline on its installed tool (as the probes run
         it), is neither; one whose tool is not installed is reported by lazy_triggered."""
         return [c for c in self.calls("mise") if c["args"][:1] == ["use"]
-                or c["args"][:1] == ["x"] and c["env"].get("MISE_OFFLINE") != "1"]
+                or (c["args"][:1] == ["x"] and c["env"].get("MISE_OFFLINE") != "1")]
 
     def configuring_launcher(self, path, name, tool=None):
         """A legacy omarchy-mise-install launcher for command name (of mise tool tool) at path: every run it writes your
@@ -4673,7 +4688,7 @@ os.execv(executable, [executable, *args])
         # npm's global prefix is read as its launcher's own mise x statement runs npm (offline), never its mise use, as
         # the other probes run their launchers' installed tools.
         self.assertFalse(self.mise_changes())
-        self.assertIn(["x", "node", "--", "npm", "prefix", "-g"], [c["args"] for c in self.calls("mise")])
+        self.assertIn(["x", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm"), "prefix", "-g"], [c["args"] for c in self.calls("mise")])
         for path, content in launchers.values():
             self.assertEqual(path.read_text(), content)
         self.assert_safe_clone_actions()
@@ -4718,7 +4733,7 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.lazy_triggered(), [])
         # npm's global prefix is read as its linked launcher's own mise x statement runs npm (offline), never its mise use.
         self.assertFalse(self.mise_changes())
-        self.assertIn(["x", "node", "--", "npm", "prefix", "-g"], [c["args"] for c in self.calls("mise")])
+        self.assertIn(["x", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm"), "prefix", "-g"], [c["args"] for c in self.calls("mise")])
         # Once mise's gh is not installed any more, its linked launcher would install it first: pending, never run.
         (self.mock / "mise-installed-gh").unlink()
         self.assertEqual(self.run_script(helper, "lazy", "gh", "claude").stdout.splitlines(), ["gh"])
@@ -4918,8 +4933,10 @@ os.execv(executable, [executable, *args])
         self.assertEqual([c["args"] for c in self.npm_changes()], [install])
         self.assertEqual([c["env"].get("NPM_CONFIG_REGISTRY") for c in self.calls("npm")
                           if c["args"] in (["prefix", "-g"], install)], [registry, registry])
-        self.assertEqual([c["args"][1:] for c in self.calls("mise") if c["args"][:1] == ["x"] and c["args"][3:4] == ["npm"]],
-                         [["node", "--", "npm", "prefix", "-g"], ["node", "--", "npm", *install]])
+        npm = str(self.home / ".local/share/mise/installs/node/latest/bin/npm")
+        self.assertEqual([c["args"][1:] for c in self.calls("mise")
+                          if c["args"][:4] == ["x", "node", "--", npm] and c["args"][4:] != ["--version"]],
+                         [["node", "--", npm, "prefix", "-g"], ["node", "--", npm, *install]])
         unchanged()
         # Your shell's launcher never stands in for the Node.js 18 the daemon's PATH finds first.
         texts.pop(daemon_node)
@@ -5173,6 +5190,15 @@ os.execv(executable, [executable, *args])
             self.assertEqual(self.lazy_triggered(), [])
             self.assertFalse(self.mise_installs())
             self.assertEqual(config.read_text(), '[tools]\n"npm:acpx" = "latest"\n')
+        # An acpx of your own there that fails with status 2 is an ordinary failure, so setup offers npm's acpx.
+        daemon_acpx.unlink()
+        daemon_acpx.write_text("#!/bin/sh\nexit 2\n")
+        daemon_acpx.chmod(0o755)
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("is a mise launcher whose tool is not installed yet", result.stdout)
+        self.assertIn("Remaining action: npm install -g --prefix " + str(self.home / ".local") + " acpx@latest",
+                      result.stdout)
 
     def test_omarchy_doctor_skips_native_doctor_only_when_its_github_profile_could_run_a_lazy_gh(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
@@ -5253,13 +5279,13 @@ os.execv(executable, [executable, *args])
         self.assertEqual([(c["args"], c["env"].get("NPM_CONFIG_REGISTRY")) for c in self.npm_changes()],
                          [(install, registry)])
         self.assertEqual([c["args"][:4] for c in self.calls("mise") if c["args"][:1] in (["use"], ["x"])],
-                         [["x", "node", "--", "npm"]])
+                         [["x", "node", "--", str(self.home / ".local/share/mise/installs/node/latest/bin/npm")]])
         self.assertEqual(self.lazy_triggered(), [])
         self.assertEqual(launcher.read_text(), text)
 
     def test_omarchy_approved_acpx_npm_install_and_update_never_start_a_due_node_auto_update(self):
         self.clone_fixture()
-        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        system, _ = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         self.assert_success(self.interactive_setup("y"))
         # npm is Omarchy's mise shim, and mise's Node.js has an auto-update due; your npm registry comes from your
         # environment.
@@ -5501,6 +5527,48 @@ os.execv(executable, [executable, *args])
         self.interactive_update(["y"] * 8)
         self.assertEqual(accounts(github("extension", "upgrade", "dash")), {(installed, account, "1")})
         unchanged()
+        # Where the probe directory cannot run scripts (such as a noexec TMPDIR, where command lookup would skip the
+        # probe and find your launcher), the probe is a link to the installed gh instead.
+        helper = self.installed / "scripts/platform.sh"
+        original = helper.read_text()
+        patched = original.replace('[ -x "$directory/$name" ] && continue', 'false && continue', 1)
+        self.assertNotEqual(patched, original)
+        helper.write_text(patched)
+        probes = self.root / "noexec probes"
+        probes.mkdir()
+        self.assertEqual(self.run_script(helper, "probes", probes, "gh").stdout.splitlines(), ["gh\t" + installed])
+        self.assertEqual(os.readlink(probes / "gh"), installed)
+
+    def test_omarchy_probes_never_record_mise_trust_for_a_checkout_you_have_not_trusted(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        # Your gh launcher writes your global mise configuration every run. Your global mise [env] selects one GitHub CLI
+        # account configuration, and the checked directory's own mise configuration another.
+        launcher = self.home / ".local/bin/gh"
+        text = self.configuring_launcher(launcher, "gh")
+        account = str(self.home / "personal gh account")
+        project = str(self.home / "work gh account")
+        self.env.update(MOCK_MISE_ENV=json.dumps({"GH_CONFIG_DIR": account}),
+                        MOCK_MISE_PROJECT_ENV=json.dumps({"GH_CONFIG_DIR": project}))
+        self.assert_success(self.interactive_setup("y"))
+
+        def accounts():
+            return {c["env"].get("GH_CONFIG_DIR") for c in self.calls("gh") if c["args"][:2] == ["auth", "status"]}
+
+        # A mise x you run would trust that configuration while you have not trusted it, and record that trust. Setup's
+        # and doctor's probes check gh in mise's safe mode instead, with your global mise environment, recording none.
+        self.log.write_text("")
+        result = self.setup(MOCK_MISE_UNTRUSTED="1")
+        self.assert_success(result)
+        self.assertIn("OK: GitHub authenticated", result.stdout.splitlines())
+        self.assertEqual(accounts(), {account})
+        self.assertFalse((self.mock / "mise-trust-recorded").exists())
+        # Once you trust it, its own mise environment applies, as your launcher gives it there.
+        self.log.write_text("")
+        self.assert_success(self.run_script(self.installed / "scripts/doctor.sh"))
+        self.assertEqual(accounts(), {project})
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse(self.mise_changes())
+        self.assertEqual(launcher.read_text(), text)
 
     def test_omarchy_setup_installs_the_exact_version_a_lazy_launcher_requests(self):
         system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))

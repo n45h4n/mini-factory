@@ -300,9 +300,12 @@ mf_configuring_launchers() {
 # command name whose tool resolves, so checks and approved actions run that tool behind the directory on PATH. A probe
 # runs the launcher's own mise x statement, offline and without its mise use, on the installed tool: the version the
 # launcher selects, with the environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]), as the
-# launcher (and so ghd) runs it, while mise installs, updates, and configures nothing. A launcher without such a
-# statement gets a link to its installed tool. A configured path (such as an absolute acpx_path) gets no probe. Fails
-# when a probe cannot be placed, so no caller runs that launcher instead.
+# launcher (and so ghd) runs it, while mise installs, updates, and configures nothing. A mise x of your own records
+# trust for the project configurations it loads, so where mise env (which records none) finds one you have not
+# trusted, the probe runs in mise's safe mode, which records no trust and ignores project configuration. A launcher
+# without such a statement, or a directory where scripts cannot run (such as a noexec TMPDIR, where command lookup
+# would skip the probe), gets a link to the installed tool. A configured path (such as an absolute acpx_path) gets no
+# probe. Fails when a probe cannot be placed, so no caller runs that launcher instead.
 mf_link_configuring_launchers() {
 	local directory="$1" name tool request mise
 	shift
@@ -311,11 +314,12 @@ mf_link_configuring_launchers() {
 		[ -n "$tool" ] || continue
 		case "$name" in */*) continue ;; esac
 		if request="$(mf_configuring_launcher_request "$name")" && mise="$(mf_mise_command)"; then
-			printf '#!/bin/sh\nMISE_OFFLINE=1 exec %q x %q -- %q "$@"\n' "$mise" "${request%%$'\t'*}" "$tool" \
-				>"$directory/$name" && chmod 755 "$directory/$name" || return 1
-		else
-			ln -s -- "$tool" "$directory/$name" || return 1
+			printf '#!/bin/sh\nMISE_OFFLINE=1 %q env </dev/null >/dev/null 2>&1 || { MISE_SAFE=1; export MISE_SAFE; }\nMISE_OFFLINE=1 exec %q x %q -- %q "$@"\n' \
+				"$mise" "$mise" "${request%%$'\t'*}" "$tool" >"$directory/$name" && chmod 755 "$directory/$name" || return 1
+			[ -x "$directory/$name" ] && continue
+			rm -f -- "$directory/$name" || return 1
 		fi
+		ln -s -- "$tool" "$directory/$name" || return 1
 	done < <(mf_configuring_launchers "$@")
 	return 0
 }

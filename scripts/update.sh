@@ -146,16 +146,11 @@ probe() {
 	fi
 }
 
-# npm as probe runs it, except that a launcher that runs mise use runs as its own mise x statement does (as setup's
-# shell_npm): with the environment mise gives npm (such as a registry from mise's [env]), but without that mise use,
-# and offline for mise, so it installs or updates nothing else.
+# npm as probe runs it (as setup's shell_npm): a launcher that runs mise use runs as its probe, with the environment
+# mise gives npm (such as a registry from mise's [env]), but without that mise use, and offline for mise, so it installs
+# or updates nothing else.
 probe_npm() {
-	local request
-	if [ -n "$probe_directory" ] && request="$(mf_configuring_launcher_request npm)"; then
-		MISE_OFFLINE=1 "$(mf_mise_command)" x "${request%%$'\t'*}" -- "${request#*$'\t'}" "$@"
-	else
-		probe npm "$@"
-	fi
+	probe npm "$@"
 }
 
 # Discovery probes run offline for mise, whose launchers would otherwise install a due update of their tool
