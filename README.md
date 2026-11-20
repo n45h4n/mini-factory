@@ -104,7 +104,8 @@ general `brew upgrade`.
 ## Bootstrap on native Ubuntu Server
 
 Supported: Ubuntu 22.04 or newer, x86_64 or arm64. WSL and other Linux
-distributions are outside this distribution's support. Start as a regular user
+distributions (except [Arch Linux and Omarchy](#bootstrap-on-arch-linux-and-omarchy))
+are outside this distribution's support. Start as a regular user
 with sudo access, not as root:
 
 ```sh
@@ -130,6 +131,75 @@ terminal type installed on the server (for example `xterm-256color` if your
 terminal's private terminfo is unavailable). You can detach from Herdr with its
 default `ctrl+b`, then `q`, and reattach with `herdr --session my-project`.
 
+## Bootstrap on Arch Linux and Omarchy
+
+Supported: native Arch Linux (`ID=arch` in `/etc/os-release`) and current
+official [Omarchy](https://omarchy.org/), x86_64 only. Arch Linux ARM, other
+derivatives (an `ID_LIKE=arch` alone is not enough), and WSL are outside this
+distribution's support. Setup recognizes Omarchy only by its installed `omarchy`
+(or `omarchy-dev`) package together with its packaged runtime
+`/usr/share/omarchy/bin/omarchy`, not by an environment variable; one without
+the other is refused as an incomplete Omarchy installation, so repair Omarchy
+first. Run as your regular user with sudo access, not as root, and never
+`sudo make setup`. The commands are the same as everywhere else: `make setup`,
+`make doctor`, `ghd`, `ghd update`, `mf-config`, and `nm-config`.
+
+**Ordinary Arch.** Git and Make are needed to clone and run setup:
+
+```sh
+sudo pacman -Syu --needed git make
+```
+
+Setup installs only missing prerequisites, from official Arch packages
+(`python` provides `python3`, `github-cli` provides `gh`; also `jq`, `curl`,
+`tar`, `gzip`, `ca-certificates`, `gum`, and `nodejs` with `npm` when Node.js is
+missing), batched into one `sudo pacman -Syu --needed <packages>` after your
+consent. That command also upgrades every installed package: Arch
+[does not support partial upgrades](https://wiki.archlinux.org/title/System_maintenance#Partial_upgrades_are_unsupported),
+so setup never refreshes the databases alone, never forces conflicts, and lets
+pacman show its own transaction for confirmation. A healthy rerun starts no
+package transaction. If pacman fails, resolve what it reports (keyring, mirror,
+or file conflict) and rerun setup. Missing Herdr, agent CLIs, and No-Mistakes
+use the same upstream native installers as on Ubuntu; setup adds no AUR helper,
+Linuxbrew, or other runtime manager.
+
+**Omarchy.** Git and Make come with Omarchy. Omarchy stays in charge of its
+packages and tools, and setup reuses them:
+
+- Missing system prerequisites go through Omarchy's package route,
+  `omarchy pkg add <packages>` (it runs `sudo pacman -S --needed` from Omarchy's
+  current package databases; no system upgrade). Herdr is Omarchy's `herdr`
+  package.
+- `gh`, Codex, Claude Code, Cursor CLI, and Node.js are Omarchy's lazy
+  [mise tools](https://omarchy.org/manual/development-tools/): finding the
+  command does not mean it is installed, because the first run installs it.
+  Setup asks before installing exactly these with `mise install`, then checks
+  them; it installs no other optional lazy tool, and Omarchy's own mise hook may
+  add each agent's Herdr integration as it installs. A launcher that requests an
+  exact version (such as `gh@2.88.1`) gets exactly that request installed, and a
+  lazy mise Gum of your own is installed the same way instead of a `gum` package.
+- Checks, Gum confirmations, and the logins, gh-dash installation, and Herdr
+  integrations you approve run the installed tool a mise launcher would run, with
+  mise offline, so none of them installs or updates a tool or writes your mise
+  configuration. Checks and approved actions keep the environment the launcher's
+  own `mise x` gives its tool (such as `GH_CONFIG_DIR` from mise's `[env]`), as
+  `ghd` runs it. In a directory whose mise configuration you have not trusted,
+  they use mise's safe mode instead, which records no trust and ignores that
+  project configuration. The `acpx` installation you approve also runs npm with
+  mise offline, so no Node.js auto-update runs first. A managed tool that is
+  unavailable stays a remaining action, including a mise `acpx` the No-Mistakes
+  daemon finds before it is installed (setup installs no competing copy).
+- Whatever your PATH selects is what setup uses. A compatible installation of
+  your own (for example a native Cursor CLI listed in mise's `disable_tools`) is
+  reused. Setup never installs a competing copy, overwrites a managed launcher,
+  or reorders PATH. A missing or broken Omarchy-managed tool gets repair
+  guidance (for example `mise install codex` or `omarchy update`), not a
+  replacement.
+- No-Mistakes and `acpx`, which only Mini-Factory needs, keep their user-level
+  installs in `~/.local/bin` (acpx through Omarchy's mise npm).
+- Your shell files, desktop configuration, mise configuration, Omarchy's
+  default agent, credentials, and sessions are left alone.
+
 ## Installation and authentication
 
 Setup checks tools first and reuses suitable installations. The runtime needs
@@ -145,7 +215,8 @@ The GitHub CLI minimum avoids the community Ubuntu 2.45/2.46 releases' deprecate
 API failures documented by [GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#ubuntu-community).
 Curl and tar support the native installers. Missing tools are installed only
 with consent, each through its own upstream installer, placing commands in
-`~/.local/bin`:
+`~/.local/bin` (on Omarchy, its own Herdr and lazy mise agent CLIs are used
+instead; see [Arch Linux and Omarchy](#bootstrap-on-arch-linux-and-omarchy)):
 
 | Tool | Native installer | Native login |
 | ---- | ---------------- | ------------ |
@@ -163,7 +234,10 @@ None of these needs Node/npm. No-Mistakes runs Cursor (`cursor` or
   reused. Only when `node` is missing does setup offer `brew install node` on
   macOS, or on Ubuntu `sudo apt-get install nodejs` (then `npm` if separate)
   when your configured apt sources offer 22.13+ (Ubuntu's own archive may be
-  older; a configured NodeSource source qualifies). Otherwise, and for an older
+  older; a configured NodeSource source qualifies), or on Arch `nodejs npm` in
+  its `sudo pacman -Syu --needed` transaction (just `npm` when a pacman
+  Node.js lacks it, as Arch packages npm separately). On Omarchy, Node.js is its lazy
+  mise tool, installed with the others above. Otherwise, and for an older
   Node.js, setup prints the exact action and reports setup pending; it never
   replaces an existing Node.js or version manager, npm prefix, or shell file.
 - **acpx**: an existing `acpx` the daemon can run is reused. Otherwise setup
@@ -793,7 +867,7 @@ It then:
 
 | Tool | Offered when installed as | Command |
 | ---- | ------------------------- | ------- |
-| GitHub CLI, Gum | Homebrew formula, or apt package | `brew upgrade gh` (Homebrew may refresh its index first); or `sudo apt-get update`, then `sudo apt-get install --only-upgrade gh` |
+| GitHub CLI, Gum | Homebrew formula, or apt package (pacman and mise installations get guidance; see below) | `brew upgrade gh` (Homebrew may refresh its index first); or `sudo apt-get update`, then `sudo apt-get install --only-upgrade gh` |
 | gh-dash | the `dlvhdr/gh-dash` extension | `gh extension upgrade dash` |
 | Herdr | native `~/.local/bin/herdr` | `herdr update` (no `--handoff`) |
 | Codex | standalone, under `${CODEX_HOME:-~/.codex}/packages/standalone` | `codex update` |
@@ -812,6 +886,22 @@ daemon. Each updater decides whether a newer release exists: Mini-Factory
 compares no versions and never runs a general `brew upgrade` or `apt upgrade`.
 System prerequisites (Git, Make, jq, Python, curl, tar) keep setup's targeted
 checks.
+
+- **Arch and Omarchy ownership.** A tool owned by a pacman package (for example
+  `github-cli`, `gum`, `nodejs`, or Omarchy's `herdr`) gets manual guidance:
+  update it with a full system upgrade (`sudo pacman -Syu`), or on Omarchy with
+  `omarchy update`. A mise-managed tool, including Omarchy's lazy `gh`, agent
+  CLIs, and Node.js, also gets guidance only (`omarchy update`, or `mup` for
+  mise tools alone): its own updater would install a copy mise does not track.
+  `make update` has no system or Omarchy upgrade stage; its setup run offers
+  only genuinely missing dependencies, under setup's consent rules. Independent
+  user-level installations (for example your own native Claude Code), setup's
+  `acpx`, No-Mistakes, and the gh-dash extension keep their consented updates;
+  the gh-dash and `acpx` upgrades run mise offline, so neither updates a
+  mise-managed `gh` or Node.js.
+  Discovery never runs a lazy tool that is not installed yet (Gum included: a
+  lazy Gum leaves the upgrades unasked); it reports it, and setup asks before
+  installing it.
 
 - **Stable only.** No-Mistakes is updated with plain `no-mistakes update`, never
   `--beta`, `--force`, or `--yes`. Its updater reports a newer prerelease you
@@ -855,7 +945,9 @@ setting, and the No-Mistakes configuration link. Only `mf-config` writes
 GitHub CLI installation writes
 `/etc/apt/keyrings/githubcli-archive-keyring.gpg` and
 `/etc/apt/sources.list.d/github-cli.list`; an approved Gum installation from
-Charm's repository writes the Charm files listed above.
+Charm's repository writes the Charm files listed above. On Arch and Omarchy,
+approved packages come only from the repositories pacman already uses (setup
+adds none), and Omarchy's lazy tools install into mise's own directories.
 It never copies the maintainer's
 credentials or personal config. Existing gh-dash, Herdr, shell and unrelated
 agent settings are preserved.
@@ -875,7 +967,16 @@ make doctor
 ```
 
 Doctor separates **installed**, **authentication/setup pending**, and **ready to
-launch from this context**. It checks the tools and versions above (including
+launch from this context**. It reports the detected platform (macOS, Ubuntu,
+Arch, or Omarchy, detected as setup does). On Arch and Omarchy, a lazy mise
+tool (Omarchy's, or your own mise's) whose version selected in the checked
+directory is not installed yet is reported as setup pending without being run,
+so no version, help, or login probe installs it; run `make setup`, which asks
+first. Setup installs only its own lazy tools, so for any other one, such as
+`glab` when a GitLab forge profile (`glab_config_dir`) makes native
+`no-mistakes doctor` run it, doctor names the step to run yourself (for example
+`mise install glab`).
+It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
 effective agent, authentication for the agents a gh-dash role or No-Mistakes
@@ -932,18 +1033,34 @@ Before committing changes, review the diff and run the focused checks:
 git diff --check
 make test
 # For changes to the launcher, setup/doctor, or worker shell scripts:
-bash -n bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
-shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/integrations/gh-dash/*.sh
+bash -n bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/platform.sh scripts/integrations/gh-dash/*.sh tests/arch-smoke.sh
+shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/platform.sh scripts/integrations/gh-dash/*.sh tests/arch-smoke.sh
+# For setup changes affecting Arch (needs Docker; CI runs it too):
+tests/arch-smoke.sh
 ```
+
+Validation comes in three separate levels; do not substitute one for another:
+
+- **Mocked** (`make test`): disposable homes with inert external tools, including
+  a synthetic Arch/Omarchy system root (`MINI_FACTORY_TEST_ROOT`, a test-only
+  seam) with mocked pacman, mise, and Omarchy commands.
+- **Container** (`tests/arch-smoke.sh`): a disposable `archlinux:latest`
+  container with real pacman packages and Bash, inert agent/Herdr/GitHub CLI/
+  No-Mistakes commands, and a read-only mount of this checkout (setup runs from a
+  writable copy). It checks the consented `-Syu --needed` transaction, a healthy
+  rerun without package transactions, and the incomplete-Omarchy refusal. It does
+  not test Omarchy itself or any login.
+- **Live host**: the [real-machine smoke test](#real-machine-smoke-test) below.
 
 Commit and push reviewed changes to this repository. Users update with
 `ghd update` from any directory, or `make update` from their clone (a
 fast-forward, consented tool upgrades, then `make setup`). There is no
 background updater or automatic cross-repository sync.
 
-Mini-Factory's own CI, `.github/workflows/ci.yml`, runs `make test` on an Ubuntu
-runner for every pull request and push to `main`, with read-only repository
-permissions. That gives No-Mistakes a real PR check to observe here. The
+Mini-Factory's own CI, `.github/workflows/ci.yml`, runs `make test` and the Arch
+container smoke check on Ubuntu runners for every pull request and push to
+`main`, with read-only repository permissions. That gives No-Mistakes a real PR
+check to observe here. The
 workflow file alone does not prove CI works: GitHub Actions must be enabled for
 the repository and the check must actually appear on the PR. It does not apply
 to target repositories (see the
@@ -971,11 +1088,15 @@ project hooks; and, against the Codex CLI 0.166.0 source and an isolated local
 `codex mcp list` check on 2026-11-03, that a linked worktree of a trusted main
 checkout loads that worktree's `.codex/config.toml` MCP servers and
 `.codex/rules`, while hook declarations come from the main checkout and run
-only with persisted hook trust. Mocked
-macOS/Ubuntu coverage is not
-native verification. Native macOS and Ubuntu Server installation and live
-Herdr/agent/No-Mistakes onboarding still need verification by users on those
-hosts.
+only with persisted hook trust; and Arch Linux and Omarchy support against the
+Arch partial-upgrade policy, the Omarchy manual (AI, Development Tools, and
+Other Packages), and the official Omarchy source (4.0.0 development branch:
+`omarchy pkg add`, `/etc/mise/conf.d/omarchy-tools.toml`, and its offline
+`mise which` probes) on 2026-11-17. Mocked
+macOS/Ubuntu/Arch/Omarchy coverage and the Arch container check are not
+native verification. Native macOS, Ubuntu Server, Arch Linux, and Omarchy
+installation and live Herdr/agent/No-Mistakes onboarding still need
+verification by users on those hosts.
 
 ### Real-machine smoke test
 
@@ -1005,3 +1126,22 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    offers only the native upgrades that match each tool's installation, and
    ends with setup's doctor report. `ghd update` from another directory does
    the same for the recorded clone.
+
+On a native Arch Linux or Omarchy x86_64 test host (a disposable account, with
+its system otherwise up to date), also check:
+
+1. `make setup` names the platform: ordinary Arch offers one
+   `sudo pacman -Syu --needed ...` with the upgrade warning, and Omarchy offers
+   only `omarchy pkg add` for missing packages and `mise install` for its lazy
+   `gh`, agent CLIs, and Node.js. Before you consent, `make doctor` reports
+   those lazy tools as setup pending and installs nothing (`mise ls` is
+   unchanged). After setup, a rerun starts no package transaction and
+   `make doctor` reports ready, including Node.js and `acpx` from the
+   No-Mistakes daemon's PATH.
+2. `mf-config` and `nm-config` open their Gum editors and save only after
+   confirmation; `mf-config show` and `nm-config show` report the saves.
+3. Then steps 2 to 5 above: `i` prepares the issue, `I` implements it through an
+   open (unmerged) PR, and PRs `I` reviews it read-only, with no first-use tool
+   installation during dispatch.
+4. On Omarchy, `make update` reports Omarchy- and mise-managed tools as manual
+   updates (`omarchy update`) and runs no system, Omarchy, or mise upgrade.

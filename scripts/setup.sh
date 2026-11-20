@@ -2,6 +2,8 @@
 set -euo pipefail
 
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/platform.sh
+. "$bundle/scripts/platform.sh"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
 launcher="$bin_directory/ghd"
@@ -26,6 +28,12 @@ duty_agents=()
 service_path="$bin_directory:$HOME/go/bin:$HOME/.cargo/bin:$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 acpx_path=acpx
 daemon_path="$service_path"
+# On Arch and Omarchy, read-only login, gh-dash, and Node.js checks run your shell's PATH (and the Node.js checks the
+# daemon's) behind these prefixes (a private directory and a colon; empty elsewhere), each from its own PATH: see
+# link_configuring_launchers.
+shell_probes=''
+daemon_probes=''
+probe_directory=''
 stage=''
 backup=''
 launcher_stage=''
@@ -43,15 +51,15 @@ notice() {
 }
 
 consent() {
-	local answer status=0
+	local answer gum status=0
 	notice "$1"
 	if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
 		notice 'Consent pending: rerun make setup in an interactive terminal. No approval was assumed.'
 		return 1
 	fi
-	if gum_is_suitable; then
+	if gum_is_suitable && gum="$(gum_command)"; then
 		# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-		GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false 'Proceed?' || status=$?
+		GUM_CONFIRM_TIMEOUT=0 MISE_OFFLINE=1 "$gum" confirm --default=false 'Proceed?' || status=$?
 		[ "$status" -ne 0 ] || return 0
 		if [ "$status" -eq 130 ]; then
 			notice 'Cancelled; setup stopped without this change.'
@@ -83,6 +91,7 @@ cleanup() {
 	fi
 	[ -z "$stage" ] || rm -rf -- "$stage"
 	[ -z "$launcher_stage" ] || rm -f -- "$launcher_stage"
+	[ -z "$probe_directory" ] || rm -rf -- "$probe_directory"
 	if [ -n "$backup" ] && [ ! -d "$backup/runtime" ]; then
 		rmdir -- "$backup" 2>/dev/null || true
 	fi
@@ -94,32 +103,9 @@ trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 
 detect_platform() {
-	local kernel architecture
-	kernel="$(uname -s)"
-	architecture="$(uname -m)"
-	case "$architecture" in
-	x86_64 | amd64 | arm64 | aarch64) ;;
-	*) die "unsupported architecture: $architecture (supported: x86_64 and arm64)" ;;
-	esac
-	case "$kernel" in
-	Darwin) platform=macos ;;
-	Linux)
-		[ -r /etc/os-release ] || die 'cannot identify Linux distribution; native Ubuntu Server 22.04+ is supported'
-		# This file is host-owned OS metadata, not a user-provided configuration.
-		# shellcheck disable=SC1091
-		. /etc/os-release
-		[ "${ID:-}" = ubuntu ] || die 'unsupported Linux distribution; native Ubuntu Server 22.04+ is supported'
-		case "${VERSION_ID:-}" in
-		[2-9][0-9].*) [ "${VERSION_ID%%.*}" -ge 22 ] || die 'Ubuntu 22.04 or later is required' ;;
-		*) die 'Ubuntu 22.04 or later is required' ;;
-		esac
-		if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
-			die 'WSL is outside this distribution; use native Ubuntu Server or macOS'
-		fi
-		platform=ubuntu
-		;;
-	*) die "unsupported operating system: $kernel (supported: macOS and native Ubuntu Server)" ;;
-	esac
+	platform="$(mf_detect_platform)" || die "$platform"
+	[ "$platform" != omarchy ] ||
+		notice 'Omarchy detected: Omarchy keeps its packages, mise tools (including its lazy gh, agent CLIs, and Node.js), and Herdr; setup reuses them and changes no Omarchy defaults, shell, or desktop settings.'
 }
 
 check_destinations() {
@@ -308,19 +294,42 @@ git_is_suitable() {
 	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
+# The Gum setup runs. On Arch and Omarchy, a mise launcher whose Gum is not installed yet never runs (it would install
+# Gum first), and one that runs mise use runs as the installed Gum it would run, so neither a check nor a confirmation
+# installs Gum or writes your global mise configuration before you approve anything.
+gum_command() {
+	local tool
+	command -v gum >/dev/null 2>&1 || return 1
+	case "$platform" in
+	arch | omarchy)
+		[ -z "$(mf_lazy_pending gum)" ] || return 1
+		tool="$(mf_configuring_launcher_tool gum)" || {
+			[ "$?" -ne 2 ] || return 1
+			tool=gum
+		}
+		printf '%s\n' "$tool"
+		;;
+	*) printf 'gum\n' ;;
+	esac
+}
+
 # Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
 gum_is_suitable() {
-	command -v gum >/dev/null 2>&1 || return 1
-	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+	local gum
+	gum="$(gum_command)" || return 1
+	MISE_OFFLINE=1 "$gum" --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 gh_is_suitable() {
+	local probe
 	command -v gh >/dev/null 2>&1 || return 1
-	gh --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 47))}'
+	# A launcher that runs mise use would write your global mise configuration: check the tool it runs instead.
+	probe="$(mf_configuring_launcher_tool gh)" || probe=gh
+	MISE_OFFLINE=1 "$probe" --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 47))}'
 }
 
 install_dependencies() {
-	local command_name package proposal
+	local command_name package proposal hint
 	local packages=()
 	local installs=() upgrades=() reinstalls=()
 	for command_name in bash awk sed grep tr mkdir rmdir rm date chmod sleep nohup stat env mktemp cp mv cat dirname uname id; do
@@ -366,7 +375,7 @@ install_dependencies() {
 				die "dependencies pending: ${packages[*]}"
 			fi
 		fi
-	else
+	elif [ "$platform" = ubuntu ]; then
 		[ -r /etc/ssl/certs/ca-certificates.crt ] || packages[${#packages[@]}]=ca-certificates
 		if [ "${#packages[@]}" -gt 0 ]; then
 			command -v sudo >/dev/null 2>&1 || die 'sudo is required to install missing Ubuntu packages; ask the host administrator'
@@ -387,10 +396,17 @@ install_dependencies() {
 				die 'GitHub CLI installation pending'
 			fi
 		fi
+	else
+		install_arch_dependencies "${packages[@]+"${packages[@]}"}"
 	fi
+	install_lazy_tools
 	python_is_suitable || die 'python3 still resolves to a version below 3.9; fix PATH to use the installed Python and rerun'
 	git_is_suitable || die 'git must be version 2.29 or later; fix PATH to the suitable installation and rerun'
-	gh_is_suitable || die 'gh must be version 2.47 or later; fix PATH to the suitable installation and rerun'
+	if ! gh_is_suitable; then
+		# Omarchy's gh is never replaced by a package above; its owner repairs it.
+		[ "$platform" != omarchy ] || die "$(command -v gh) cannot run or is not GitHub CLI 2.47+; $(repair_hint gh), then rerun make setup"
+		die 'gh must be version 2.47 or later; fix PATH to the suitable installation and rerun'
+	fi
 	gum_is_suitable || die "gum 0.15 or later is required; fix PATH (an unrelated gum may shadow it: $(command -v gum || printf 'none found')) and rerun"
 	select_role_agents
 	# All three agent CLIs are baseline, so any role can switch later without another install;
@@ -398,6 +414,9 @@ install_dependencies() {
 	install_tools codex claude cursor-agent herdr no-mistakes
 	# Any installed release with the stable interface is reused, including a newer prerelease; only an older one is updated.
 	if ! no_mistakes_is_suitable; then
+		if hint="$(managed_update_hint no-mistakes)"; then
+			die "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--base-branch/--yes interface used by issue I, and its native updater would compete with its manager: $hint; then rerun make setup"
+		fi
 		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--base-branch/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
 			no-mistakes update || die 'no-mistakes update did not complete; resolve its reported blocker (for example wait for active runs to finish) and rerun make setup'
 		else
@@ -407,10 +426,161 @@ install_dependencies() {
 	fi
 }
 
+# Arch and Omarchy: official packages only (python provides python3, github-cli provides gh), batched into one
+# transaction. Arch does not support partial upgrades, so on ordinary Arch that transaction is a full
+# sudo pacman -Syu --needed; Omarchy's own route, omarchy pkg add, installs from its current package databases.
+install_arch_dependencies() {
+	local name gh_path gum_path
+	local packages=()
+	for name in "$@"; do
+		case "$name" in
+		python3) packages+=(python) ;;
+		*) packages+=("$name") ;;
+		esac
+	done
+	# The native installers unpack with gzip, part of Arch's base like their other tools.
+	command -v gzip >/dev/null 2>&1 || packages+=(gzip)
+	[ -r /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
+	# A mise-managed Gum, like a mise-managed gh below, is installed through mise (never run before that), not
+	# replaced by a competing gum package.
+	gum_path="$(command -v gum 2>/dev/null)" || gum_path=''
+	if [ -z "$gum_path" ] || ! mf_is_mise_launcher "$gum_path"; then
+		gum_is_suitable || packages+=(gum)
+	fi
+	# A mise-managed gh (Omarchy's lazy gh, or your own) is installed through mise below, and is never run before
+	# that; a github-cli package would compete with it. Omarchy owns its gh even when the launcher is missing, so
+	# setup never falls back to a github-cli package there (a restored launcher would shadow it).
+	gh_path="$(command -v gh 2>/dev/null)" || gh_path=''
+	if [ "$platform" = omarchy ]; then
+		[ -n "$gh_path" ] ||
+			die "gh is missing, but Omarchy provides GitHub CLI as a lazy mise tool and setup never installs a competing github-cli package. Restore Omarchy's launcher (mise install gh, mise reshim, or Restore Preinstalls in the Omarchy menu), or install your own GitHub CLI 2.47+ on PATH and add gh to disable_tools in ~/.config/mise/config.toml; then rerun make setup"
+	elif [ -z "$gh_path" ] || ! mf_is_mise_launcher "$gh_path"; then
+		gh_is_suitable || packages+=(github-cli)
+	fi
+	# Omarchy ships Herdr as its herdr package; ordinary Arch keeps Herdr's native installer.
+	[ "$platform" != omarchy ] || command -v herdr >/dev/null 2>&1 || packages+=(herdr)
+	# A missing Node.js (or the npm a pacman Node.js lacks) joins a transaction that is needed anyway;
+	# install_node offers it on its own otherwise.
+	if [ "$platform" = arch ] && [ "${#packages[@]}" -gt 0 ]; then
+		if ! command -v node >/dev/null 2>&1; then
+			packages+=(nodejs npm)
+		elif arch_npm_missing; then
+			packages+=(npm)
+		fi
+	fi
+	[ "${#packages[@]}" -gt 0 ] || return 0
+	command -v sudo >/dev/null 2>&1 ||
+		die "sudo is required to install missing Arch packages (${packages[*]}); as root, install sudo and allow your user to use it, then rerun make setup"
+	if [ "$platform" = omarchy ]; then
+		consent "Install missing packages with Omarchy's package route, omarchy pkg add ${packages[*]}? It runs sudo pacman -S --needed from Omarchy's current package databases; no system upgrade, Omarchy update, or other change." ||
+			die "dependencies pending: ${packages[*]}"
+		"$mf_omarchy" pkg add "${packages[@]}" ||
+			die "omarchy pkg add ${packages[*]} did not complete; resolve the problem it reported (if a package could not be retrieved, update the system with omarchy update first), then rerun make setup"
+	else
+		consent "Run sudo pacman -Syu --needed ${packages[*]}? WARNING: this also upgrades every installed package (a full system upgrade), because Arch does not support partial upgrades; review pacman's transaction before confirming it." ||
+			die "dependencies pending: ${packages[*]}"
+		sudo pacman -Syu --needed "${packages[@]}" ||
+			die "sudo pacman -Syu --needed ${packages[*]} did not complete; resolve the problem pacman reported (for example its keyring, a mirror, or a file conflict; never force it with --overwrite or refresh with -Sy alone), then rerun make setup"
+	fi
+	hash -r
+}
+
+# gh, Gum, the agent CLIs, and Node.js may be lazy mise tools (Omarchy's, or your own mise's on Arch) whose launchers
+# install them on first run. Setup asks first, installs only these through mise, each as its launcher requests it (in
+# this directory as the later probes select them, or the exact version a launcher names), and runs none of them before
+# that; other lazy tools are left alone.
+install_lazy_tools() {
+	local name request required='' remaining
+	local requests=()
+	case "$platform" in arch | omarchy) ;; *) return 0 ;; esac
+	resolve_daemon_path
+	while IFS=$'\t' read -r name request; do
+		contains "$request" "${requests[@]+"${requests[@]}"}" || requests+=("$request")
+		case "$name" in node | npm) ;; *) required="$required $name" ;; esac
+	done < <(lazy_tools_pending)
+	[ "${#requests[@]}" -gt 0 ] || return 0
+	if consent "Your mise configuration (on Omarchy, Omarchy's) provides ${requests[*]} as lazy mise tools that install on first use. Install them now with mise install ${requests[*]}? mise installs the versions its configuration selects here, or the exact version a launcher requests (Omarchy's own hook may add each agent's Herdr integration); other lazy tools, your mise configuration, and Omarchy's default agent stay unchanged."; then
+		"$(mf_mise_command)" install "${requests[@]}" ||
+			die "mise install ${requests[*]} did not complete; resolve the problem mise reported (for example network access), then rerun make setup"
+		hash -r
+		# Each launcher must now find the tool it requests, read offline as before; nothing changes mise's configuration.
+		remaining="$(lazy_tools_pending | cut -f1 | awk '!seen[$0]++' | tr '\n' ' ')"
+		[ -z "$remaining" ] ||
+			die "mise install did not provide: $remaining; repair it with mise or omarchy update, then rerun make setup"
+	elif [ -n "$required" ]; then
+		# A declined Node.js alone is reported later as a remaining action, as on other platforms.
+		die "lazy mise tools pending:$required; rerun make setup in a terminal to install them with mise install ${requests[*]}"
+	fi
+}
+
+# NAME<TAB>REQUEST for each named command that PATH (the first argument) finds as a lazy mise launcher whose tool is not
+# installed yet, where REQUEST is what mise install installs for it (see mf_launcher_install_request).
+lazy_requests() {
+	local PATH="$1" name request
+	shift
+	while IFS= read -r name; do
+		request="$(mf_launcher_install_request "$name" "$(command -v "$name")")" || request="$name"
+		printf '%s\t%s\n' "$name" "$request"
+	done < <(mf_lazy_pending "$@")
+}
+
+# The required lazy tools from your shell's PATH, and Node.js as the No-Mistakes daemon's PATH resolves it.
+lazy_tools_pending() {
+	lazy_requests "$PATH" gh gum codex claude cursor-agent node npm
+	lazy_requests "$daemon_path" node
+}
+
+# How to repair an installed tool that cannot run, by its owner; setup never replaces a managed installation.
+repair_hint() {
+	local path owner
+	path="$(command -v "$1")"
+	if [ "$platform" = omarchy ] && mf_is_mise_launcher "$path"; then
+		printf 'Omarchy manages it with mise: repair it with mise install %s or omarchy update' "$1"
+	elif mf_is_mise_launcher "$path"; then
+		printf 'mise manages it: repair it with mise install %s' "$1"
+	elif owner="$(mf_pacman_owner "$path")"; then
+		printf 'it belongs to pacman package %s: reinstall that package with sudo pacman -S %s' "$owner" "$owner"
+	else
+		printf 'repair it using its native installer'
+	fi
+}
+
+# How to update a tool its manager owns (mise, or a pacman package), as make update reports; fails for any other
+# installation. Setup never runs a native updater over a managed installation.
+managed_update_hint() {
+	local path real owner
+	path="$(command -v "$1")" || return 1
+	real="$(readlink -f -- "$path" 2>/dev/null)" || real="$path"
+	if mf_is_mise_launcher "$path" || [[ "$real" == */mise/installs/* ]]; then
+		if [ "$platform" = omarchy ]; then
+			printf 'Omarchy manages it with mise: update it with omarchy update'
+		else
+			printf 'mise manages it: update it with mise (for example mise upgrade %s)' "$1"
+		fi
+	elif owner="$(mf_pacman_owner "$real")" || owner="$(mf_pacman_owner "$path")"; then
+		if [ "$platform" = omarchy ]; then
+			printf 'it belongs to pacman package %s, which omarchy update updates' "$owner"
+		else
+			printf 'it belongs to pacman package %s: update it with a full system upgrade (sudo pacman -Syu), or for an AUR package the way you installed it' "$owner"
+		fi
+	else
+		return 1
+	fi
+}
+
 install_tools() {
-	local command_name installer directory
+	local command_name installer directory probe
 	for command_name in "$@"; do
 		if ! command -v "$command_name" >/dev/null 2>&1; then
+			# Omarchy owns Herdr (its herdr package, offered above) and the agent CLIs (lazy mise tools).
+			if [ "$platform" = omarchy ]; then
+				case "$command_name" in
+				herdr) die 'herdr is missing; Omarchy ships it as its herdr package: run omarchy pkg add herdr, then rerun make setup' ;;
+				codex | claude | cursor-agent)
+					die "$command_name is missing, but Omarchy provides it as a lazy mise tool and setup never installs a competing copy. Restore Omarchy's launcher (mise reshim, or Restore Preinstalls in the Omarchy menu), or install your own copy and add it to disable_tools in ~/.config/mise/config.toml; then rerun make setup"
+					;;
+				esac
+			fi
 			case "$command_name" in
 			codex) installer='https://chatgpt.com/codex/install.sh'; directory="${CODEX_HOME:-$HOME/.codex}" ;;
 			herdr) installer='https://herdr.dev/install.sh'; directory="$bin_directory" ;;
@@ -424,14 +594,23 @@ install_tools() {
 				die "$command_name installation pending"
 			fi
 		fi
-		"$command_name" --version >/dev/null 2>&1 || die "$command_name is installed but cannot run; repair it using its native installer"
+		# A launcher that runs mise use would write your global mise configuration: check the tool it runs instead,
+		# and never run one whose tool is not installed (it would install it first).
+		probe="$(mf_configuring_launcher_tool "$command_name")" || {
+			[ "$?" -ne 2 ] ||
+				die "$command_name is a mise launcher whose tool is not installed yet; $(repair_hint "$command_name"), then rerun make setup"
+			probe="$command_name"
+		}
+		MISE_OFFLINE=1 "$probe" --version >/dev/null 2>&1 || die "$command_name is installed but cannot run; $(repair_hint "$command_name")"
 	done
 }
 
 # A capability check, not a version floor: stable releases document axi run --intent, --base-branch, and --yes.
 no_mistakes_is_suitable() {
-	local help flag pattern
-	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 no-mistakes axi run --help 2>/dev/null)" || return 1
+	local help flag pattern probe
+	# As in install_tools: a launcher that runs mise use is checked as the tool it runs.
+	probe="$(mf_configuring_launcher_tool no-mistakes)" || probe=no-mistakes
+	help="$(MISE_OFFLINE=1 NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$probe" axi run --help 2>/dev/null)" || return 1
 	for flag in --intent --base-branch --yes; do
 		# An exact flag: --intent-file alone is not the stable interface.
 		pattern="${flag}([^[:alnum:]_-]|\$)"
@@ -534,6 +713,7 @@ install_bundle() {
 	local input source relative quoted
 	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config bin/nm-config gh-dash/config.yml no-mistakes/config.yaml
 		scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py scripts/nm_config.py
+		scripts/platform.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh
@@ -558,7 +738,7 @@ install_bundle() {
 			;;
 		esac
 	done
-	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
+	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/platform.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
 	# ghd update reads this clone path as data; it is published (or rolled back) with the runtime.
 	printf '%s\n' "$bundle" >"$stage/.mini-factory-clone"
@@ -625,26 +805,56 @@ install_optional_launcher() {
 
 agent_is_authenticated() {
 	case "$1" in
-	claude) claude auth status >/dev/null 2>&1 ;;
-	codex) codex login status >/dev/null 2>&1 ;;
+	claude) MISE_OFFLINE=1 PATH="$shell_probes$PATH" claude auth status >/dev/null 2>&1 ;;
+	codex) MISE_OFFLINE=1 PATH="$shell_probes$PATH" codex login status >/dev/null 2>&1 ;;
 	# Cursor's status exits 0 while logged out; read only its boolean, never display it.
-	cursor) cursor-agent status --format json 2>/dev/null | jq -e '.isAuthenticated == true' >/dev/null 2>&1 ;;
+	cursor) MISE_OFFLINE=1 PATH="$shell_probes$PATH" cursor-agent status --format json 2>/dev/null | jq -e '.isAuthenticated == true' >/dev/null 2>&1 ;;
 	esac
 }
 
+# Whether the named command is a mise launcher whose tool is unavailable to setup's login, gh-dash, and Herdr checks
+# (through shell_probes): one not installed yet, or one that runs mise use whose installed tool has no probe there.
+# Running it would install its tool or write your global mise configuration (replacing the version you selected), so
+# neither a check nor an action you approve runs it; it stays pending.
+shell_tool_unavailable() {
+	[ -n "$shell_probes" ] && [ ! -e "${shell_probes%:}/$1" ] || return 1
+	[ -z "$(mf_lazy_pending "$1")" ] || return 0
+	mf_configuring_launcher_tool "$1" >/dev/null || [ "$?" -eq 2 ]
+}
+
+# Runs a login, extension, or integration installation you approved with the installed tool that setup's checks ran: a
+# launcher that runs mise use runs as the tool it would run, with the environment mise gives it (such as GH_CONFIG_DIR;
+# see link_configuring_launchers), so your mise configuration and the version it selects stay unchanged, and mise stays
+# offline, so no mise launcher updates its tool first. The tool itself runs as usual (its browser or device login, or gh
+# fetching the extension).
+run_approved() {
+	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$@"
+}
+
+# The reason a pending action waits for a command that shell_tool_unavailable reports.
+unavailable_reason() {
+	printf '%s is a mise launcher whose tool is unavailable, which setup never runs; %s, then rerun make setup' \
+		"$(command -v "$1")" "$(repair_hint "$1")"
+}
+
 login_agent() {
-	local kind="$1" command_text detail
+	local kind="$1" command_name command_text detail
 	case "$kind" in
-	claude) command_text='claude auth login'; detail='Open its URL in a browser on this or another machine.' ;;
-	codex) command_text='codex login --device-auth'; detail='Enable device-code login in ChatGPT security settings/workspace permissions first, then use a browser on this or another machine.' ;;
-	cursor) command_text='cursor-agent login'; detail='On a headless server set NO_OPEN_BROWSER=1 and open its URL in a browser on another machine.' ;;
+	claude) command_name=claude; command_text='claude auth login'; detail='Open its URL in a browser on this or another machine.' ;;
+	codex) command_name=codex; command_text='codex login --device-auth'; detail='Enable device-code login in ChatGPT security settings/workspace permissions first, then use a browser on this or another machine.' ;;
+	cursor) command_name=cursor-agent; command_text='cursor-agent login'; detail='On a headless server set NO_OPEN_BROWSER=1 and open its URL in a browser on another machine.' ;;
 	esac
+	if shell_tool_unavailable "$command_name"; then
+		notice "Remaining action: $command_text, once it can run: $(unavailable_reason "$command_name")"
+		pending=1
+		return 0
+	fi
 	agent_is_authenticated "$kind" && return 0
 	if consent "$kind authentication is pending. Run $command_text now? $detail Authentication stays in the native CLI; do not paste credentials here."; then
 		case "$kind" in
-		claude) claude auth login || pending=1 ;;
-		codex) codex login --device-auth || pending=1 ;;
-		cursor) cursor-agent login || pending=1 ;;
+		claude) run_approved claude auth login || pending=1 ;;
+		codex) run_approved codex login --device-auth || pending=1 ;;
+		cursor) run_approved cursor-agent login || pending=1 ;;
 		esac
 	else
 		notice "Remaining action: $command_text"
@@ -660,12 +870,43 @@ node_version_is_suitable() {
 # Your shell's node and npm install acpx.
 node_is_suitable() {
 	command -v node >/dev/null 2>&1 &&
-		node --version 2>/dev/null | node_version_is_suitable
+		MISE_OFFLINE=1 PATH="$shell_probes$PATH" node --version 2>/dev/null | node_version_is_suitable
+}
+
+resolve_daemon_path() {
+	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
+	[ -n "$daemon_path" ] || daemon_path="$service_path"
+}
+
+# The lazy launchers among the named commands as the No-Mistakes daemon's PATH resolves them.
+daemon_lazy_pending() {
+	local PATH="$daemon_path"
+	mf_lazy_pending "$@"
 }
 
 # acpx starts the node that the daemon's PATH finds first, whichever node your shell finds.
 daemon_node_is_suitable() {
-	env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null | node_version_is_suitable
+	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'node --version' 2>/dev/null | node_version_is_suitable
+}
+
+# Places, in a new directory (the first argument), a probe for each named command's launcher that PATH (the second
+# argument) finds and that runs mise use, and so writes your global mise configuration every run: the installed tool it
+# would run, with the environment mise gives it (see mf_link_configuring_launchers), as doctor's probes and update's
+# discovery present them. Every other command is unchanged, as is such a launcher whose tool is not installed: setup's
+# lazy mise tool checks have already stopped or reported it.
+link_configuring_launchers() {
+	local directory="$1" path="$2"
+	shift 2
+	mkdir -- "$directory"
+	PATH="$path" mf_link_configuring_launchers "$directory" "$@" >/dev/null
+}
+
+# Runs your shell's npm for its global prefix and the acpx installation you approve, as the read-only checks run it: a
+# launcher that runs mise use runs as its probe (see link_configuring_launchers), so npm gets the environment mise gives
+# it (such as a registry from mise's [env]) but not that mise use, which writes your global mise configuration; that
+# mise runs offline, so it installs or updates nothing.
+shell_npm() {
+	PATH="$shell_probes$PATH" npm "$@"
 }
 
 # madison lists repository-provided versions only (as for Gum); any configured source counts, such as NodeSource.
@@ -676,45 +917,119 @@ node_in_apt_sources() {
 	} END { exit !found }'
 }
 
-# Only a missing Node.js is installed; an existing one (system, Homebrew, fnm, nvm, ...) is never replaced.
+# Arch packages npm separately from nodejs: a pacman Node.js without npm gets Arch's npm package. Any other
+# Node.js (nvm, fnm, mise, ...) gets guidance only, as Arch's npm would add a competing system Node.js.
+arch_npm_missing() {
+	local path real
+	[ "$platform" = arch ] || return 1
+	! command -v npm >/dev/null 2>&1 || return 1
+	path="$(command -v node 2>/dev/null)" || return 1
+	! mf_is_mise_launcher "$path" || return 1
+	real="$(readlink -f -- "$path" 2>/dev/null)" || real="$path"
+	mf_pacman_owner "$real" >/dev/null || mf_pacman_owner "$path" >/dev/null
+}
+
+# Only a missing Node.js (or a pacman Node.js's missing npm) is installed; an existing one (system, Homebrew,
+# fnm, nvm, mise, ...) is never replaced.
+# Omarchy's Node.js is its lazy mise tool, offered with the other lazy tools; setup never adds one to mise itself.
 install_node() {
-	if [ "$platform" = macos ]; then
+	case "$platform" in
+	macos)
 		command -v brew >/dev/null 2>&1 || return 1
 		consent 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+. Install it with brew install node? No general brew update/upgrade or shell edits.' ||
 			return 1
 		HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install node || return 1
-	else
+		;;
+	ubuntu)
 		command -v sudo >/dev/null 2>&1 && node_in_apt_sources || return 1
 		consent 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+, which your configured apt sources offer. Run sudo apt-get install --no-install-recommends nodejs, then the same for npm only if nodejs does not provide it? This changes system packages.' ||
 			return 1
 		sudo apt-get install -y --no-install-recommends nodejs || return 1
 		hash -r
 		command -v npm >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends npm || return 1
-	fi
+		;;
+	arch)
+		command -v sudo >/dev/null 2>&1 || return 1
+		if command -v node >/dev/null 2>&1; then
+			arch_npm_missing || return 1
+			consent "npm is missing beside your pacman Node.js; acpx, the ACP runner No-Mistakes uses for Cursor, is installed with npm. Run sudo pacman -Syu --needed npm? WARNING: this also upgrades every installed package (a full system upgrade), because Arch does not support partial upgrades; review pacman's transaction before confirming it." ||
+				return 1
+			sudo pacman -Syu --needed npm || return 1
+			hash -r
+			return 0
+		fi
+		consent "Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+. Run sudo pacman -Syu --needed nodejs npm? WARNING: this also upgrades every installed package (a full system upgrade), because Arch does not support partial upgrades; review pacman's transaction before confirming it." ||
+			return 1
+		sudo pacman -Syu --needed nodejs npm || return 1
+		;;
+	*) return 1 ;;
+	esac
 	hash -r
 }
 
+# acpx_path runs verbatim, which no PATH prefix redirects: a launcher that runs mise use, found from the daemon's PATH,
+# is checked as the installed tool it would run, and one whose tool is not installed does not run, nor does any other
+# lazy mise launcher (such as mise's shim) whose tool is not installed yet (status 2).
 acpx_runs_for_daemon() {
-	[ -n "$acpx_path" ] || return 1
+	local acpx="$acpx_path"
+	[ -n "$acpx" ] || return 1
+	if [ -n "$daemon_probes" ]; then
+		[ -z "$(daemon_lazy_pending "$acpx_path")" ] || return 2
+		acpx="$(PATH="$daemon_path" mf_configuring_launcher_tool "$acpx_path")" || {
+			[ "$?" -ne 2 ] || return 2
+			acpx="$acpx_path"
+		}
+	fi
+	# A failing acpx is an ordinary failure, whatever its status; status 2 stays for the mise launcher above.
 	# shellcheck disable=SC2016 # Expanded by the child shell with the daemon's PATH.
-	env PATH="$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx_path"
+	env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1' sh "$acpx" || return 1
+}
+
+# The acpx your shell's PATH finds, checked as acpx_runs_for_daemon checks the daemon's: a launcher that runs mise use
+# is checked as the installed tool it would run, and a lazy mise launcher whose tool is not installed does not run
+# (status 2).
+acpx_runs_for_shell() {
+	local acpx=acpx
+	command -v acpx >/dev/null 2>&1 || return 1
+	if [ -n "$shell_probes" ]; then
+		[ -z "$(mf_lazy_pending acpx)" ] || return 2
+		acpx="$(mf_configuring_launcher_tool acpx)" || {
+			[ "$?" -ne 2 ] || return 2
+			acpx=acpx
+		}
+	fi
+	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$acpx" --version >/dev/null 2>&1 || return 1
 }
 
 # Node.js 22.13+, npm, and acpx are baseline: No-Mistakes runs Cursor (cursor or acp:cursor, as the
 # pipeline agent or any review role) through acpx, so choosing Cursor later needs no new install.
 ensure_node_and_acpx() {
-	local prefix found daemon_node
+	local prefix found daemon_node status=0
 	local npm_arguments=(install -g acpx@latest)
-	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
-	[ -n "$daemon_path" ] || daemon_path="$service_path"
-	command -v node >/dev/null 2>&1 || install_node || true
+	resolve_daemon_path
+	# A lazy mise Node.js installs itself when run (acpx runs it too), so nothing below may run it first.
+	if { [ "$platform" = arch ] || [ "$platform" = omarchy ]; } && [ -n "$(mf_lazy_pending node npm)$(daemon_lazy_pending node)" ]; then
+		notice "Remaining action: Node.js, a lazy mise tool, is not installed yet; acpx, the ACP runner No-Mistakes uses for Cursor, needs it from your shell and from the No-Mistakes daemon's PATH $daemon_path. Rerun make setup in a terminal and accept mise install node (or run it yourself), then rerun make doctor."
+		pending=1
+		return 0
+	fi
+	if ! command -v node >/dev/null 2>&1 || arch_npm_missing; then
+		install_node || true
+	fi
+	# An installed node or npm launcher that runs mise use is checked as the tool it would run, which your shell's
+	# PATH (see configure_native_tools) and the daemon's each resolve on their own; messages still name what that PATH
+	# finds.
+	if [ -n "$probe_directory" ]; then
+		link_configuring_launchers "$probe_directory/daemon" "$daemon_path" node npm
+		daemon_probes="$probe_directory/daemon:"
+	fi
 	if ! node_is_suitable || ! command -v npm >/dev/null 2>&1; then
 		found='Node.js is missing'
 		if command -v node >/dev/null 2>&1; then
-			found="$(command -v node) is Node.js $(node --version 2>/dev/null || printf 'of unknown version')"
+			found="$(command -v node) is Node.js $(MISE_OFFLINE=1 PATH="$shell_probes$PATH" node --version 2>/dev/null || printf 'of unknown version')"
 			command -v npm >/dev/null 2>&1 || found="$found without npm"
 		fi
-		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
+		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, sudo pacman -Syu --needed nodejs npm on Arch, Omarchy's mise Node.js, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
 		return 0
 	fi
@@ -723,21 +1038,30 @@ ensure_node_and_acpx() {
 		daemon_node="$(env PATH="$daemon_path" /bin/sh -c 'command -v node' 2>/dev/null)" || daemon_node=''
 		found='no Node.js'
 		if [ -n "$daemon_node" ]; then
-			found="$daemon_node, Node.js $(env PATH="$daemon_path" /bin/sh -c 'node --version' 2>/dev/null || printf 'of unknown version')"
+			found="$daemon_node, Node.js $(env MISE_OFFLINE=1 PATH="$daemon_probes$daemon_path" /bin/sh -c 'node --version' 2>/dev/null || printf 'of unknown version')"
 		fi
 		notice "Remaining action: the No-Mistakes daemon's PATH $daemon_path (your login shell's PATH plus well-known directories) finds $found first, but acpx runs with that PATH and needs Node.js 22.13+; your current shell's $(command -v node) does not count. Setup never replaces an existing Node.js or version manager: put a Node.js 22.13+ first on that PATH yourself (for example by activating your version manager's 22.13+ default in your login shell's startup files, or by upgrading the Node.js found there with the tool that installed it), then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
 	fi
 	# An existing acpx the daemon can run (from ~/bin, Homebrew, ... or acpx_path) is reused as is.
-	acpx_runs_for_daemon && return 0
+	acpx_runs_for_daemon || status=$?
+	[ "$status" -ne 0 ] || return 0
 	if [ "$acpx_path" != acpx ]; then
 		# An unreadable acpx_path was already reported.
 		[ -z "$acpx_path" ] || notice "Remaining action: acpx_path $acpx_path in the No-Mistakes config does not run (with the Node.js 22.13+ it needs) from the daemon's PATH $daemon_path. Fix that executable or setting yourself, then rerun make setup."
 		pending=1
 		return 0
 	fi
+	# The daemon's acpx is a mise launcher whose tool is not installed yet: mise provides it there, so setup installs no
+	# competing acpx (which the daemon would not run) and changes no mise configuration.
+	if [ "$status" -eq 2 ]; then
+		notice "Remaining action: $(PATH="$daemon_path" command -v acpx) is a mise launcher whose tool is not installed yet, found first by the No-Mistakes daemon's PATH $daemon_path; running it would install it first (or write your global mise configuration), and setup never installs a competing acpx. Install it with mise yourself, then rerun make setup"
+		pending=1
+		return 0
+	fi
+	status=0
 	if ! command -v acpx >/dev/null 2>&1; then
-		prefix="$(npm prefix -g 2>/dev/null || true)"
+		prefix="$(MISE_OFFLINE=1 shell_npm prefix -g 2>/dev/null || true)"
 		# A global prefix that is root-owned (system Node) or outside the daemon's PATH (such as a per-shell
 		# fnm path) gets a user-owned acpx in $bin_directory instead; npm's configured prefix is never changed.
 		case ":$daemon_path:" in
@@ -746,14 +1070,20 @@ ensure_node_and_acpx() {
 		esac
 		[ -n "$prefix" ] || npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
 		if consent "acpx is the ACP runner No-Mistakes uses for Cursor. Install it with its documented npm ${npm_arguments[*]}?"; then
-			npm "${npm_arguments[@]}" || true
+			# Offline for mise only: a mise npm or Node.js with an auto-update due would otherwise update Node.js first;
+			# npm itself still downloads acpx.
+			MISE_OFFLINE=1 shell_npm "${npm_arguments[@]}" || true
 			PATH="$PATH:$bin_directory"
 			export PATH
 			hash -r
 			acpx_runs_for_daemon && return 0
 		fi
 	fi
-	if ! command -v acpx >/dev/null 2>&1 || ! acpx --version >/dev/null 2>&1; then
+	acpx_runs_for_shell || status=$?
+	if [ "$status" -eq 2 ]; then
+		notice "Remaining action: $(command -v acpx) is a mise launcher whose tool is not installed yet, and running it would install it first (or write your global mise configuration); install it with mise yourself, then rerun make setup"
+		pending=1
+	elif [ "$status" -ne 0 ]; then
 		notice "Remaining action: npm ${npm_arguments[*]} (acpx, the ACP runner No-Mistakes uses for Cursor), then rerun make setup"
 		pending=1
 	else
@@ -775,14 +1105,27 @@ explain_git_transport() {
 }
 
 configure_native_tools() {
-	local codex_directory integration kind description login_arguments login_kinds github_ready=1
-	if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+	local codex_directory integration kind description login_arguments login_kinds github_ready=1 gh_runs=1
+	# Read-only checks, and the logins, gh-dash installation, and Herdr integrations you approve (see run_approved), run
+	# an installed tool, not a launcher that runs mise use (see link_configuring_launchers); other installations you
+	# approve run your commands as before (npm as shell_npm runs it).
+	if [ "$platform" = arch ] || [ "$platform" = omarchy ]; then
+		probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-setup.XXXXXX")"
+		link_configuring_launchers "$probe_directory/shell" "$PATH" gh codex claude cursor-agent node npm herdr
+		shell_probes="$probe_directory/shell:"
+	fi
+	if shell_tool_unavailable gh; then
+		notice "Remaining action: gh auth login --hostname github.com --web and gh extension install dlvhdr/gh-dash, once gh can run: $(unavailable_reason gh)"
+		pending=1
+		github_ready=0
+		gh_runs=0
+	elif ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" gh auth status --hostname github.com >/dev/null 2>&1; then
 		if consent 'GitHub authentication is pending. Run gh auth login --hostname github.com --web now? Follow its native device-code instructions in a browser on this or another machine. Choose Git transport yourself; setup will not configure Git credentials.'; then
 			login_arguments=(auth login --hostname github.com --web)
 			if consent "Optional: also request GitHub's project scope (only for GitHub Projects access)? Ordinary issue and PR actions do not need it."; then
 				login_arguments=(auth login --hostname github.com --web --scopes project)
 			fi
-			gh "${login_arguments[@]}" || { pending=1; github_ready=0; }
+			run_approved gh "${login_arguments[@]}" || { pending=1; github_ready=0; }
 		else
 			notice 'Remaining action: gh auth login --hostname github.com --web'
 			pending=1
@@ -790,9 +1133,9 @@ configure_native_tools() {
 		fi
 	fi
 	[ "$github_ready" -eq 0 ] || explain_git_transport
-	if ! gh dash --version >/dev/null 2>&1; then
+	if [ "$gh_runs" -eq 1 ] && ! MISE_OFFLINE=1 PATH="$shell_probes$PATH" gh dash --version >/dev/null 2>&1; then
 		if consent 'Install the gh-dash extension with gh extension install dlvhdr/gh-dash? Existing gh-dash configuration is preserved; ghd uses the bundled config explicitly.'; then
-			gh extension install dlvhdr/gh-dash || pending=1
+			run_approved gh extension install dlvhdr/gh-dash || pending=1
 		else
 			notice 'Remaining action: gh extension install dlvhdr/gh-dash'
 			pending=1
@@ -812,7 +1155,13 @@ configure_native_tools() {
 	/*) ;;
 	*) die 'CODEX_HOME must be an absolute path before integration installation' ;;
 	esac
-	integration="$(herdr integration status 2>/dev/null || true)"
+	# Herdr's status check, and the integration installations you approve, run Herdr as the login checks run the agents.
+	if shell_tool_unavailable herdr; then
+		notice "Remaining action: herdr integration status, and herdr integration install for each of ${role_agents[*]} it does not report current, once herdr can run: $(unavailable_reason herdr)"
+		pending=1
+		return 0
+	fi
+	integration="$(MISE_OFFLINE=1 PATH="$shell_probes$PATH" herdr integration status 2>/dev/null || true)"
 	# Herdr detects the gh-dash roles' agents through native integrations; No-Mistakes needs none.
 	for kind in "${role_agents[@]}"; do
 		! printf '%s\n' "$integration" | grep -q "^$kind: current " || continue
@@ -836,7 +1185,7 @@ configure_native_tools() {
 		cursor) description="Cursor's user hook files under $HOME/.cursor" ;;
 		esac
 		if consent "Run herdr integration install $kind? This native installer changes $description. Review native trust decisions yourself. Other settings remain owned by their native tools."; then
-			herdr integration install "$kind" || pending=1
+			run_approved herdr integration install "$kind" || pending=1
 		else
 			notice "Remaining action: herdr integration install $kind"
 			pending=1

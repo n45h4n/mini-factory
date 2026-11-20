@@ -5,8 +5,11 @@
 set -euo pipefail
 
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/platform.sh
+. "$bundle/scripts/platform.sh"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
+platform=''
 home=''
 codex_home=''
 upstream=''
@@ -18,6 +21,7 @@ plan_text=''
 plan_detail=''
 plan_manual=''
 plan_path=''
+probe_directory=''
 plan_targets=()
 upgraded=()
 declined=()
@@ -120,14 +124,45 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
+# A launcher script that runs mise use (as omarchy-mise-install's do) writes your global mise configuration every
+# run, even offline once its tool is installed. As in doctor, gh, Gum, npm, and the node acpx starts run behind a
+# private directory with a probe for each such launcher of these tools: the installed tool it would run, with the
+# environment mise gives it (see mf_link_configuring_launchers); it is removed on exit. Such a launcher whose tool is
+# not installed is lazy and gets no probe: discovery reports it and never runs it.
+prepare_probes() {
+	case "$platform" in macos | ubuntu) return 0 ;; esac
+	probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-update.XXXXXX")" ||
+		die 'cannot create a temporary directory for the discovery probes; nothing was changed by them'
+	trap 'rm -rf -- "$probe_directory"' EXIT
+	mf_link_configuring_launchers "$probe_directory" gh gum codex claude cursor-agent node npm >/dev/null
+}
+
+# Runs a command with PATH presented as prepare_probes arranged it.
+probe() {
+	if [ -n "$probe_directory" ]; then
+		PATH="$probe_directory:$PATH" "$@"
+	else
+		"$@"
+	fi
+}
+
+# npm as probe runs it (as setup's shell_npm): a launcher that runs mise use runs as its probe, with the environment
+# mise gives npm (such as a registry from mise's [env]), but without that mise use, and offline for mise, so it installs
+# or updates nothing else.
+probe_npm() {
+	probe npm "$@"
+}
+
+# Discovery probes run offline for mise, whose launchers would otherwise install a due update of their tool
+# (Omarchy's agents auto-update) before running it; offline, they run the installed version.
 tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
-		text="$(gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
+		text="$(MISE_OFFLINE=1 probe gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
 	elif [ "$1" = acpx ] || [ "$1" = node ]; then
-		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$plan_path" --version 2>/dev/null)" || true
+		text="$(MISE_OFFLINE=1 NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 probe "$plan_path" --version 2>/dev/null)" || true
 	else
-		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$1" --version 2>/dev/null)" || true
+		text="$(MISE_OFFLINE=1 NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 probe "$1" --version 2>/dev/null)" || true
 	fi
 	printf '%s\n' "${text%%$'\n'*}"
 }
@@ -148,7 +183,7 @@ plan_package() {
 			;;
 		esac
 	fi
-	if [ "$(uname -s)" = Linux ] && command -v dpkg >/dev/null 2>&1 && owner="$(dpkg -S "$real" 2>/dev/null)"; then
+	if [ "$platform" = ubuntu ] && command -v dpkg >/dev/null 2>&1 && owner="$(dpkg -S "$real" 2>/dev/null)"; then
 		owner="${owner%%: *}"
 		case ", $owner," in
 		*", $package,"* | *", $package:"*)
@@ -173,6 +208,40 @@ plan_package() {
 	[ "$tool" != node ] || plan_manual="$plan_manual (make update never changes a Node version manager, npm prefix, or shell configuration; setup and doctor then check that acpx still runs for the No-Mistakes daemon)"
 }
 
+# Lazy mise launchers (Omarchy's, or your own mise's on Arch) install their tool when run, so discovery never runs
+# one whose tool is not installed yet (nor on an unrecognized platform, such as an incomplete Omarchy installation).
+lazy_pending() {
+	case "$platform" in macos | ubuntu) return 1 ;; esac
+	[ -n "$(mf_lazy_pending "$@")" ]
+}
+
+# The same, for the commands as the No-Mistakes daemon's PATH (the first argument) resolves them.
+daemon_lazy_pending() {
+	local PATH="$1"
+	shift
+	lazy_pending "$@"
+}
+
+# mise- and pacman-managed installations update through their manager (on Omarchy, omarchy update). make update
+# offers neither their native updater, which would install a copy mise does not track, nor a system upgrade.
+plan_managed() {
+	local path="$1" real="$2" owner
+	if mf_is_mise_launcher "$path" || [[ "$real" == */mise/installs/* ]]; then
+		if [ "$platform" = omarchy ]; then
+			plan_manual="$path is managed by mise for Omarchy: omarchy update updates it (mup updates only mise tools); its own updater would install a copy mise does not track"
+		else
+			plan_manual="$path is managed by mise: update it with mise (for example mise upgrade); its own updater would install a copy mise does not track"
+		fi
+		return 0
+	fi
+	owner="$(mf_pacman_owner "$real")" || owner="$(mf_pacman_owner "$path")" || return 1
+	if [ "$platform" = omarchy ]; then
+		plan_manual="$real belongs to pacman package $owner, which omarchy update updates; make update never upgrades system packages"
+	else
+		plan_manual="$real belongs to pacman package $owner: update it with a full system upgrade (sudo pacman -Syu), or for an AUR package the way you installed it; make update never upgrades system packages"
+	fi
+}
+
 # acpx is offered only where setup's npm install puts it: ~/.local, or a writable npm global prefix.
 plan_acpx() {
 	local real="$1" prefix
@@ -180,12 +249,17 @@ plan_acpx() {
 		plan_manual='npm is missing; make setup reports the Node.js/npm action'
 		return 0
 	fi
+	# npm may be a lazy mise launcher even when another provider supplies node; neither its probe nor its update runs it.
+	if lazy_pending npm; then
+		plan_manual='npm, a lazy mise tool, is not installed yet; make setup offers mise install node'
+		return 0
+	fi
 	case "$real" in
 	"$home/.local/lib/node_modules/acpx/"*)
 		plan_targets=(install -g --prefix "$HOME/.local" acpx@latest)
 		;;
 	*)
-		prefix="$(npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
+		prefix="$(MISE_OFFLINE=1 probe_npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
 		case "$real" in
 		"$prefix/lib/node_modules/acpx/"*)
 			if [ ! -w "$prefix/lib/node_modules" ]; then
@@ -212,12 +286,16 @@ plan_gh_dash() {
 		plan_manual='GitHub CLI is missing; make setup installs it and then offers the extension'
 		return 0
 	fi
-	list="$(gh extension list 2>/dev/null)" || true
+	if lazy_pending gh; then
+		plan_manual="GitHub CLI, a lazy mise gh, is not installed yet; make setup offers mise install gh, then the extension"
+		return 0
+	fi
+	list="$(MISE_OFFLINE=1 probe gh extension list 2>/dev/null)" || true
 	if grep -Eq "[[:space:]]dlvhdr/gh-dash([[:space:]]|\$)" <<<"$list"; then
 		plan_kind=extension
 		plan_text='gh extension upgrade dash'
 		plan_detail='the dlvhdr/gh-dash GitHub CLI extension; never --force'
-	elif gh dash --version >/dev/null 2>&1; then
+	elif MISE_OFFLINE=1 probe gh dash --version >/dev/null 2>&1; then
 		plan_manual='gh dash is not the dlvhdr/gh-dash extension; update it the way you installed it'
 	else
 		plan_manual='not installed; make setup offers gh extension install dlvhdr/gh-dash'
@@ -240,7 +318,7 @@ cursor_commands_owned() {
 # Each native updater is offered only for the layout its own installer creates
 # (see install_native_tool in setup.sh) and only when the installed CLI lists it.
 plan_upgrade() {
-	local tool="$1" path real help config acpx daemon_path
+	local tool="$1" path real help config acpx daemon_path provider
 	plan_kind='' plan_text='' plan_detail='' plan_manual='' plan_path=''
 	plan_targets=()
 	if [ "$tool" = gh-dash ]; then
@@ -261,6 +339,11 @@ plan_upgrade() {
 	if [ "$tool" = acpx ] || [ "$tool" = node ]; then
 		[ "$tool" = acpx ] || acpx=node
 		daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
+		# acpx runs node, so neither runs while a lazy mise Node.js is not installed yet.
+		if lazy_pending node || daemon_lazy_pending "$daemon_path" node; then
+			plan_manual="Node.js, a lazy mise tool that acpx runs, is not installed yet; make setup offers mise install node"
+			return 0
+		fi
 		# shellcheck disable=SC2016 # Resolve the executable using the daemon's PATH, not this shell's.
 		if ! path="$(env PATH="$daemon_path" /bin/sh -c 'command -v "$1"' sh "$acpx" 2>/dev/null)"; then
 			if [ "$tool" = node ]; then
@@ -275,8 +358,17 @@ plan_upgrade() {
 		plan_manual='not installed; make setup offers its installer'
 		return 0
 	fi
+	# A mise command wrapper (Omarchy's agent-account wrapper) for a tool mise does not select runs your own
+	# installation behind it, whose owner decides its update.
+	if mf_is_mise_wrapper "$path" && provider="$(mf_wrapper_provider "$tool")"; then
+		path="$provider"
+	fi
 	if ! real="$(physical_path "$path")"; then
 		plan_manual="cannot resolve $path; update it with the tool that installed it"
+		return 0
+	fi
+	# acpx keeps the npm ownership checks of plan_acpx.
+	if [ "$tool" != acpx ] && plan_managed "$path" "$real"; then
 		return 0
 	fi
 	case "$tool" in
@@ -324,7 +416,7 @@ plan_upgrade() {
 		plan_manual="$real is not the native installation that '$tool update' manages; update it with the tool that installed it"
 		return 0
 	fi
-	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$path" --help 2>&1)" || true
+	help="$(MISE_OFFLINE=1 NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$path" --help 2>&1)" || true
 	if ! grep -Eq "^[[:space:]]*(${tool}[[:space:]]+)?update([[:space:]|]|\$)" <<<"$help"; then
 		plan_detail=''
 		plan_manual="the installed $tool does not list an update command; update it with its native installer"
@@ -346,17 +438,23 @@ run_plan() {
 		fi
 		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
-	npm) PATH="$bin_directory:$PATH" npm "${plan_targets[@]}" ;;
-	extension) gh extension upgrade dash ;;
+	# Offline for mise only, as for the extension below: a mise npm or Node.js with an auto-update due would otherwise
+	# update Node.js first; npm itself still downloads acpx.
+	npm) MISE_OFFLINE=1 PATH="$bin_directory:$PATH" probe_npm "${plan_targets[@]}" ;;
+	# Offline for mise only: a mise gh with an auto-update due would otherwise update itself first; gh itself still
+	# fetches the extension.
+	extension) MISE_OFFLINE=1 probe gh extension upgrade dash ;;
 	# Keeping the bin directory on PATH avoids the native installers' profile-editing branches, as in setup.
 	native) PATH="$bin_directory:$PATH" "$plan_path" update ;;
 	esac
 }
 
-# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
+# Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1). Gum runs as probe presents it, and a lazy mise
+# Gum (not installed yet) never runs, so asking installs no Gum and writes no mise configuration before you approve.
 gum_is_suitable() {
 	command -v gum >/dev/null 2>&1 || return 1
-	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+	! lazy_pending gum || return 1
+	MISE_OFFLINE=1 probe gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 offer_upgrade() {
@@ -379,8 +477,9 @@ offer_upgrade() {
 		unasked+=("$tool")
 		return 0
 	fi
-	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline.
-	GUM_CONFIRM_TIMEOUT=0 gum confirm --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
+	# No is the default; any other exit (No, Esc, or a Gum failure) is a decline. The timeout is disabled on the command
+	# line too, which mise's [env] for a Gum probe cannot override.
+	GUM_CONFIRM_TIMEOUT=0 MISE_OFFLINE=1 probe gum confirm --timeout=0s --default=false "Run $plan_text now? It decides itself whether a newer release exists." || status=$?
 	if [ "$status" -eq 130 ]; then
 		notice "  Cancelled; $label was left unchanged and make update stopped before rerunning setup."
 		exit 130
@@ -412,6 +511,7 @@ offer_upgrades() {
 	codex_home="$(physical_path "${CODEX_HOME:-$HOME/.codex}")" || codex_home="${CODEX_HOME:-$HOME/.codex}"
 	notice ''
 	notice '== Optional native tool upgrades (each needs your consent) =='
+	prepare_probes
 	offer_upgrade gh 'GitHub CLI'
 	offer_upgrade gh-dash 'gh-dash extension'
 	offer_upgrade gum 'Gum'
@@ -435,6 +535,8 @@ main() {
 	local setup_status=0
 	[ "$#" -eq 0 ] || die 'usage: scripts/update.sh (run make update)'
 	check_clone
+	# An unsupported platform still fast-forwards (a newer release may support it); setup below reports it.
+	platform="$(mf_detect_platform)" || platform=unsupported
 	notice '== Mini-Factory clone =='
 	fast_forward
 	offer_upgrades
