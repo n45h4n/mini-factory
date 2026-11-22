@@ -33,7 +33,7 @@ ISSUE_BODY = ("Body with \"quotes\", $(touch interpolated-marker), `touch backti
               "Unicode \u2014 stays data.\n")
 
 MOCK = r'''#!PYTHON
-import json, os, pathlib, re, shutil, subprocess, sys
+import json, os, pathlib, re, shutil, subprocess, sys, urllib.parse
 ISSUE_BODY = ISSUE_BODY_LITERAL
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -77,8 +77,7 @@ elif name == "gh":
                                                   or args[:2] == ["api", "repositories/1"]
                                                   or args[:1] == ["api"] and args[1:2] != []
                                                   and args[1].startswith(("repos/friend/target/activity?",
-                                                                          "repos/friend/target/commits/",
-                                                                          "repos/friend/target/compare/"))):
+                                                                          "repos/friend/target/commits/"))):
         # The PR Fixer's GitHub: one pull request for agent/issue-8 whose head follows the remote fixture.
         fixture_file = pathlib.Path(os.environ["MOCK_FIXER_GITHUB"])
         github = json.loads(fixture_file.read_text()) if fixture_file.exists() else {}
@@ -115,12 +114,16 @@ elif name == "gh":
             if os.environ.get("MOCK_GH_COMMENT") == "lost":
                 fail("simulated connection loss after the comment was accepted")
         elif args[1].startswith("repos/friend/target/activity?"):
-            # GitHub's push records of the issue branch, most recent first: pushes is [[sha, timestamp], ...].
-            if args[1:] != ["repos/friend/target/activity?per_page=100&ref=refs%2Fheads%2Fagent%2Fissue-8"]:
+            # GitHub's records of a branch moving, most recent first: for the issue branch pushes is
+            # [[sha, timestamp], ...]; for another ref, ref_tips lists the commits it pointed to.
+            ref = urllib.parse.unquote(args[1].partition("&ref=")[2])
+            if args[2:] or not args[1].startswith("repos/friend/target/activity?per_page=100&ref="):
                 fail("unexpected repository activity request")
-            print(json.dumps([{"id": index, "before": "0" * 40, "after": sha, "ref": "refs/heads/agent/issue-8",
+            pushes = (github.get("pushes", []) if ref == "refs/heads/agent/issue-8"
+                      else [[sha, "2099-01-01T00:00:00Z"] for sha in github.get("ref_tips", {}).get(ref, [])])
+            print(json.dumps([{"id": index, "before": "0" * 40, "after": sha, "ref": ref,
                                "timestamp": at, "activity_type": "push", "actor": {"login": "someone"}}
-                              for index, (sha, at) in enumerate(github.get("pushes", []))]))
+                              for index, (sha, at) in enumerate(pushes)]))
         elif args[:2] == ["api", "repositories/1"]:
             # The repository a ruleset's required workflow file lives in, by its ID.
             print(json.dumps({"id": 1, "full_name": "friend/target"}))
@@ -131,14 +134,6 @@ elif name == "gh":
             if args[2:] or ref not in refs:
                 fail("gh: Not Found (HTTP 404)")
             print(json.dumps({"sha": refs[ref]}))
-        elif args[1].startswith("repos/friend/target/compare/"):
-            # How a commit relates to a later one: history maps a ref's current commit to its earlier commits.
-            base, _, later = args[1][len("repos/friend/target/compare/"):].partition("...")
-            if args[2:] or not later:
-                fail("unexpected commit comparison")
-            status = ("identical" if base == later else "ahead" if base in github.get("history", {}).get(later, [])
-                      else "diverged")
-            print(json.dumps({"status": status, "files": []}))
         elif args[:2] == ["api", "repos/friend/target/branches/feature%2Ffriend"]:
             # Classic branch protection of the captured base, as GitHub shows it to readers.
             contexts = github.get("protected_checks", [])
@@ -1098,11 +1093,14 @@ MAIN_WORKFLOW_COMMIT = "c" * 40  # the commit refs/heads/main names in the mock,
 
 
 def check_run(name, conclusion="SUCCESS", status="COMPLETED", required=True, app="github-actions", completed=None,
-              title="", workflow=None, event="pull_request", pulls=(12,)):
+              title="", workflow=None, event="pull_request", pulls=(12,), suite_result=None):
     """A check run; workflow is the (repository, path[, commit]) of the Actions workflow file whose run, triggered
     by event, reported it, with the commit GitHub links that file at (main's unless given), and pulls are the open
-    pull requests GitHub matches to that run's check suite."""
-    suite = {"app": {"slug": app}, "matchingPullRequests": {"nodes": [{"number": number} for number in pulls]}}
+    pull requests GitHub matches to that run's check suite. The suite (the whole workflow run) has the check run's
+    own status and conclusion unless suite_result gives them, as when other jobs of the run are still to report."""
+    suite_status, suite_conclusion = suite_result or (status, conclusion)
+    suite = {"status": suite_status, "conclusion": suite_conclusion, "app": {"slug": app},
+             "matchingPullRequests": {"nodes": [{"number": number} for number in pulls]}}
     if workflow:
         commit = workflow[2] if len(workflow) > 2 else MAIN_WORKFLOW_COMMIT
         suite["workflowRun"] = {"event": event, "file": {
@@ -3977,8 +3975,9 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, ready))
         self.set_github(issue, checks=[], pr={"number": 12, "mergeable": "CONFLICTING"}, no_ci=False)
         self.assertIn("merge conflict", self.fixer_json(issue, "evidence")["ci"]["trigger_blocker"])
-        # A declared no_ci never waives a bot that has not reviewed this head.
-        self.set_github(issue, comments=[summary], reviews=[], no_ci=True)
+        # A declared no_ci never waives a bot that has not reviewed this head (without a conflict, the missing
+        # CodeRabbit review is the only thing keeping the gate closed).
+        self.set_github(issue, comments=[summary], reviews=[], no_ci=True, pr={"number": 12})
         evidence = self.fixer_json(issue, "evidence")
         self.assertEqual((evidence["ci"]["state"], evidence["bots"]["coderabbit"]["completed"], evidence["ready_gate"]),
                          ("declared-no-ci", False, False))
@@ -4326,6 +4325,19 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 coderabbit = self.fixer_json(issue, "evidence")["bots"]["coderabbit"]
                 self.assertEqual((coderabbit["unresolved_threads"], coderabbit["kept_open_threads"]), (1 - kept, kept))
         self.assertIn("CodeRabbit has 1 unresolved thread(s)", self.pr_fixer(issue, "finish", "ready").stderr)
+        # So does a bot that deletes its reply and posts the same text again after the human's reply.
+        asked = review_thread("coderabbit", "Rename this", number=3, replies=[
+            ("coderabbitai", "Bot", "Still applies."), ("operator", "User", "Why rename it?")])
+        reposted = review_thread("coderabbit", "Rename this", number=3, replies=[
+            ("operator", "User", "Why rename it?"), ("coderabbitai", "Bot", "Still applies.")])
+        reposted["comments"]["nodes"][-1]["url"] = "https://github.com/friend/target/pull/12#discussion_r10"
+        self.set_github(issue, threads=[asked])
+        self.fixer_json(issue, "keep-open", "thread-3", "--reason", "Renamed; the question is human")
+        for thread, kept in ((asked, 1), (reposted, 0)):
+            with self.subTest(reposted=not kept):
+                self.set_github(issue, threads=[thread])
+                coderabbit = self.fixer_json(issue, "evidence")["bots"]["coderabbit"]
+                self.assertEqual((coderabbit["unresolved_threads"], coderabbit["kept_open_threads"]), (1 - kept, kept))
         self.set_github(issue, threads=[question])
         self.assertEqual(self.fixer_json(issue, "evidence")["bots"]["coderabbit"]["kept_open_threads"], 1)
         # The bot raising the finding again in that thread makes it actionable once more.
@@ -4722,6 +4734,9 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 ([pushed, check_run("test", status="IN_PROGRESS", conclusion=None, required=False, workflow=ci_run)],
                  "pending"),
                 ([pushed, check_run("test", conclusion="FAILURE", required=False, workflow=ci_run)], "failing"),
+                # A passing job of a workflow run that failed as a whole (another job failed) is that run's failure.
+                ([pushed, check_run("test", required=False, workflow=ci_run, suite_result=("COMPLETED", "FAILURE"))],
+                 "failing"),
                 ([check_run("test", required=False, workflow=ci_run, event="pull_request_target")], "passing"),
                 ([pushed, check_run("test", required=False, workflow=ci_run)], "passing")):
             with self.subTest(checks=[(check["checkSuite"]["workflowRun"]["event"],
@@ -4747,16 +4762,20 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 ([pinned], [check_run("test", required=False, workflow=ci_run + ("e" * 40,))], None),
                 # A ref that GitHub does not resolve leaves its rule unverified.
                 ([{"path": ci_workflow, "ref": "refs/heads/gone"}], [main], [ci_workflow + "@refs/heads/gone"]),
-                # A run GitHub started while main named an earlier commit still stands after main moves on, but a
-                # pinned commit is exact, and a commit outside main's history is not main's version.
+                # A run GitHub started while main named an earlier commit (as GitHub's activity for main records)
+                # still stands after main moves on, but a pinned commit is exact, and a commit that main never named,
+                # such as release's, is not main's version even if it was merged into main's history.
                 ([ci_workflow], [check_run("test", required=False, workflow=ci_run + ("b" * 40,))], None),
                 ([{"path": ci_workflow, "ref": None, "sha": "c" * 40}],
                  [check_run("test", required=False, workflow=ci_run + ("b" * 40,))], [ci_workflow]),
-                ([ci_workflow], [check_run("test", required=False, workflow=ci_run + ("a" * 40,))],
-                 [ci_workflow + "@refs/heads/main"])):
+                ([ci_workflow], [check_run("test", required=False, workflow=ci_run + ("d" * 40,))],
+                 [ci_workflow + "@refs/heads/main"]),
+                # The workflow run as a whole must succeed: a passing job does not stand for jobs still to report.
+                ([ci_workflow], [check_run("test", required=False, workflow=ci_run,
+                                           suite_result=("IN_PROGRESS", None))], [ci_workflow + "@refs/heads/main"])):
             with self.subTest(rules=rules, checks=checks, unverified=unverified):
                 self.set_github(issue, ruleset_workflows=rules, checks=checks, refs={"heads/release": "d" * 40},
-                                history={"c" * 40: ["b" * 40]})
+                                ref_tips={"refs/heads/main": ["c" * 40, "b" * 40]})
                 evidence = self.fixer_json(issue, "evidence")
                 self.assertEqual((evidence["ci"]["state"], evidence["ci"].get("unverified_required_workflows")),
                                  ("pending" if unverified else "passing", unverified))
@@ -4971,9 +4990,19 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                               "run", result.stderr)
                 self.assertIn("Finish blocked and report the merge conflict", result.stderr)
                 self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
-        # Without one, the spent budget is the accurate verdict.
-        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")], reviews=reviewed, protected_checks=[],
-                        pr={"number": 12})
+        # Without one, a failed required check does not settle CI while another required check is still running: the
+        # verdict waits for it, and the final head with only completed failures is the round limit.
+        running = check_run("test", status="IN_PROGRESS", conclusion=None)
+        self.set_github(issue, checks=[check_run("lint", conclusion="FAILURE"), running], reviews=reviewed,
+                        protected_checks=[], pr={"number": 12})
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertEqual((evidence["ci"]["state"], evidence["ci"].get("required_still_pending"), evidence["settled"]),
+                         ("failing", True, False))
+        result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "A finding remains")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("final permitted round has not been observed yet (waiting on hosted CI)", result.stderr)
+        self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")])
         report = self.fixer_json(issue, "finish", "round-limit", "--reason", "A finding and a failing test remain")
         self.assertEqual((report["result"], report["ci"], report["verified_head"]), ("round limit reached", "failing", final))
 

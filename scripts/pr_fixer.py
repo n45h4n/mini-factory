@@ -726,7 +726,7 @@ CONTEXTS = """contexts(first: 100, after: $endCursor) {
         pageInfo { hasNextPage endCursor }
         nodes { __typename
           ... on CheckRun { name status conclusion title completedAt isRequired(pullRequestNumber: $number)
-            checkSuite { app { slug } matchingPullRequests(first: 2) { nodes { number } }
+            checkSuite { status conclusion app { slug } matchingPullRequests(first: 2) { nodes { number } }
               workflowRun { event file { path repositoryName repositoryFileUrl } } } }
           ... on StatusContext { context state description createdAt isRequired(pullRequestNumber: $number)
             creator { __typename login } } } }"""
@@ -828,14 +828,18 @@ def ref_commit(worktree, repository, ref):
     return sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", sha) else None
 
 
-def ref_contains(worktree, repository, commit, ref_head):
-    """Whether a commit is the ref's current commit or in its history, as GitHub's comparison shows it: a run
-    GitHub started while the ref named that earlier commit still stands for the rule after the ref moves on."""
-    result = gh(worktree, "api", "repos/" + repository + "/compare/" + commit + "..." + ref_head, check=False)
+def ref_tips(worktree, repository, ref):
+    """The commits GitHub's repository activity shows a ref pointing to after each of its latest updates (pushes
+    and merges), or none when GitHub does not show them. Being in the ref's history is not enough: a commit
+    merged into it from another branch was never the version the ref named."""
+    result = gh(worktree, "api", "repos/" + repository + "/activity?per_page=100&ref=" + urllib.parse.quote(ref, safe=""),
+                check=False)
     try:
-        return not result.returncode and json.loads(result.stdout)["status"] in ("identical", "ahead")
-    except (ValueError, KeyError, TypeError):
-        return False
+        activities = json.loads(result.stdout) if not result.returncode else []
+    except ValueError:
+        return set()
+    return {str(activity.get("after")).lower() for activity in activities if isinstance(activities, list)
+            and isinstance(activity, dict) and activity.get("ref") in (ref, "refs/heads/" + ref, "refs/tags/" + ref)}
 
 
 def required_workflows(context, worktree, workflows, contexts, merge_state, number):
@@ -844,15 +848,19 @@ def required_workflows(context, worktree, workflows, contexts, merge_state, numb
     otherwise the workflow's own check runs for this pull request on the head must have reported and passed. A
     rule names a file at a ref (or a pinned commit), and the pull request's own run of the same file can execute
     another version of it, so a run stands for a rule only when GitHub ties its workflow file to the pinned commit,
-    or to the commit the ref names now or named earlier; a matching repository and path alone leave the rule
-    unverified."""
+    or to a commit GitHub's activity shows the ref naming (now or before it moved on); a matching repository and
+    path alone leave the rule unverified. The workflow run itself must have completed successfully: a job that
+    passed says nothing about jobs of the same run that have yet to report."""
     if not workflows or merge_state in ("CLEAN", "HAS_HOOKS"):
         return [], False
-    runs, names, commits, contained, unverified, failed = {}, {}, {}, {}, [], False
+    runs, names, commits, tips, unverified, failed = {}, {}, {}, {}, [], False
     for item in contexts:
         source = workflow_file(item, number) if item.get("__typename") == "CheckRun" else None
         if source:
-            runs.setdefault(source, []).append(check_of(item)[2])
+            suite = item.get("checkSuite") or {}
+            whole = ("pending" if suite.get("status") != "COMPLETED" else
+                     "passing" if suite.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED") else "failing")
+            runs.setdefault(source, []).extend((check_of(item)[2], whole))
     for repository_id, path, ref, pinned in workflows:
         if type(repository_id) is int and repository_id not in names:
             result = gh(worktree, "api", "repositories/" + str(repository_id), check=False)
@@ -871,9 +879,9 @@ def required_workflows(context, worktree, workflows, contexts, merge_state, numb
         for (repository, run_path, run_commit), found in runs.items():
             if not (name and commit and run_commit and (repository, run_path) == (name, path)):
                 continue
-            if run_commit != commit and not exact and (name, run_commit, commit) not in contained:
-                contained[(name, run_commit, commit)] = ref_contains(worktree, name, run_commit, commit)
-            if run_commit == commit or not exact and contained[(name, run_commit, commit)]:
+            if run_commit != commit and not exact and (name, ref) not in tips:
+                tips[(name, ref)] = ref_tips(worktree, name, ref)
+            if run_commit == commit or not exact and run_commit in tips[(name, ref)]:
                 states += found
         if "failing" in states:
             failed = True
@@ -1148,11 +1156,16 @@ def collect_evidence(context, record, worktree, remote):
           "head_reported": commit == head, "mergeable": remote["mergeable"], "merge_state": remote["merge_state"]}
     if unverified:
         ci["unverified_required_workflows"] = unverified
+    # A required check or workflow still to report, whatever else has already failed.
+    outstanding = bool(unverified or missing or any(check["state"] == "pending" for check in relevant))
     if commit != head:
         ci["state"] = "unknown"
     elif workflow_failed or any(check["state"] == "failing" for check in relevant):
         ci["state"] = "failing"
-    elif unverified or missing or any(check["state"] == "pending" for check in relevant):
+        if outstanding:
+            # Failing already, but not settled: the result of what is still running belongs in the final report.
+            ci["required_still_pending"] = True
+    elif outstanding:
         # A required check that has not registered yet is still expected, and a required workflow that GitHub
         # has not shown satisfied for this head is never satisfied by the other checks.
         ci["state"] = "pending"
@@ -1190,9 +1203,9 @@ def mark_inspected(context, evidence):
 
 
 def bot_digest(comments):
-    """A digest of a thread's bot comments, their text included: a new or edited bot comment changes it, while a
-    reply by anyone else does not."""
-    return hashlib.sha256(json.dumps([[comment["author"], comment["body"]] for comment in comments
+    """A digest of a thread's bot comments, their identity and text included: a new, reposted, or edited bot
+    comment changes it, while a reply by anyone else does not."""
+    return hashlib.sha256(json.dumps([[comment["author"], comment.get("url"), comment["body"]] for comment in comments
                                       if comment["bot"]]).encode("utf-8")).hexdigest()
 
 
@@ -1213,7 +1226,7 @@ def summarize(record, evidence, registration_waited):
     """What still has to be observed, and whether the deterministic part of a ready verdict holds."""
     bots, ci = evidence["bots"], evidence["ci"]
     waiting = [bot["label"] + " review" for bot in bots.values() if not bot["completed"]]
-    if ci["state"] in ("pending", "unknown"):
+    if ci["state"] in ("pending", "unknown") or ci.get("required_still_pending"):
         waiting.append("hosted CI")
     elif ci["state"] == "none" and not ci.get("trigger_blocker") and not registration_waited:
         waiting.append("CI check registration")

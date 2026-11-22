@@ -617,7 +617,7 @@ explains non-actionable ones on their threads, and resolves only selected-bot
 threads it addressed or explained; an unresolved selected-bot thread keeps the
 PR from being ready. When a human's reply still awaits an answer, the fixer
 leaves the thread open and records with `keep-open` that its bot finding is
-settled; a later or edited bot comment there makes it actionable again (a
+settled; a later, reposted, or edited bot comment there makes it actionable again (a
 human-only reply does not). It requests a
 re-review (`@coderabbitai review`, `@coderabbitai full review` after a failed,
 cancelled, or configuration-skipped CodeRabbit review, or `@greptileai`) at most
@@ -653,8 +653,10 @@ require (which names a file at a ref or commit, not its checks) keeps CI
 pending until GitHub reports the PR's merge state as clean for that head or that
 file's own run for this PR (a `pull_request` or `pull_request_target` run whose
 check suite GitHub matches to exactly this PR, and whose workflow file GitHub
-links at the rule's pinned SHA, or at the commit its ref names or named
-earlier, so a run is not invalidated when the ref moves on) has passed on the head.
+links at the rule's pinned SHA, or at a commit GitHub's repository activity
+shows its ref naming, now or before it moved on; a commit merely merged into
+the ref's history is not one) has completed successfully on the head, as a
+whole workflow run, not just one of its jobs.
 Rules for the same file at different refs are separate requirements; a run of
 the same file that GitHub does not tie to that commit (such as the PR's own
 version of the file), or a push run with the same check names, never counts. A trusted default-branch
@@ -691,7 +693,8 @@ the branch or holding its custody, no publication since that head was
 checked, and no selected-bot feedback posted or edited since `evidence` or
 `wait` last showed it), **review/CI pending or unverifiable**, **round
 limit reached** (only after the final head's reviews and hosted CI were
-verified; CI still pending, with no registered check, or a pull request with a
+verified, including any required check still running beside one that already
+failed; CI still pending, with no registered check, or a pull request with a
 merge conflict is reported as pending or blocked instead), or **blocked**.
 Ready and round limit are recorded only if, read again just before recording,
 the head, its hosted CI, and the selected bots' reviews and feedback are
