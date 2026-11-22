@@ -4955,13 +4955,16 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         report = self.fixer_json(issue, "finish", "pending", "--reason", "No CI check registered", **bounded)
         self.assertEqual((report["result"], report["ci"], report["rounds"]["remaining"]),
                          ("review/CI pending or unverifiable", "none", 0))
-        # With the final head's CI verified, a merge conflict, not the budget, is what blocks the pull request,
-        # whether its registered checks pass or fail.
+        # A merge conflict, not the budget, is what blocks the pull request, whether its registered checks pass or
+        # fail, a required check has not registered beside them, or the selected bot has not reviewed the head.
         issue, final = spent("verified")
-        for conclusion in ("SUCCESS", "FAILURE"):
-            with self.subTest(conclusion=conclusion):
-                self.set_github(issue, checks=[check_run("test", conclusion=conclusion)],
-                                pr={"number": 12, "mergeable": "CONFLICTING"})
+        reviewed = [bot_review("coderabbit", final, number=2)]
+        for changes in ({"checks": [check_run("test")]}, {"checks": [check_run("test", conclusion="FAILURE")]},
+                        {"checks": [check_run("test")], "protected_checks": ["build"]},
+                        {"checks": [check_run("test")], "reviews": []}):
+            with self.subTest(changes=changes):
+                self.set_github(issue, **dict({"reviews": reviewed, "protected_checks": []}, **changes,
+                                              pr={"number": 12, "mergeable": "CONFLICTING"}))
                 result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "A finding remains")
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("has a merge conflict with feature/friend, so the round limit is not what stopped this "
@@ -4969,7 +4972,8 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertIn("Finish blocked and report the merge conflict", result.stderr)
                 self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
         # Without one, the spent budget is the accurate verdict.
-        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")], pr={"number": 12})
+        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")], reviews=reviewed, protected_checks=[],
+                        pr={"number": 12})
         report = self.fixer_json(issue, "finish", "round-limit", "--reason", "A finding and a failing test remain")
         self.assertEqual((report["result"], report["ci"], report["verified_head"]), ("round limit reached", "failing", final))
 

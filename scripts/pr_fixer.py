@@ -2173,14 +2173,14 @@ def command_finish(context, arguments):
             raise Stop("the final permitted push of " + short(evidence["pending_push"]["commit"]) + " is unconfirmed, "
                        "so its head has not been observed; run push to reconcile or retry that same commit, or "
                        "finish pending or blocked")
-        if not evidence["settled"]:
-            raise Stop("the final permitted round has not been observed yet (waiting on "
-                       + ", ".join(evidence["waiting_on"]) + "); wait for it, or finish pending if it cannot be verified")
         if evidence["ci"]["mergeable"] == "CONFLICTING":
-            # Whatever its CI result, a conflicting pull request is blocked by the conflict, not by the budget.
+            # Whatever its CI or review state, a conflicting pull request is blocked by the conflict, not by the budget.
             raise Stop("the pull request has a merge conflict with " + record["base_branch"] + ", so the round "
                        "limit is not what stopped this run and nothing was recorded. Finish blocked and report the "
                        "merge conflict.")
+        if not evidence["settled"]:
+            raise Stop("the final permitted round has not been observed yet (waiting on "
+                       + ", ".join(evidence["waiting_on"]) + "); wait for it, or finish pending if it cannot be verified")
         if evidence["ci"]["state"] not in ("passing", "failing", "declared-no-ci"):
             # Settled only means nothing more is awaited: no check registered, or a trigger blocker, is still no
             # verified CI result, and that, not the spent budget, is then what is unresolved.
