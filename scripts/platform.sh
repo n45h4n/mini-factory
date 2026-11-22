@@ -332,9 +332,13 @@ mf_link_configuring_launchers() {
 # a launcher's mise x statement where scripts cannot run (see above): through it the installed tool runs without the
 # environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]). Checks still read through it, but
 # no action you approve runs through it, as it could store a login or install a package outside the account or registry
-# your mise environment selects. Only read, never run.
+# your mise environment selects. npm also lacks it through node's link: npm starts the node PATH finds (its
+# #!/usr/bin/env node), unless its own probe's mise x puts mise's node first. Only read, never run.
 mf_probe_lacks_environment() {
-	[ -L "$1/$2" ] && mf_configuring_launcher_request "$2" >/dev/null
+	if [ -L "$1/$2" ] && mf_configuring_launcher_request "$2" >/dev/null; then
+		return 0
+	fi
+	[ "$2" = npm ] && [ -L "$1/node" ] && mf_configuring_launcher_request node >/dev/null
 }
 
 # Prints each named command that PATH resolves to a mise launcher whose tool is not installed yet, so running

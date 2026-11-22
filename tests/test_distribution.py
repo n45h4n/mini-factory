@@ -5665,6 +5665,37 @@ os.execv(executable, [executable, *args])
         self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["auth", "login"]])
         self.assertFalse(self.npm_changes())
         unchanged()
+        # A native npm starts the node PATH finds (#!/usr/bin/env node). With a node launcher that writes your global mise
+        # configuration, npm would run through that node's link without the environment too, so its actions wait as well.
+        npm = self.home / ".local/bin/npm"
+        texts.pop(npm)
+        npm.unlink()
+        shutil.copyfile(self.mock / "mock-cli", npm)
+        npm.chmod(0o755)
+        node = self.home / ".local/bin/node"
+        texts[node] = self.configuring_launcher(node, "node")
+        self.acpx.symlink_to(self.home / ".local/lib/node_modules/acpx/dist/cli.js")
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8)
+        self.assertIn("acpx: manual update only: " + install + " runs npm with the environment mise gives it",
+                      result.stdout)
+        self.assertFalse(self.npm_changes())
+        unchanged()
+        self.acpx.unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: " + install + ", once setup can run npm with the environment mise gives it",
+                      result.stdout)
+        self.assertFalse(self.npm_changes())
+        unchanged()
+        # With probes that can run, node's probe is its launcher's own mise x statement, and the approved installation runs.
+        helper.write_text(original)
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y"))
+        self.assertEqual([c["args"] for c in self.npm_changes()],
+                         [["install", "-g", "--prefix", str(self.home / ".local"), "acpx@latest"]])
+        unchanged()
 
     def test_omarchy_probes_never_trust_a_checkouts_mise_configuration_or_prepare_its_deps(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
