@@ -885,7 +885,9 @@ def required_workflows(context, worktree, workflows, contexts, merge_state, numb
                 states += found
         if "failing" in states:
             failed = True
-        elif not states or "pending" in states:
+        # Tracked apart from a failure: a run with a failed job may still have jobs to report, and CI is not
+        # settled until it has finished.
+        if not states or "pending" in states:
             unverified.append(path + ("@" + ref if isinstance(ref, str) and ref else ""))
     return unverified, failed
 

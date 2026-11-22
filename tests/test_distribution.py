@@ -4780,6 +4780,14 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertEqual((evidence["ci"]["state"], evidence["ci"].get("unverified_required_workflows")),
                                  ("pending" if unverified else "passing", unverified))
         self.set_github(issue, ruleset_workflows=[ci_workflow])
+        # A failed job of a workflow run that is still in progress fails CI, but CI is not settled until the run
+        # finishes, even when none of its jobs is a required check of its own.
+        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE", required=False, workflow=ci_run,
+                                                 suite_result=("IN_PROGRESS", None))])
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertEqual((evidence["ci"]["state"], evidence["ci"].get("required_still_pending"), evidence["settled"]),
+                         ("failing", True, False))
+        self.assertIn("hosted CI", evidence["waiting_on"])
         # The verdict agrees: a same-named push run never makes the pull request ready.
         self.set_github(issue, checks=[pushed])
         self.fixer_json(issue, "evidence")
