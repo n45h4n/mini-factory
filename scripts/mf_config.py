@@ -650,10 +650,13 @@ def edit():
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
     print("Saved: " + str(path))
-    print("Existing Herdr agents keep their original harness and options. Close one (exit the agent in its pane),")
-    print("then press its key again to start a fresh agent with this profile.")
     if role == "pr-fixer":
-        print("Issue branches that already exist keep the PR Fixer settings captured when they were created.")
+        # Captured per branch at enrollment: restarting an existing fixer would not apply them.
+        print("Issue branches that already exist keep the PR Fixer settings captured when they were created;")
+        print("these settings apply to issue branches that Issues I creates from now on.")
+    else:
+        print("Existing Herdr agents keep their original harness and options. Close one (exit the agent in its pane),")
+        print("then press its key again to start a fresh agent with this profile.")
     return 0
 
 

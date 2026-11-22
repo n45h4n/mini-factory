@@ -238,12 +238,18 @@ class Context:
         for directory in (self.state, self.state / "locks"):
             private_directory(directory)
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        # Inside a bounded wait call the lock is awaited no longer than that call's own deadline.
+        bounded = DEADLINE is not None and DEADLINE < deadline
+        deadline = DEADLINE if bounded else deadline
         while True:
             try:
                 os.mkdir(self.lock_directory, 0o700)
                 break
             except FileExistsError:
                 if time.monotonic() >= deadline:
+                    if bounded:
+                        raise Stop("this wait call reached its " + str(CALL_SECONDS) + "-second limit while another "
+                                   "helper held the issue lock, so nothing further was recorded. Run wait again.")
                     raise Stop("the issue operation is locked by another helper; retry shortly. If none is running, "
                                "remove the stale lock manually: " + str(self.lock_directory))
                 time.sleep(0.2)
@@ -337,8 +343,7 @@ def capability_problems():
               (["no-mistakes", "axi", "status", "--help"], (), "No-Mistakes run status (no-mistakes axi status)"),
               (["herdr", "tab", "create", "--help"], ("--workspace", "--cwd", "--label", "--no-focus"),
                "Herdr tab creation in a named workspace (herdr tab create --workspace --cwd --label --no-focus)"),
-              (["herdr", "tab", "list", "--help"], ("--workspace",), "Herdr tab listing (herdr tab list --workspace)"),
-              (["herdr", "pane", "list", "--help"], ("--workspace",), "Herdr pane listing (herdr pane list --workspace)"))
+              (["herdr", "tab", "list", "--help"], ("--workspace",), "Herdr tab listing (herdr tab list --workspace)"))
     problems = []
     for argv, flags, label in checks:
         try:
@@ -430,11 +435,16 @@ def verify_pipeline(context, record, worktree):
     if run_object.get("branch") != context.branch:
         raise Stop("No-Mistakes reported a run for another branch (" + str(run_object.get("branch")) + ")")
     # The branch name alone does not identify this enrollment's run: a run, pull request, and remote branch left
-    # by an earlier branch of the same name are never handed over as this implementation's publication.
-    created, enrolled = run_created(run_object.get("id")), record.get("enrolled_at")
-    if type(enrolled) is not int or created is None or created < enrolled * 1000:
+    # by an earlier branch of the same name are never handed over as this implementation's publication. The run
+    # must be strictly newer than the enrollment at its ID's millisecond precision; a checkpoint that recorded only
+    # the enrollment second cannot order a run created within that second, so such a run is not proven newer.
+    created, enrolled = run_created(run_object.get("id")), record.get("enrolled_at_ms")
+    if type(enrolled) is not int and type(record.get("enrolled_at")) is int:
+        enrolled = record["enrolled_at"] * 1000 + 999
+    if type(enrolled) is not int or created is None or created <= enrolled:
         raise Stop("the No-Mistakes run " + str(run_object.get("id")) + " for " + context.branch + " cannot be shown "
-                   "to belong to this PR Fixer enrollment (" + ("it predates the enrollment" if created is not None
+                   "to belong to this PR Fixer enrollment (" + ("it predates the enrollment, or was created too close "
+                                                                "to it to be ordered after it" if created is not None
                                                                 and type(enrolled) is int else
                                                                 "its creation time is unreadable") + "), so it is "
                    "not proven to be this implementation's publication. Ownership was not transferred and nothing was "
@@ -717,7 +727,7 @@ CONTEXTS = """contexts(first: 100, after: $endCursor) {
         nodes { __typename
           ... on CheckRun { name status conclusion title completedAt isRequired(pullRequestNumber: $number)
             checkSuite { app { slug } matchingPullRequests(first: 2) { nodes { number } }
-              workflowRun { event file { path repositoryName } } } }
+              workflowRun { event file { path repositoryName repositoryFileUrl } } } }
           ... on StatusContext { context state description createdAt isRequired(pullRequestNumber: $number)
             creator { __typename login } } } }"""
 CHECKS_QUERY = """query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
@@ -730,8 +740,9 @@ MERGE_CHECKS_QUERY = """query($owner: String!, $name: String!, $number: Int!, $e
 
 
 def graphql(context, worktree, query, number):
+    # -F would turn an owner or name that looks like a number or boolean into one; only the PR number is an Int.
     return json_documents(gh(worktree, "api", "graphql", "--paginate", "-f", "query=" + query,
-                             "-F", "owner=" + context.owner, "-F", "name=" + context.name, "-F", "number=" + str(number)))
+                             "-f", "owner=" + context.owner, "-f", "name=" + context.name, "-F", "number=" + str(number)))
 
 
 def rest(context, worktree, path):
@@ -760,8 +771,9 @@ def thread_comments(worktree, thread):
 
 def expected_checks(context, worktree, base):
     """Status checks the base branch's protection and rulesets require, whether or not they have registered, and
-    the workflows its rulesets require as (repository ID, path). A required workflow names a file, not the checks
-    its jobs report, so which checks it requires cannot be told from the rule."""
+    the workflows its rulesets require as (repository ID, path, ref, pinned SHA). A required workflow names a file
+    at a ref, not the checks its jobs report, so which checks it requires cannot be told from the rule; rules
+    naming the same file at different refs are different requirements."""
     path = "repos/" + context.repository + "/" + "{}/" + urllib.parse.quote(base, safe="")
     try:
         protection = json.loads(gh(worktree, "api", path.format("branches"))).get("protection") or {}
@@ -776,9 +788,9 @@ def expected_checks(context, worktree, base):
                     names.update(check.get("context") for check in
                                  (rule.get("parameters") or {}).get("required_status_checks") or [])
                 elif rule.get("type") == "workflows":
-                    workflows += [(item.get("repository_id"), str(item.get("path"))) for item in
-                                  (rule.get("parameters") or {}).get("workflows") or [] if isinstance(item, dict)
-                                  ] or [(None, "a required workflow")]
+                    workflows += [(item.get("repository_id"), str(item.get("path")), item.get("ref"), item.get("sha"))
+                                  for item in (rule.get("parameters") or {}).get("workflows") or []
+                                  if isinstance(item, dict)] or [(None, "a required workflow", None, None)]
     except (AttributeError, TypeError, ValueError):
         raise Stop("GitHub returned an unexpected response for the required checks of " + base)
     return {name for name in names if isinstance(name, str) and name}, sorted(set(workflows), key=str)
@@ -790,8 +802,9 @@ PULL_REQUEST_EVENTS = ("pull_request", "pull_request_target")
 
 
 def workflow_file(item, number):
-    """(repository, path) of the workflow file whose run for this pull request reported a check run, or None: a
-    run for another event, or one GitHub does not attribute to exactly this open pull request, is not that run."""
+    """(repository, path, commit) of the workflow file whose run for this pull request reported a check run, or
+    None: a run for another event, or one GitHub does not attribute to exactly this open pull request, is not that
+    run. The commit is the one GitHub's link to the run's workflow file names, or None when it names none."""
     suite = item.get("checkSuite") or {}
     run = suite.get("workflowRun") or {}
     matching = [pull.get("number") for pull in (suite.get("matchingPullRequests") or {}).get("nodes") or []
@@ -799,32 +812,54 @@ def workflow_file(item, number):
     if run.get("event") not in PULL_REQUEST_EVENTS or matching != [number]:
         return None
     repository, path = (run.get("file") or {}).get("repositoryName"), (run.get("file") or {}).get("path")
-    return (repository.lower(), path) if isinstance(repository, str) and isinstance(path, str) else None
+    commit = re.search(r"/blob/([0-9a-f]{40,64})/", text_of((run.get("file") or {}).get("repositoryFileUrl")))
+    return ((repository.lower(), path, commit and commit.group(1))
+            if isinstance(repository, str) and isinstance(path, str) else None)
+
+
+def ref_commit(worktree, repository, ref):
+    """The commit a required workflow's ref names now, or None when GitHub does not show it."""
+    result = gh(worktree, "api", "repos/" + repository + "/commits/"
+                + urllib.parse.quote(re.sub(r"^refs/", "", ref), safe="/"), check=False)
+    try:
+        sha = json.loads(result.stdout)["sha"] if not result.returncode else None
+    except (ValueError, KeyError, TypeError):
+        return None
+    return sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", sha) else None
 
 
 def required_workflows(context, worktree, workflows, contexts, merge_state, number):
     """Required workflows not yet shown satisfied for the head, and whether any of them failed. GitHub's merge
     state CLEAN (or HAS_HOOKS) means every merge requirement, required workflows included, is met for the head;
-    otherwise the workflow's own check runs for this pull request on the head must have reported and passed."""
+    otherwise the workflow's own check runs for this pull request on the head must have reported and passed. A
+    rule names a file at a ref (or a pinned commit), and the pull request's own run of the same file can execute
+    another version of it, so a run stands for a rule only when GitHub ties its workflow file to the commit that
+    rule names; a matching repository and path alone leave the rule unverified."""
     if not workflows or merge_state in ("CLEAN", "HAS_HOOKS"):
         return [], False
-    runs, names, unverified, failed = {}, {}, [], False
+    runs, names, commits, unverified, failed = {}, {}, {}, [], False
     for item in contexts:
         source = workflow_file(item, number) if item.get("__typename") == "CheckRun" else None
         if source:
             runs.setdefault(source, []).append(check_of(item)[2])
-    for repository_id, path in workflows:
+    for repository_id, path, ref, pinned in workflows:
         if type(repository_id) is int and repository_id not in names:
             result = gh(worktree, "api", "repositories/" + str(repository_id), check=False)
             try:
                 names[repository_id] = str(json.loads(result.stdout)["full_name"]).lower() if not result.returncode else None
             except (ValueError, KeyError, TypeError):
                 names[repository_id] = None
-        states = runs.get((names.get(repository_id), path), []) if names.get(repository_id) else []
+        name = names.get(repository_id)
+        commit = pinned.lower() if isinstance(pinned, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", pinned) else None
+        if commit is None and name and isinstance(ref, str) and ref:
+            if (name, ref) not in commits:
+                commits[(name, ref)] = ref_commit(worktree, name, ref)
+            commit = commits[(name, ref)]
+        states = runs.get((name, path, commit), []) if name and commit else []
         if "failing" in states:
             failed = True
         elif not states or "pending" in states:
-            unverified.append(path)
+            unverified.append(path + ("@" + ref if isinstance(ref, str) and ref else ""))
     return unverified, failed
 
 
@@ -874,6 +909,15 @@ def check_of(item):
         name, detail, at = item.get("context"), item.get("description") or "", item.get("createdAt")
         state = {"SUCCESS": "passing", "PENDING": "pending", "EXPECTED": "pending"}.get(item.get("state"), "failing")
     return key, name, state, detail, at, bool(item.get("isRequired"))
+
+
+def check_identity(item):
+    """(type, source, name) of a check: GitHub can pin a required check to the app that reports it, so the same
+    name reported by another app (or, for a commit status, another account) is another check."""
+    if item.get("__typename") == "CheckRun":
+        source = ((item.get("checkSuite") or {}).get("app") or {}).get("slug")
+        return "check run", text_of(source).lower(), item.get("name")
+    return "commit status", text_of((item.get("creator") or {}).get("login")).lower(), item.get("context")
 
 
 def is_review_check(key, item):
@@ -1007,8 +1051,8 @@ def collect_evidence(context, record, worktree, remote):
                          "created_at": comment.get("createdAt"), "url": comment.get("url"),
                          "body": text_of(comment.get("body"))} for comment in thread_comments(worktree, thread)]
             kept = (record.get("kept_open") or {}).get(thread.get("id"))
-            # A bot comment after that judgment raises the finding again.
-            kept = kept if isinstance(kept, dict) and kept.get("bot_comments") == bot_comments(comments) else None
+            # A bot comment after that judgment, or a bot editing one of its comments, raises the finding again.
+            kept = kept if isinstance(kept, dict) and kept.get("bot_digest") == bot_digest(comments) else None
             bots[key]["open_threads"].append({
                 "id": thread.get("id"), "path": thread.get("path"), "line": thread.get("line"),
                 "outdated": bool(thread.get("isOutdated")), "url": first.get("url"), "comments": comments,
@@ -1028,16 +1072,17 @@ def collect_evidence(context, record, worktree, remote):
         key, name, state, detail, at, required = check_of(item)
         if key is None or required:
             kind = "check run" if item.get("__typename") == "CheckRun" else "commit status"
-            merged.add((kind, name))
+            merged.add(check_identity(item))
             checks.append(dict({"name": name, "type": kind, "state": state, "required": required,
                                 "commit": "test merge"}, **({"bot": BOTS[key]["label"]} if key else {})))
     for item in contexts if commit == head else []:
         key, name, state, detail, at, required = check_of(item)
         kind = "check run" if item.get("__typename") == "CheckRun" else "commit status"
-        if (key is None or required) and (kind, name) not in merged:
+        if (key is None or required) and check_identity(item) not in merged:
             # A required check is CI whoever runs it; an optional bot check is only a review signal. The test
             # merge commit's result for the same check takes precedence, as on GitHub. A check run and a commit
-            # status sharing a name are separate checks that GitHub requires both of, so one never replaces the other.
+            # status sharing a name are separate checks that GitHub requires both of, so one never replaces the other,
+            # and neither does a same-named check that another app or account reports.
             checks.append(dict({"name": name, "type": kind, "state": state, "required": required},
                                **({"bot": BOTS[key]["label"]} if key else {})))
         if key in bots and is_review_check(key, item):
@@ -1125,8 +1170,11 @@ def mark_inspected(context, evidence):
         context.unlock()
 
 
-def bot_comments(comments):
-    return sum(1 for comment in comments if comment["bot"])
+def bot_digest(comments):
+    """A digest of a thread's bot comments, their text included: a new or edited bot comment changes it, while a
+    reply by anyone else does not."""
+    return hashlib.sha256(json.dumps([[comment["author"], comment["body"]] for comment in comments
+                                      if comment["bot"]]).encode("utf-8")).hexdigest()
 
 
 def retain_summaries(record, evidence):
@@ -1262,8 +1310,8 @@ def validate_pane(record, tab_id, pane_id, label=False):
 
 
 def fixer_pane(context, record):
-    """The recorded tab, the tab this fixer asked Herdr to create when that response was lost, or one new tab:
-    never a tab it did not create, whatever its label, and never a second one."""
+    """The recorded tab or one new tab: never a tab whose creation Herdr did not confirm, whatever its label or
+    whenever it appeared, and never a second one while such a tab may still be the fixer's."""
     route = record["route"]
     fixer = route["fixer"]
     if fixer.get("pane_id"):
@@ -1277,35 +1325,33 @@ def fixer_pane(context, record):
     if not isinstance(tabs, list) or not all(isinstance(tab, dict) and isinstance(tab.get("tab_id"), str) and tab["tab_id"]
                                              for tab in tabs):
         raise Stop("unexpected Herdr tab-list response; no PR Fixer tab was created")
-    # A tab labelled PR Fixer may be an operator's or one left by an earlier run. Only a tab that appeared after
-    # this fixer's own creation request, checkpointed with every tab that existed before it, can be the tab whose
-    # creation response was lost; any other tab is left alone.
+    # A tab labelled PR Fixer may be an operator's or one left by an earlier run, and Herdr gives a tab nothing its
+    # creator could later prove it by: not its label, workspace, or worktree, nor its absence from the listing
+    # checkpointed before the request. So a tab whose creation response was lost is never adopted. While a tab
+    # labelled PR Fixer has appeared since that unconfirmed request, nothing is created, started, or prompted until
+    # a human closes it (or renames a tab that is theirs); a lost response that created nothing blocks nothing.
     before = fixer.get("creating")
-    candidates = [tab for tab in tabs if isinstance(before, list) and tab["tab_id"] not in before
-                  and tab.get("label") == TAB_LABEL and tab.get("workspace_id") == route["workspace_id"]
-                  and tab["tab_id"] != route["implementer"]["tab_id"]]
-    if len(candidates) > 1:
-        raise Stop(str(len(candidates)) + " tabs labelled " + TAB_LABEL + " appeared in the issue workspace after the "
-                   "PR Fixer asked Herdr for its own, so which one it created is ambiguous. Nothing was started and "
-                   "every tab was left alone; close the ones that are not the fixer's, then retry.")
-    if candidates:
-        panes = result_of(herdr(record, "pane", "list", "--workspace", route["workspace_id"]), "pane_list")
-        panes = [pane for pane in (panes or {}).get("panes") or []
-                 if isinstance(pane, dict) and pane.get("tab_id") == candidates[0]["tab_id"]]
-        if len(panes) != 1 or not isinstance(panes[0].get("pane_id"), str):
-            raise Stop("the " + TAB_LABEL + " tab the fixer created does not have exactly one pane; it was left alone")
-        tab_id, pane_id = candidates[0]["tab_id"], panes[0]["pane_id"]
-    else:
-        # Recorded before the request, so a lost response is recovered from the checkpoint, never from a label.
-        fixer["creating"] = [tab["tab_id"] for tab in tabs]
-        context.save(record)
-        created = result_of(herdr(record, "tab", "create", "--workspace", route["workspace_id"], "--cwd",
-                                  route["worktree"], "--label", TAB_LABEL, "--no-focus"), "tab_created")
-        tab, pane = (created or {}).get("tab"), (created or {}).get("root_pane")
-        if (not isinstance(tab, dict) or not isinstance(pane, dict)
-                or not all(isinstance(value, str) and value for value in (tab.get("tab_id"), pane.get("pane_id")))):
-            raise Stop("Herdr did not confirm the new " + TAB_LABEL + " tab; rerun to recover it before creating another")
-        tab_id, pane_id = tab["tab_id"], pane["pane_id"]
+    appeared = [tab["tab_id"] for tab in tabs if isinstance(before, list) and tab["tab_id"] not in before
+                and tab.get("label") == TAB_LABEL and tab.get("workspace_id") == route["workspace_id"]
+                and tab["tab_id"] != route["implementer"]["tab_id"]]
+    if appeared:
+        raise Stop("Herdr never confirmed the " + TAB_LABEL + " tab requested earlier, and since then "
+                   + ("tabs" if len(appeared) > 1 else "tab") + " " + ", ".join(appeared) + " labelled " + TAB_LABEL
+                   + " appeared in the issue workspace. Nothing proves which, if any, the fixer created, so none was "
+                   "adopted and no tab or agent was created, started, or prompted. Close the tab that request left "
+                   "(once you have checked that it holds nothing of yours), or rename a tab that is yours, then retry: "
+                   "exactly one new " + TAB_LABEL + " tab is created.")
+    # Recorded before the request, so a lost response is detected from the checkpoint, never resolved by a label.
+    fixer["creating"] = [tab["tab_id"] for tab in tabs]
+    context.save(record)
+    created = result_of(herdr(record, "tab", "create", "--workspace", route["workspace_id"], "--cwd",
+                              route["worktree"], "--label", TAB_LABEL, "--no-focus"), "tab_created")
+    tab, pane = (created or {}).get("tab"), (created or {}).get("root_pane")
+    if (not isinstance(tab, dict) or not isinstance(pane, dict)
+            or not all(isinstance(value, str) and value for value in (tab.get("tab_id"), pane.get("pane_id")))):
+        raise Stop("Herdr did not confirm the new " + TAB_LABEL + " tab, so it is never adopted. Retry: if no "
+                   + TAB_LABEL + " tab appeared, one is created; if one did, close it first")
+    tab_id, pane_id = tab["tab_id"], pane["pane_id"]
     validate_pane(record, tab_id, pane_id, label=True)
     fixer.update(tab_id=tab_id, pane_id=pane_id)
     fixer.pop("creating", None)
@@ -1522,7 +1568,7 @@ Work in this loop:
 
 Finish with exactly one result, and let the helper confirm it:
 - ready: every selected bot completed for the latest published head, no legitimate actionable finding remains, every selected bot's thread is resolved or kept open only for a human discussion, and required checks are satisfied.
-- round-limit: the budget is spent and actionable findings remain on the final head you observed, whose reviews and hosted CI were verified. If that head's CI is still pending, missing, or unverifiable, the unresolved condition is CI, not the budget: finish pending (or blocked for an external blocker) instead.
+- round-limit: the budget is spent and actionable findings remain on the final head you observed, whose reviews and hosted CI were verified. If that head's CI is still pending, missing, or unverifiable, the unresolved condition is CI, not the budget: finish pending (or blocked for an external blocker) instead. If the pull request has a merge conflict, the conflict is what blocks it: finish blocked.
 - pending: a review or CI result could not be obtained or verified within the bounded waiting. Never report a selected bot as absent or clean because nothing appeared.
 - blocked: something outside your authority or scope stops the work.
 
@@ -1568,9 +1614,11 @@ def command_enroll(context, arguments):
     if git(os.getcwd(), "show-ref", "--verify", "--quiet", "refs/heads/" + context.branch, check=False).returncode == 0:
         raise Stop(context.branch + " already exists, so it is not a new enrollment; its retained PR Fixer "
                    "checkpoint, owner, and round budget were kept unchanged")
+    # Milliseconds, the precision of a No-Mistakes run ID's creation time, which the handoff compares with it.
+    enrolled = time.time_ns() // 1000000
     context.save({
         "version": 1, "repository": context.repository, "issue": context.issue, "branch": context.branch,
-        "base_branch": values["--base"], "enrolled_at": now(),
+        "base_branch": values["--base"], "enrolled_at": enrolled // 1000, "enrolled_at_ms": enrolled,
         "config": {"agent": values["--agent"], "arguments": values.get("--", []), "bots": bots,
                    "max_rounds": int(values["--max-rounds"])},
         "owner": "implementer", "phase": "enrolled", "route": {}, "pr": None, "pipeline": None,
@@ -1948,12 +1996,18 @@ def command_keep_open(context, arguments):
     if record.get("published_head") != evidence["head"]:
         raise Stop("the published head changed; run evidence again")
     record.setdefault("kept_open", {})[thread_id] = {"reason": reason, "at": now(), "head": evidence["head"],
-                                                      "bot_comments": bot_comments(comments)}
+                                                      "bot_digest": bot_digest(comments)}
     context.save(record)
     print(json.dumps({"kept_open": thread_id, "head": evidence["head"], "reason": reason,
-                      "note": "the thread stays open for its human discussion; a new bot comment there raises "
-                              "the finding again"}, indent=2))
+                      "note": "the thread stays open for its human discussion; a new or edited bot comment there "
+                              "raises the finding again"}, indent=2))
     return 0
+
+
+def recorded(record):
+    """The verdict finish recorded, or None while the fixer's run is still open."""
+    outcome = record.get("outcome")
+    return outcome if isinstance(outcome, dict) and outcome.get("result") in RESULTS else None
 
 
 def command_push(context, arguments):
@@ -1961,6 +2015,12 @@ def command_push(context, arguments):
     record = context.load()
     require_fixer(record)
     require_pane(record, "fixer", "push", "Nothing was pushed or counted.")
+    outcome = recorded(record)
+    if outcome:
+        # The verdict describes the head it was recorded for; publishing after it would leave it describing another.
+        raise Stop("the PR Fixer already recorded its result (" + RESULTS[outcome["result"]] + " for "
+                   + short(outcome.get("head")) + "), so its run is over: nothing was pushed or counted, and local "
+                   "commits were kept for a human to decide on")
     worktree = worktree_of(record)
     remote = remote_state(context, record, worktree)
     message = reconcile(context, record, worktree, remote["head"])
@@ -2019,6 +2079,28 @@ def command_push(context, arguments):
     return 0
 
 
+def verdict_basis(evidence):
+    """What a ready or round-limit verdict rests on: the head, its hosted CI result, and each selected bot's review
+    state and feedback for that head."""
+    bots = {key: [bot["completed"], bot["in_progress"], bot["unresolved_threads"], bot["kept_open_threads"],
+                  sorted(notice["kind"] for notice in bot["notices"])] for key, bot in evidence["bots"].items()}
+    return [evidence["head"], evidence["ci"], bots, feedback_of(evidence)]
+
+
+def finish_recorded(record, result):
+    """finish records one verdict: repeating it reports that verdict, unchanged, and another result is refused."""
+    outcome = recorded(record)
+    if outcome["result"] != result:
+        raise Stop("the PR Fixer already recorded its result: " + RESULTS[outcome["result"]] + " for "
+                   + short(outcome.get("head")) + ". A verdict is recorded once, so " + result + " was not recorded "
+                   "and nothing was changed.")
+    print(json.dumps({"result": RESULTS[result], "reason": outcome.get("reason"), "pull_request": record["pr"]["url"],
+                      "published_head": outcome.get("head"), "already_recorded": True,
+                      "note": "this result was recorded earlier and stands unchanged; the pull request stays open"},
+                     indent=2))
+    return 0
+
+
 def command_finish(context, arguments):
     if not arguments or arguments[0] not in RESULTS:
         raise Stop("usage: finish REPO ISSUE ready|pending|round-limit|blocked [--reason TEXT]")
@@ -2029,6 +2111,8 @@ def command_finish(context, arguments):
     record = context.load()
     require_fixer(record)
     require_pane(record, "fixer", "finish", "Nothing was recorded.")
+    if recorded(record):
+        return finish_recorded(record, result)
     evidence = None
     try:
         record, evidence = observe(context, 0)
@@ -2080,19 +2164,38 @@ def command_finish(context, arguments):
                        + (" (" + evidence["ci"]["trigger_blocker"] + ")" if evidence["ci"].get("trigger_blocker") else "")
                        + ", so it has no verified CI result and the round limit is not what stopped this run. Finish "
                        "pending, or blocked for an external blocker, and report that CI state.")
+        if evidence["ci"]["mergeable"] == "CONFLICTING":
+            # Whatever its CI result, a conflicting pull request is blocked by the conflict, not by the budget.
+            raise Stop("the pull request has a merge conflict with " + record["base_branch"] + ", so the round "
+                       "limit is not what stopped this run and nothing was recorded. Finish blocked and report the "
+                       "merge conflict.")
     if result in ("ready", "round-limit"):
         # The verdict is about the live pull request, so it is read again after every other check: one closed,
-        # retargeted, or moved while the evidence was gathered is never recorded as verified.
+        # retargeted, or moved while the evidence was gathered, or whose hosted CI or selected-bot reviews and
+        # feedback changed meanwhile on the same head (a rerun check, a new or edited finding), is never recorded
+        # as verified.
+        worktree = worktree_of(record)
         try:
-            live = remote_state(context, record, worktree_of(record))["head"]
+            remote = remote_state(context, record, worktree)
         except Stop as error:
             raise Stop("cannot record " + result + ": the pull request no longer matches its verified evidence: "
                        + str(error))
-        if live != evidence["head"]:
+        if remote["head"] != evidence["head"]:
             raise Stop("cannot record " + result + ": the pull request head moved from the verified "
-                       + short(evidence["head"]) + " to " + short(live) + "; run evidence, then finish again")
+                       + short(evidence["head"]) + " to " + short(remote["head"]) + "; run evidence, then finish again")
+        try:
+            current = collect_evidence(context, record, worktree, remote)
+        except Stop as error:
+            raise Stop("cannot record " + result + ": the evidence for " + short(evidence["head"]) + " could not be "
+                       "read again to confirm it: " + str(error))
+        if verdict_basis(current) != verdict_basis(evidence):
+            raise Stop("cannot record " + result + ": hosted CI or the selected bots' reviews or feedback for "
+                       + short(evidence["head"]) + " changed while it was being checked, so nothing was recorded. "
+                       "Run evidence, assess what changed, then finish again.")
     context.lock()
     record = context.load()
+    if recorded(record):
+        return finish_recorded(record, result)  # another finish call recorded its verdict meanwhile
     if evidence is not None and (record.get("published_head") != evidence["head"]
                                  or record.get("pending_push") != evidence["pending_push"]):
         raise Stop("the published head or a pending publication changed while " + result + " was being checked "

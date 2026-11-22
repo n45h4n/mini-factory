@@ -76,7 +76,8 @@ elif name == "gh":
                                                   or args[:2] == ["api", "repos/friend/target/branches/feature%2Ffriend"]
                                                   or args[:2] == ["api", "repositories/1"]
                                                   or args[:1] == ["api"] and args[1:2] != []
-                                                  and args[1].startswith("repos/friend/target/activity?")):
+                                                  and args[1].startswith(("repos/friend/target/activity?",
+                                                                          "repos/friend/target/commits/"))):
         # The PR Fixer's GitHub: one pull request for agent/issue-8 whose head follows the remote fixture.
         fixture_file = pathlib.Path(os.environ["MOCK_FIXER_GITHUB"])
         github = json.loads(fixture_file.read_text()) if fixture_file.exists() else {}
@@ -122,6 +123,13 @@ elif name == "gh":
         elif args[:2] == ["api", "repositories/1"]:
             # The repository a ruleset's required workflow file lives in, by its ID.
             print(json.dumps({"id": 1, "full_name": "friend/target"}))
+        elif args[1].startswith("repos/friend/target/commits/"):
+            # The commit a required workflow's ref names: main at "c" * 40 unless refs says otherwise.
+            ref = args[1][len("repos/friend/target/commits/"):]
+            refs = dict({"heads/main": "c" * 40}, **github.get("refs", {}))
+            if args[2:] or ref not in refs:
+                fail("gh: Not Found (HTTP 404)")
+            print(json.dumps({"sha": refs[ref]}))
         elif args[:2] == ["api", "repos/friend/target/branches/feature%2Ffriend"]:
             # Classic branch protection of the captured base, as GitHub shows it to readers.
             contexts = github.get("protected_checks", [])
@@ -139,10 +147,12 @@ elif name == "gh":
             elif args[2] == "repos/friend/target/rules/branches/feature%2Ffriend":
                 items = [{"type": "required_status_checks", "ruleset_id": 1, "parameters": {
                     "required_status_checks": [{"context": name} for name in github.get("ruleset_checks", [])]}}]
-                # A ruleset's required workflows name workflow files, not the checks their jobs report.
+                # A ruleset's required workflows name workflow files at a ref (or a pinned sha), not the checks their
+                # jobs report; an entry is a path (at refs/heads/main) or the rule's own fields.
                 items += [{"type": "workflows", "ruleset_id": 2, "parameters": {"do_not_enforce_on_create": False,
-                           "workflows": [{"path": path, "repository_id": 1, "ref": "refs/heads/main"}]}}
-                          for path in github.get("ruleset_workflows", [])]
+                           "workflows": [dict({"repository_id": 1, "ref": "refs/heads/main"},
+                                              **(entry if isinstance(entry, dict) else {"path": entry}))]}}
+                          for entry in github.get("ruleset_workflows", [])]
             else:
                 fail("unexpected paginated GitHub request")
             print("".join(json.dumps(page) for page in pages(items)))
@@ -157,9 +167,12 @@ elif name == "gh":
                     print(json.dumps({"data": {"node": {"comments": {
                         "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": page}}}}))
                 sys.exit(0)
+            # gh api -F turns a value that looks like a number or boolean into one: owner and name are GraphQL
+            # Strings, so they must be sent with -f; only the pull request number is an Int.
             if (args[2:4] != ["--paginate", "-f"] or "$endCursor" not in query
-                    or [arg for arg in args if arg.startswith(("owner=", "name=", "number="))]
-                    != ["owner=friend", "name=target", "number=" + str(pull["number"])]):
+                    or [args[index - 1:index + 1] for index, arg in enumerate(args)
+                        if arg.startswith(("owner=", "name=", "number="))]
+                    != [["-f", "owner=friend"], ["-f", "name=target"], ["-F", "number=" + str(pull["number"])]]):
                 fail("unexpected GraphQL request")
             if "reviewThreads" in query:
                 if re.search(r"\bdatabaseId\b", query) and any(
@@ -1072,13 +1085,20 @@ def review_thread(bot, body, replies=(), resolved=False, number=1, more=(), revi
             "more_comments": [reply(*item) for item in more]}
 
 
+MAIN_WORKFLOW_COMMIT = "c" * 40  # the commit refs/heads/main names in the mock, where required workflows are pinned
+
+
 def check_run(name, conclusion="SUCCESS", status="COMPLETED", required=True, app="github-actions", completed=None,
               title="", workflow=None, event="pull_request", pulls=(12,)):
-    """A check run; workflow is the (repository, path) of the Actions workflow file whose run, triggered by event,
-    reported it, and pulls are the open pull requests GitHub matches to that run's check suite."""
+    """A check run; workflow is the (repository, path[, commit]) of the Actions workflow file whose run, triggered
+    by event, reported it, with the commit GitHub links that file at (main's unless given), and pulls are the open
+    pull requests GitHub matches to that run's check suite."""
     suite = {"app": {"slug": app}, "matchingPullRequests": {"nodes": [{"number": number} for number in pulls]}}
     if workflow:
-        suite["workflowRun"] = {"event": event, "file": {"repositoryName": workflow[0], "path": workflow[1]}}
+        commit = workflow[2] if len(workflow) > 2 else MAIN_WORKFLOW_COMMIT
+        suite["workflowRun"] = {"event": event, "file": {
+            "repositoryName": workflow[0], "path": workflow[1],
+            "repositoryFileUrl": "https://github.com/" + workflow[0] + "/blob/" + commit + "/" + workflow[1]}}
     return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion, "title": title,
             "completedAt": completed, "isRequired": required, "checkSuite": suite}
 
@@ -3508,7 +3528,21 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         handoff = next(line for line in prompt.splitlines() if line.endswith(" handoff friend/target 8"))
         self.assertEqual(shlex.split(handoff), [str(self.bundle / FIXER_SCRIPT), "handoff", "friend/target", "8"])
         self.assertIn("make ordinary engineering decisions yourself", prompt)
-        self.assertNotIn("Do not reattach forever to an empty check list", prompt)
+        # Only a run that actually skipped CI is driven without waiting for checks. A reattached run that kept its CI
+        # stage keeps the bounded check-registration wait and the mergeability and workflow-trigger diagnostics.
+        step = prompt[prompt.index("\n6. "):prompt.index("\n7. ")]
+        self.assertLess(step.index("Only when it is skipped"), step.index("do not monitor CI yourself"))
+        self.assertLess(step.index("do not monitor CI yourself"),
+                        step.index("If you reattached to an active run whose CI stage is not skipped"))
+        self.assertLess(step.index("If you reattached"), step.index("Do not reattach forever to an empty check list"))
+        for requirement in ("drive that same run without restarting or altering it",
+                            "start a separate two-minute check-registration interval",
+                            "inspect PR mergeability and workflow trigger status before assigning the blocker",
+                            "An empty check list alone does not establish missing CI",
+                            "never bypass CI, mark checks passed, or set no_ci yourself"):
+            self.assertIn(requirement, step)
+        self.assertNotIn("its skipped CI stage saved on it", prompt)
+        self.assertNotIn("owner's corrective action from step 3", prompt)
         # Selecting this path read only native help: no tab, fixer, or PR/review traffic exists yet.
         self.assertTrue(self.calls("no-mistakes"))
         self.assertTrue(all("--help" in call["args"] for call in self.calls("no-mistakes")))
@@ -3664,6 +3698,40 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertIn("ci completed", prompt)
         self.assertNotIn("deliberately skipped", prompt)
 
+    def test_pr_fixer_handoff_needs_a_run_strictly_newer_than_the_enrollment_at_millisecond_precision(self):
+        def run_id(milliseconds):
+            """A native ULID run ID created at that millisecond."""
+            return "".join("0123456789ABCDEFGHJKMNPQRSTVWXYZ"[(milliseconds >> (5 * (9 - index))) & 31]
+                           for index in range(10)) + "0" * 16
+
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        checkpoint = self.fixer_records()[0]
+        record = json.loads(checkpoint.read_text())
+        self.assertEqual(record["enrolled_at"], record["enrolled_at_ms"] // 1000)
+        second = record["enrolled_at"]
+        record["enrolled_at_ms"] = second * 1000 + 500
+        checkpoint.write_text(json.dumps(record))
+        self.publish_implementation(issue)
+        legacy = dict(record, enrolled_at=second)
+        del legacy["enrolled_at_ms"]
+        # An earlier run from the enrollment's own second, and one from its very millisecond, are not proven newer;
+        # neither is any run from that second when an older checkpoint recorded only the second.
+        for enrollment, created in ((record, second * 1000 + 499), (record, second * 1000 + 500),
+                                    (legacy, second * 1000 + 999)):
+            with self.subTest(precision="ms" if "enrolled_at_ms" in enrollment else "s", created=created):
+                checkpoint.write_text(json.dumps(enrollment))
+                issue["run"].write_text(json.dumps(dict(json.loads(issue["run"].read_text()), id=run_id(created))))
+                self.log.write_text("")
+                result = self.pr_fixer(issue, "handoff")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("predates the enrollment, or was created too close to it to be ordered after it",
+                              result.stderr)
+                self.assertEqual(self.fixer_json(issue, "status")["owner"], "implementer")
+                self.assertFalse(self.fixer_tabs_created() or self.fixer_launches())
+        # A run from after that second is this enrollment's, even for the older checkpoint.
+        issue["run"].write_text(json.dumps(dict(json.loads(issue["run"].read_text()), id=run_id(second * 1000 + 1000))))
+        self.assertEqual(self.fixer_json(issue, "handoff")["handoff"], "transferred")
+
     def test_pr_fixer_recovers_lost_launch_responses_and_exited_agents_without_a_second_writer(self):
         issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "max_rounds": 3})
         self.publish_implementation(issue)
@@ -3674,20 +3742,29 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(len(self.fixer_tabs_created()), 1)
         self.assertFalse(self.fixer_launches())
         self.assertEqual(self.fixer_json(issue, "status")["owner"], "fixer")
-        # The retry recovers that tab instead of creating another; this time the agent's start response is lost.
+        # Nothing proves who created the tab that appeared, so the retry neither adopts it nor creates another.
+        self.log.write_text("")
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("never confirmed the PR Fixer tab requested earlier", result.stderr)
+        self.assertIn("tab fix-tab-1 labelled PR Fixer appeared", result.stderr)
+        self.assertFalse(self.fixer_tabs_created() or self.herdr_calls("agent", "start")
+                         or self.herdr_calls("agent", "prompt"))
+        # Once that tab is closed, exactly one new tab is created; this time the agent's start response is lost.
+        self.fixer_herdr_tabs(issue, lambda tabs: tabs.clear())
         self.log.write_text("")
         result = self.pr_fixer(issue, "handoff", MOCK_FIXER_START="lost")
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertFalse(self.fixer_tabs_created())
-        self.assertEqual(len(self.fixer_launches()), 1)
-        # Issues I adopts the started agent and prompts it once; nothing is launched twice or resent.
+        self.assertEqual(len(self.fixer_tabs_created()), 1)
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-2"])
+        # Issues I adopts the started agent in its recorded pane and prompts it once; nothing is launched twice.
         self.log.write_text("")
         self.assert_success(self.issue_helper(**self.fixer_route(issue)))
         self.assertFalse(self.fixer_tabs_created() or self.herdr_calls("agent", "start"))
         prompts = self.herdr_calls("agent", "prompt")
-        self.assertEqual([args[2] for args in prompts], ["fix-pane-1"])
+        self.assertEqual([args[2] for args in prompts], ["fix-pane-2"])
         self.assertTrue(prompts[0][3].startswith("You are the PR Fixer"))
-        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-2"]])
         # An exited fixer is recreated in its tab only once GitHub confirms the PR and its published head.
         state_file = issue["repo"].parent / "issue-workflow.json"
         state = json.loads(state_file.read_text())
@@ -3700,7 +3777,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.log.write_text("")
         self.assert_success(self.issue_helper(**self.fixer_route(issue)))
         self.assertEqual(self.fixer_launches(), [["agent", "start", "target-fix-8", "--kind", "codex", "--pane",
-                                                  "fix-pane-1", "--timeout", "30000", "--", "--config",
+                                                  "fix-pane-2", "--timeout", "30000", "--", "--config",
                                                   "check_for_update_on_startup=false"]])
         self.assertFalse(self.fixer_tabs_created())
         self.assertTrue(self.herdr_calls("agent", "prompt")[0][3].startswith("You are resuming as the PR Fixer"))
@@ -3713,7 +3790,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assert_success(self.issue_helper(**self.fixer_route(issue)))
         self.assertEqual(self.fixer_tabs_created(), [["tab", "create", "--workspace", "issue-ws", "--cwd",
                                                       str(issue["worktree"]), "--label", "PR Fixer", "--no-focus"]])
-        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-2"])
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-3"])
         # An unreadable checkpoint is ambiguous: nothing is started, focused, or prompted, and work is kept.
         self.fixer_records()[0].write_text("{not json")
         self.log.write_text("")
@@ -3736,13 +3813,16 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("pull request #12 is closed", result.stderr)
         self.assertFalse(self.fixer_launches() or self.herdr_calls("agent", "prompt"))
-        # Reopened, the fixer starts but its start response is lost; offline, it is focused but never prompted.
+        # Reopened, and with the unconfirmed tab closed by a human, the fixer starts in a new tab but its start
+        # response is lost; offline, it is focused but never prompted.
         self.set_github(issue, pr={"number": 12})
+        self.fixer_herdr_tabs(issue, lambda tabs: tabs.clear())
         self.assertEqual(self.pr_fixer(issue, "handoff", MOCK_FIXER_START="lost").returncode, 1)
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-2"])
         self.log.write_text("")
         self.assert_success(self.issue_helper(**self.fixer_route(issue, MOCK_GH_API="fail")))
         self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start"))
-        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-2"]])
         # An operator's local commit is never handed to the fixer to publish, whether it is idle or has exited.
         (issue["worktree"] / "operator.txt").write_text("operator\n")
         git("-C", worktree, "add", "operator.txt")
@@ -3888,9 +3968,16 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, ready))
         self.set_github(issue, checks=[], pr={"number": 12, "mergeable": "CONFLICTING"}, no_ci=False)
         self.assertIn("merge conflict", self.fixer_json(issue, "evidence")["ci"]["trigger_blocker"])
+        # A declared no_ci never waives a bot that has not reviewed this head.
         self.set_github(issue, comments=[summary], reviews=[], no_ci=True)
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertEqual((evidence["ci"]["state"], evidence["bots"]["coderabbit"]["completed"], evidence["ready_gate"]),
+                         ("declared-no-ci", False, False))
+        # The pending verdict recorded above stands: a later finish never replaces it.
         result = self.pr_fixer(issue, "finish", "ready")
-        self.assertIn("CodeRabbit has not completed a review", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("already recorded its result: review/CI pending or unverifiable", result.stderr)
+        self.assertEqual(self.fixer_json(issue, "status")["outcome"]["reason"], "Greptile did not review the head")
 
     def test_pr_fixer_ready_gate_needs_provider_completion_expected_required_checks_and_resolved_threads(self):
         issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True})
@@ -3999,7 +4086,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 evidence = evidence_of(**changes)
                 self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, state == "passing"))
                 if state == "pending" and json.loads(issue["github"].read_text()).get("ruleset_workflows"):
-                    self.assertEqual(evidence["ci"]["unverified_required_workflows"], [ci_workflow])
+                    self.assertEqual(evidence["ci"]["unverified_required_workflows"], [ci_workflow + "@refs/heads/main"])
                     self.assertIn("hosted CI", evidence["waiting_on"])
                     self.assertIn("required hosted CI is pending", self.pr_fixer(issue, "finish", "ready").stderr)
         self.assertEqual(evidence_of(checks=[], ruleset_checks=["build"])["ci"]["missing_required"], ["build"])
@@ -4084,9 +4171,6 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                         threads=[review_thread("coderabbit", "Handle empty input", replies=[("operator", "User")])])
         self.assertIn("local work at " + fourth[:12] + " is not exactly the published head",
                       self.pr_fixer(issue, "finish", "ready").stderr)
-        report = self.fixer_json(issue, "finish", "round-limit", "--reason", "One finding still needs a fix")
-        self.assertEqual((report["result"], report["published_head"], report["verified_head"], report["rounds"]["used"]),
-                         ("round limit reached", third, third, 2))
         # Another actor's push is neither adopted nor overwritten.
         other = git("-C", str(issue["remote"]), "-c", "user.name=Someone Else", "-c", "user.email=else@example.invalid",
                     "commit-tree", third + "^{tree}", "-p", third, "-m", "Another actor")
@@ -4097,6 +4181,15 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("another actor changed the pull request branch", result.stderr)
         self.assertEqual((self.remote_branch(issue), git("-C", worktree, "rev-parse", "HEAD")), (other, fourth))
+        # Back at the final head, the spent budget is the verdict, and nothing is published after it.
+        git("-C", str(issue["remote"]), "update-ref", "refs/heads/agent/issue-8", third)
+        report = self.fixer_json(issue, "finish", "round-limit", "--reason", "One finding still needs a fix")
+        self.assertEqual((report["result"], report["published_head"], report["verified_head"], report["rounds"]["used"]),
+                         ("round limit reached", third, third, 2))
+        result = self.pr_fixer(issue, "push", **self.fixer_pane())
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("already recorded its result (round limit reached for " + third[:12] + ")", result.stderr)
+        self.assertEqual(self.remote_branch(issue), third)
 
     def test_pr_fixer_publishes_only_its_own_commits_from_its_pane_and_keeps_its_route(self):
         issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
@@ -4181,7 +4274,15 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                                  "checks": [check_run("test"), commit_status("build", "PENDING")]}, "pending"),
                                ({"merge_checks": [commit_status("build")],
                                  "checks": [check_run("test"), check_run("build", conclusion="FAILURE")]}, "failing"),
-                               ({"merge_checks": [check_run("build")],
+                               # The same name reported by another app is another check: an optional app's result on
+                               # the test merge commit never replaces the required app's failing result on the head,
+                               # nor hides its passing result for a check the base branch requires.
+                               ({"merge_checks": [check_run("build", required=False, app="optional-ci")],
+                                 "checks": [check_run("test"), check_run("build", conclusion="FAILURE")]}, "failing"),
+                               ({"protected_checks": ["build"],
+                                 "merge_checks": [check_run("build", required=False, app="optional-ci")],
+                                 "checks": [check_run("test"), check_run("build")]}, "passing"),
+                               ({"protected_checks": [], "merge_checks": [check_run("build")],
                                  "checks": [check_run("test"), check_run("build", conclusion="FAILURE"),
                                             commit_status("build")]}, "passing")):
             with self.subTest(changes=changes):
@@ -4204,6 +4305,20 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual((coderabbit["unresolved_threads"], coderabbit["kept_open_threads"], evidence["ready_gate"]),
                          (0, 1, True))
         self.assertIn("question is human", coderabbit["open_threads"][0]["kept_open"])
+        # Another human reply leaves that judgment standing; the bot editing its finding, without commenting again,
+        # makes it actionable once more.
+        followed_up = review_thread("coderabbit", "Handle empty input", replies=[
+            ("operator", "User", "Should None be handled too?"), ("operator", "User", "Any update?")])
+        edited = review_thread("coderabbit", "Handle empty and None input",
+                               replies=[("operator", "User", "Should None be handled too?")])
+        for thread, kept in ((followed_up, 1), (edited, 0)):
+            with self.subTest(kept=kept):
+                self.set_github(issue, threads=[thread])
+                coderabbit = self.fixer_json(issue, "evidence")["bots"]["coderabbit"]
+                self.assertEqual((coderabbit["unresolved_threads"], coderabbit["kept_open_threads"]), (1 - kept, kept))
+        self.assertIn("CodeRabbit has 1 unresolved thread(s)", self.pr_fixer(issue, "finish", "ready").stderr)
+        self.set_github(issue, threads=[question])
+        self.assertEqual(self.fixer_json(issue, "evidence")["bots"]["coderabbit"]["kept_open_threads"], 1)
         # The bot raising the finding again in that thread makes it actionable once more.
         reraised = review_thread("coderabbit", "Handle empty input", replies=[
             ("operator", "User", "Should None be handled too?"), ("coderabbitai", "Bot", "Still unhandled.")])
@@ -4607,7 +4722,28 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 evidence = self.fixer_json(issue, "evidence")
                 self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, state == "passing"))
                 self.assertEqual(evidence["ci"].get("unverified_required_workflows"),
-                                 [ci_workflow] if state == "pending" else None)
+                                 [ci_workflow + "@refs/heads/main"] if state == "pending" else None)
+        # A rule names the file at a ref (or a pinned commit). The pull request's own run of the same file, which
+        # GitHub links at this head (the version the pull request carries), does not stand for main's version, and
+        # a rule for the same file at another ref is a requirement of its own.
+        release = {"path": ci_workflow, "ref": "refs/heads/release"}
+        pinned = {"path": ci_workflow, "ref": None, "sha": "e" * 40}
+        main = check_run("test", required=False, workflow=ci_run)
+        for rules, checks, unverified in (
+                ([ci_workflow], [check_run("test", required=False, workflow=ci_run + (head,))],
+                 [ci_workflow + "@refs/heads/main"]),
+                ([ci_workflow, release], [main], [ci_workflow + "@refs/heads/release"]),
+                ([ci_workflow, release], [main, check_run("test", required=False, workflow=ci_run + ("d" * 40,))], None),
+                ([pinned], [main], [ci_workflow]),
+                ([pinned], [check_run("test", required=False, workflow=ci_run + ("e" * 40,))], None),
+                # A ref that GitHub does not resolve leaves its rule unverified.
+                ([{"path": ci_workflow, "ref": "refs/heads/gone"}], [main], [ci_workflow + "@refs/heads/gone"])):
+            with self.subTest(rules=rules, unverified=unverified):
+                self.set_github(issue, ruleset_workflows=rules, checks=checks, refs={"heads/release": "d" * 40})
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertEqual((evidence["ci"]["state"], evidence["ci"].get("unverified_required_workflows")),
+                                 ("pending" if unverified else "passing", unverified))
+        self.set_github(issue, ruleset_workflows=[ci_workflow])
         # The verdict agrees: a same-named push run never makes the pull request ready.
         self.set_github(issue, checks=[pushed])
         self.fixer_json(issue, "evidence")
@@ -4710,36 +4846,48 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(len(self.fixer_tabs_created()), 1)
         self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-2"])
         self.assertFalse(self.herdr_pane_actions("fix-pane-9"))
-        # A creation response is lost: only the tab that appeared after the fixer's own request is recovered.
+        # A creation response is lost: even the one tab that appeared after the fixer's own request (in the same
+        # workspace and worktree, with its label) is not proven to be the fixer's, so it is never adopted.
         close("fix-tab-2")
         self.log.write_text("")
         self.assertEqual(self.issue_helper(**self.fixer_route(issue, MOCK_TAB_CREATE="lost")).returncode, 1)
         self.assertFalse(self.fixer_launches())
         self.log.write_text("")
-        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
-        self.assertFalse(self.fixer_tabs_created())
-        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-3"])
-        self.assertFalse(self.herdr_pane_actions("fix-pane-9"))
-        # Two labelled tabs appeared since its request: which one it created is ambiguous, so nothing is touched.
+        result = self.issue_helper(**self.fixer_route(issue))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("tab fix-tab-3 labelled PR Fixer appeared", result.stderr)
+        self.assertIn("none was adopted", result.stderr)
+        self.assertFalse(self.fixer_tabs_created() or self.herdr_pane_actions("fix-pane-3")
+                         or self.herdr_pane_actions("fix-pane-9"))
+        self.assertIsNone(json.loads(self.fixer_records()[0].read_text())["route"]["fixer"]["pane_id"])
+        # Once a human closes it, exactly one new tab is created and only that one is used.
         close("fix-tab-3")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertEqual(len(self.fixer_tabs_created()), 1)
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-4"])
+        self.assertFalse(self.herdr_pane_actions("fix-pane-9"))
+        # Any labelled tab that appeared since an unconfirmed request blocks creation until a human closes it.
+        close("fix-tab-4")
         self.assertEqual(self.issue_helper(**self.fixer_route(issue, MOCK_TAB_CREATE="lost")).returncode, 1)
         self.fixer_herdr_tabs(issue, lambda tabs: tabs.append({"tab": "fix-tab-8", "pane": "fix-pane-8",
                                                                "cwd": worktree}))
         self.log.write_text("")
         result = self.issue_helper(**self.fixer_route(issue))
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("ambiguous", result.stderr)
+        self.assertIn("tabs fix-tab-5, fix-tab-8 labelled PR Fixer appeared", result.stderr)
         self.assertFalse(self.fixer_tabs_created() or self.herdr_calls("agent", "start")
                          or self.herdr_calls("agent", "prompt"))
+        close("fix-tab-5")
         close("fix-tab-8")
         self.log.write_text("")
         self.assert_success(self.issue_helper(**self.fixer_route(issue)))
-        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-4"])
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-6"])
         # Before its tab is recorded, an agent with the fixer's name in another tab (an earlier run's, or anyone's)
         # is not the fixer: it is neither adopted, focused, nor prompted, by the dispatcher or by the handoff.
-        close("fix-tab-4")
+        close("fix-tab-6")
         self.assertEqual(self.issue_helper(**self.fixer_route(issue, MOCK_TAB_CREATE="lost")).returncode, 1)
-        close("fix-tab-5")
+        close("fix-tab-7")
         self.fixer_herdr_tabs(issue, lambda tabs: tabs[0].update(agent={"name": "target-fix-8", "kind": "codex",
                                                                         "agent_status": "idle"}))
         self.log.write_text("")
@@ -4753,16 +4901,23 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertIsNone(json.loads(self.fixer_records()[0].read_text())["route"]["fixer"]["pane_id"])
 
     def test_pr_fixer_reports_unverified_ci_rather_than_the_round_limit_when_rounds_are_spent(self):
-        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 1})
-        first = self.publish_implementation(issue)
-        self.assert_success(self.pr_fixer(issue, "handoff"))
-        finding = review_thread("coderabbit", "Handle empty input")
-        self.set_github(issue, reviews=[bot_review("coderabbit", first)], checks=[check_run("test")], threads=[finding])
-        final = self.fixer_commit(issue, "round 1")
-        self.assertEqual(self.fixer_json(issue, "push", final, **self.fixer_pane())["rounds"]["remaining"], 0)
-        # The final head is reviewed, with a finding left, but no check registers within the bounded wait.
+        def spent(name):
+            """One enrollment whose single round is spent; the final head is reviewed, with a finding left."""
+            issue = self.fixer_issue(name=name, fixer={"agent": "codex", "enabled": True, "bots": "coderabbit",
+                                                       "max_rounds": 1})
+            first = self.publish_implementation(issue)
+            self.assert_success(self.pr_fixer(issue, "handoff"))
+            finding = review_thread("coderabbit", "Handle empty input")
+            self.set_github(issue, reviews=[bot_review("coderabbit", first)], checks=[check_run("test")],
+                            threads=[finding])
+            final = self.fixer_commit(issue, "round 1")
+            self.assertEqual(self.fixer_json(issue, "push", final, **self.fixer_pane())["rounds"]["remaining"], 0)
+            self.set_github(issue, reviews=[bot_review("coderabbit", final, number=2)], checks=[])
+            return issue, final
+
+        # No check registers for the final head within the bounded wait.
+        issue, final = spent("unregistered")
         bounded = {"GH_DASH_PR_FIXER_REGISTRATION_POLLS": "1", "GH_DASH_PR_FIXER_CALL_POLLS": "1"}
-        self.set_github(issue, reviews=[bot_review("coderabbit", final, number=2)], checks=[])
         waited = self.fixer_json(issue, "wait", **bounded)
         self.assertEqual((waited["wait"], waited["ci"]["state"]), ("settled", "none"))
         for changes, detail in (({}, "is none"),
@@ -4779,25 +4934,54 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         report = self.fixer_json(issue, "finish", "pending", "--reason", "No CI check registered", **bounded)
         self.assertEqual((report["result"], report["ci"], report["rounds"]["remaining"]),
                          ("review/CI pending or unverifiable", "none", 0))
-        # With the final head's CI verified, the spent budget is the accurate verdict.
-        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")])
+        # With the final head's CI verified, a merge conflict, not the budget, is what blocks the pull request,
+        # whether its registered checks pass or fail.
+        issue, final = spent("verified")
+        for conclusion in ("SUCCESS", "FAILURE"):
+            with self.subTest(conclusion=conclusion):
+                self.set_github(issue, checks=[check_run("test", conclusion=conclusion)],
+                                pr={"number": 12, "mergeable": "CONFLICTING"})
+                result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "A finding remains")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("has a merge conflict with feature/friend, so the round limit is not what stopped this "
+                              "run", result.stderr)
+                self.assertIn("Finish blocked and report the merge conflict", result.stderr)
+                self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        # Without one, the spent budget is the accurate verdict.
+        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")], pr={"number": 12})
         report = self.fixer_json(issue, "finish", "round-limit", "--reason", "A finding and a failing test remain")
         self.assertEqual((report["result"], report["ci"], report["verified_head"]), ("round limit reached", "failing", final))
 
     def test_pr_fixer_that_finished_is_never_restarted_or_prompted_again(self):
-        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
-        head = self.publish_implementation(issue)
-        self.assert_success(self.pr_fixer(issue, "handoff"))
-        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
-                        checks=[check_run("test")])
-        self.fixer_json(issue, "evidence")
-        for result, args in (("ready", ()), ("pending", ("--reason", "Waiting on a human")),
-                             ("blocked", ("--reason", "Out of scope"))):
+        results = (("ready", (), "ready for human review"),
+                   ("pending", ("--reason", "Waiting on a human"), "review/CI pending or unverifiable"),
+                   ("blocked", ("--reason", "Out of scope"), "blocked"),
+                   ("round-limit", ("--reason", "Findings remain"), "round limit reached"))
+        for result, args, label in results[:3]:
             with self.subTest(result=result):
+                # Each result is recorded on an enrollment of its own, so what is checked is the result asked for.
+                issue = self.fixer_issue(name="finished " + result,
+                                         fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+                head = self.publish_implementation(issue)
+                self.assert_success(self.pr_fixer(issue, "handoff"))
+                self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                                checks=[check_run("test")])
+                self.fixer_json(issue, "evidence")
                 self.fixer_herdr_tabs(issue, lambda tabs: tabs[0].update(
                     agent={"name": "target-fix-8", "kind": "codex", "agent_status": "idle"}))
-                self.fixer_json(issue, "finish", result, *args)
+                report = self.fixer_json(issue, "finish", result, *args)
+                self.assertEqual((report["result"], report["published_head"]), (label, head))
                 status = self.fixer_json(issue, "status")
+                self.assertEqual((status["outcome"]["result"], status["outcome"]["head"]), (result, head))
+                # The first verdict is final: repeating it reports it unchanged, and no other result replaces it.
+                again = self.fixer_json(issue, "finish", result, *args)
+                self.assertEqual((again["result"], again["already_recorded"]), (label, True))
+                for other, other_args, _ in results:
+                    if other != result:
+                        refused = self.pr_fixer(issue, "finish", other, *other_args)
+                        self.assertEqual(refused.returncode, 1, refused.stdout)
+                        self.assertIn("already recorded its result: " + label, refused.stderr)
+                self.assertEqual(self.fixer_json(issue, "status"), status)
                 # Pressing I again with the finished fixer idle only focuses it.
                 self.log.write_text("")
                 self.assert_success(self.issue_helper(**self.fixer_route(issue)))
@@ -4816,8 +5000,101 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                                      or self.herdr_calls("agent", "focus") or self.fixer_tabs_created()
                                      or self.fixer_pushes())
                     self.assertEqual(self.fixer_json(issue, "status"), status)
-                self.fixer_herdr_tabs(issue, lambda tabs: tabs.append({"tab": "fix-tab-1", "pane": "fix-pane-1",
-                                                                       "cwd": str(issue["worktree"])}))
+                # Nothing is published after it either: a later commit is neither pushed nor charged a round.
+                self.log.write_text("")
+                late = self.fixer_commit(issue, "after the verdict")
+                refused = self.pr_fixer(issue, "push", late, **self.fixer_pane())
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn("its run is over: nothing was pushed or counted", refused.stderr)
+                self.assertEqual(self.remote_branch(issue), head)
+                self.assertFalse(self.fixer_pushes())
+                self.assertEqual(self.fixer_json(issue, "status"), status)
+
+    def test_pr_fixer_verdict_rechecks_ci_and_bot_feedback_of_the_same_head_before_recording(self):
+        issue = self.fixer_issue(name="ready verdict", fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        clean = bot_review("coderabbit", head, body="Actionable comments posted: 0")
+        # Each change lands on GitHub, for the same head, after finish read its evidence and before it records.
+        for changes in ({"checks": [check_run("test", conclusion="FAILURE")]},
+                        {"checks": [check_run("test", status="IN_PROGRESS", conclusion=None)]},
+                        {"reviews": [bot_review("coderabbit", head, body="Actionable comments posted: 1")]},
+                        {"comments": [pr_comment("coderabbitai", "One more finding: handle None.", number=8)]},
+                        {"threads": [review_thread("coderabbit", "Handle empty input")]}):
+            with self.subTest(changes=sorted(changes)):
+                self.set_github(issue, reviews=[clean], checks=[check_run("test")], comments=[], threads=[])
+                self.assertTrue(self.fixer_json(issue, "evidence")["ready_gate"])
+                self.set_github(issue, after_evidence=changes)
+                result = self.pr_fixer(issue, "finish", "ready")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("changed while it was being checked, so nothing was recorded", result.stderr)
+                self.assertNotIn("after_evidence", json.loads(issue["github"].read_text()))
+                self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        self.set_github(issue, reviews=[clean], checks=[check_run("test")], comments=[], threads=[])
+        self.fixer_json(issue, "evidence")
+        self.assertEqual(self.fixer_json(issue, "finish", "ready")["result"], "ready for human review")
+        # The round limit is confirmed the same way.
+        issue = self.fixer_issue(name="round-limit verdict",
+                                 fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 1})
+        first = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.set_github(issue, reviews=[bot_review("coderabbit", first)], checks=[check_run("test")])
+        final = self.fixer_commit(issue, "round 1")
+        self.assertEqual(self.fixer_json(issue, "push", final, **self.fixer_pane())["rounds"]["remaining"], 0)
+        failing = [check_run("test", conclusion="FAILURE")]
+        self.set_github(issue, reviews=[bot_review("coderabbit", final, number=2)], checks=failing,
+                        threads=[review_thread("coderabbit", "Handle empty input")],
+                        after_evidence={"checks": [check_run("test", status="IN_PROGRESS", conclusion=None)]})
+        result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "A finding remains")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("changed while it was being checked", result.stderr)
+        self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        self.set_github(issue, checks=failing)
+        report = self.fixer_json(issue, "finish", "round-limit", "--reason", "A finding remains")
+        self.assertEqual((report["result"], report["verified_head"]), ("round limit reached", final))
+
+    def test_pr_fixer_wait_holds_its_deadline_while_another_helper_holds_the_issue_lock(self):
+        import threading
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                        checks=[check_run("test")])
+        lock = Path(self.env["XDG_STATE_HOME"]) / "gh-dash-codex-issue/locks/repo-6-friend-6-target-issue-8.lock"
+
+        def hold():
+            lock.mkdir(mode=0o700)
+            (lock / "owner").write_text(str(os.getpid()) + "\n0\n")
+
+        def release():
+            (lock / "owner").unlink()
+            lock.rmdir()
+        # A wait call gives up on the lock at its own deadline (10 seconds here), not the 20-second lock timeout.
+        hold()
+        try:
+            started = time.monotonic()
+            result = self.pr_fixer(issue, "wait", GH_DASH_PR_FIXER_CALL_SECONDS="10")
+            elapsed = time.monotonic() - started
+        finally:
+            release()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("reached its 10-second limit while another helper held the issue lock", result.stderr)
+        self.assertIn("Run wait again", result.stderr)
+        self.assertLess(elapsed, 18)
+        # Any other command keeps the full lock timeout: it is still waiting after that deadline and proceeds once
+        # the lock is released.
+        hold()
+        timer = threading.Timer(12, release)
+        timer.start()
+        try:
+            started = time.monotonic()
+            evidence = self.fixer_json(issue, "evidence", GH_DASH_PR_FIXER_CALL_SECONDS="10")
+            elapsed = time.monotonic() - started
+        finally:
+            timer.join()
+        self.assertGreater(elapsed, 11)
+        self.assertTrue(evidence["settled"])
+        self.assertEqual(self.fixer_json(issue, "wait")["wait"], "settled")
 
     def test_pr_fixer_enrollment_captures_one_profile_snapshot_despite_a_concurrent_save(self):
         # Another mf-config session saves a disabled Greptile/Sonnet profile while enrollment probes interfaces.
@@ -5119,6 +5396,10 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                          [["Off", "On"], ["Both", "CodeRabbit", "Greptile"], [], ["Codex", "Claude Code", "Cursor"]])
         self.assertEqual([prompt[2] for prompt in prompts[1:5]], ["Off", "Both", "5", "Codex"])
         self.assertIn("captured when Issues I first creates an issue branch", result.stdout)
+        # Settings captured per branch cannot be applied by restarting a running fixer, so that is not suggested.
+        self.assertIn("Issue branches that already exist keep the PR Fixer settings captured when they were created",
+                      result.stdout)
+        self.assertNotIn("Existing Herdr agents keep their original harness and options", result.stdout)
         profiles = json.loads(path.read_text())["profiles"]
         self.assertEqual(profiles, {"issue-implement": {"agent": "cursor", "model": "gpt-5"},
                                     "pr-fixer": {"agent": "claude", "model": "opus", "effort": "high", "enabled": True,

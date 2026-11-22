@@ -523,7 +523,7 @@ Issues `I` creates a new issue branch, that branch is enrolled (see
 [mf-config](#agent-profiles-mf-config)); Issues `I` first checks the installed
 interfaces it needs (`no-mistakes axi run --skip`, `axi status`,
 `axi sync --check`, and Herdr `tab create --workspace --cwd --label --no-focus`,
-`tab list`, `pane list`) and refuses to create the branch, naming the missing
+`tab list`) and refuses to create the branch, naming the missing
 one, rather than reconfiguring anything. The implementation prompt then
 delegates only the CI stage:
 
@@ -534,8 +534,11 @@ no-mistakes axi run --yes --skip ci --base-branch <captured-branch> --intent "$(
 Every other stage and native gate (protected paths, questions, approvals,
 failures) still runs; shared No-Mistakes defaults and the target's
 `.no-mistakes.yaml` are untouched, and an already active run is reattached as it
-is, never aborted or restarted. The skip is reported as a skip: it neither
-waives GitHub's checks nor means the PR is ready.
+is, never aborted or restarted. Only a run whose CI stage was actually skipped
+is driven without waiting for checks; a reattached run that kept its CI stage
+gets the same bounded check-registration wait and mergeability and
+workflow-trigger diagnostics as the original workflow. The skip is reported as
+a skip: it neither waives GitHub's checks nor means the PR is ready.
 
 **Handoff.** When its run is terminal with Push and PR completed, the
 implementer runs the bundled
@@ -568,12 +571,16 @@ implementation, starts a second fixer, or resets the budget. Once the fixer has
 recorded a result with `finish`, its run is over: pressing `I` or repeating the
 handoff only focuses it while it is open, or reports the result once it has
 exited, and never restarts or prompts it. Only the fixer's own tab and agent
-are reused: a tab whose creation response was lost is recognized only as one
-that appeared after the fixer asked Herdr for it (every tab that existed before
-is checkpointed first), and an agent only in the fixer's recorded pane. A tab
-labelled PR Fixer that it did not create, or an agent with its name in any other
-tab, is never adopted, and an ambiguous match stops without touching any tab or
-agent. A fixer is started, restarted after exiting, or prompted to write only
+are reused: the tab Herdr confirmed creating for it, and an agent only in the
+fixer's recorded pane. Herdr gives a tab nothing that proves who created it, so
+a tab whose creation response was lost is never adopted, whatever its label,
+workspace, or worktree, and even though every tab that existed before the
+request is checkpointed first: while a tab labelled PR Fixer has appeared since
+that request, nothing is created, started, or prompted, and the fixer names
+that tab so you can close it (or rename it if it is yours) before retrying. A
+tab labelled PR Fixer that it did not create, or an agent with its name in any
+other tab, is never adopted, and an ambiguous match stops without touching any
+tab or agent. A fixer is started, restarted after exiting, or prompted to write only
 after GitHub confirms the same open PR and published head and the worktree holds
 exactly that head (or the fixer's own interrupted publication); other local
 commits or tracked changes are preserved and reported, never published.
@@ -610,7 +617,8 @@ explains non-actionable ones on their threads, and resolves only selected-bot
 threads it addressed or explained; an unresolved selected-bot thread keeps the
 PR from being ready. When a human's reply still awaits an answer, the fixer
 leaves the thread open and records with `keep-open` that its bot finding is
-settled; a later bot comment there makes it actionable again. It requests a
+settled; a later or edited bot comment there makes it actionable again (a
+human-only reply does not). It requests a
 re-review (`@coderabbitai review`, `@coderabbitai full review` after a failed,
 cancelled, or configuration-skipped CodeRabbit review, or `@greptileai`) at most
 once per head (a plain CodeRabbit request it then skipped is retried once as a
@@ -636,14 +644,19 @@ regressions this PR caused within the same budget and reports unrelated
 failures, missing CI, merge conflicts, and permission problems as blockers.
 An empty check list is not success, a required check (a bot's included) counts as
 CI, a result GitHub's test merge commit of that head reports for a check takes
-precedence over the head commit's result for the same check (a check run and a
-commit status sharing a name are separate, and both are required), a check the base branch's protection or
+precedence over the head commit's result for the same check, the same name
+reported by the same app or account (a check run and a commit status sharing a
+name are separate, and both are required, and so are same-named checks that
+different apps report), a check the base branch's protection or
 rulesets require stays pending until it registers, a workflow its rulesets
-require (which names a file, not its checks) keeps CI pending until GitHub
-reports the PR's merge state as clean for that head or that file's own run for
-this PR (a `pull_request` or `pull_request_target` run whose check suite GitHub
-matches to exactly this PR) has passed on the head; a push run of the same file,
-with the same check names, never counts. A trusted default-branch
+require (which names a file at a ref or commit, not its checks) keeps CI
+pending until GitHub reports the PR's merge state as clean for that head or that
+file's own run for this PR (a `pull_request` or `pull_request_target` run whose
+check suite GitHub matches to exactly this PR, and whose workflow file GitHub
+links at the commit the rule's pinned SHA or ref names) has passed on the head.
+Rules for the same file at different refs are separate requirements; a run of
+the same file that GitHub does not tie to that commit (such as the PR's own
+version of the file), or a push run with the same check names, never counts. A trusted default-branch
 `no_ci: true` never waives a selected bot.
 
 **Round budget.** One round is one fix-and-push cycle, whatever mix of bot and
@@ -661,13 +674,15 @@ accepted it is reconciled without another round; retrying the same commit uses
 none. Once the budget is spent nothing more is pushed, but the last head's
 reviews and checks are still observed. If HEAD no longer matches a commit whose
 publication was interrupted, nothing is pushed until a human decides. Each
-`wait` call returns within about 90 seconds (every command it runs is cut off at
-that deadline), and the total wait per head is bounded: each attempt is counted
+`wait` call returns within about 90 seconds (every command it runs, and any
+wait for the issue lock, is cut off at that deadline), and the total wait per head is bounded: each attempt is counted
 before GitHub is contacted, so failed polls use it too. A head changed by someone else,
 a closed or retargeted PR, or ambiguous state stops the fixer without adopting
 or overwriting anything.
 
-**Outcomes.** `finish` records exactly one result: **ready for human review**
+**Outcomes.** `finish` records exactly one result, once: repeating it reports
+the recorded result unchanged, a different result is refused, and `push` refuses
+to publish after it. The result is **ready for human review**
 (every selected bot completed for the latest published head, no unresolved bot
 thread other than one kept open for a human discussion, required checks passing or the owner's `no_ci: true`, the local
 worktree on the PR's branch exactly at that head, no No-Mistakes run owning
@@ -675,8 +690,11 @@ the branch or holding its custody, no publication since that head was
 checked, and no selected-bot feedback posted or edited since `evidence` or
 `wait` last showed it), **review/CI pending or unverifiable**, **round
 limit reached** (only after the final head's reviews and hosted CI were
-verified; CI still pending, with no registered check, or blocked by a merge
-conflict is reported as pending or blocked instead), or **blocked**. The
+verified; CI still pending, with no registered check, or a pull request with a
+merge conflict is reported as pending or blocked instead), or **blocked**.
+Ready and round limit are recorded only if, read again just before recording,
+the head, its hosted CI, and the selected bots' reviews and feedback are
+unchanged from what was checked. The
 fixer's final report gives the PR URL, latest published and verified head, bots
 and their completion, rounds used/allowed, fixes, remaining findings, CI
 results, and No-Mistakes skips or overrides. It never merges, enables
@@ -1235,22 +1253,31 @@ and review pull requests, with registered CI checks.
 2. Press `I` on a small issue. The prompt runs
    `no-mistakes axi run --yes --skip ci ...`; the run finishes after Push and PR
    with CI reported as skipped, and no fixer tab exists yet.
-3. Before the run is terminal, run the handoff command from the prompt yourself:
-   it refuses and changes nothing. Once the implementer runs it after
-   publication, one **PR Fixer** tab appears in the same workspace (without
-   taking focus), at the same worktree, running the fixer's harness/model; the
-   implementer's tab stays open and stops writing.
+3. Before the run is terminal, have the handoff command from the prompt run in
+   the implementer's own recorded pane (ask the implementer to run it, or use
+   its harness's shell escape there): it refuses because the run is still
+   active, and changes nothing. From any other pane or shell it is refused for
+   that reason instead, before the run is checked. Once the implementer runs it
+   after publication, one **PR Fixer** tab appears in the same workspace
+   (without taking focus), at the same worktree, running the fixer's
+   harness/model; the implementer's tab stays open and stops writing.
 4. Watch the fixer: it waits for both bots' reviews of the published head,
    fixes or answers their findings and failing required checks, pushes through
    the helper, and stops after at most two fix-and-push rounds with one result
    (ready, pending, round limit, or blocked) and a full report. `status` shows
-   the rounds used. The PR stays open and unmerged. While it is still working
-   (before it records a result), exit it in its pane and press `I`: it restarts
-   in the same tab with the same budget.
+   the rounds used. The PR stays open and unmerged. Before it records a result,
+   while it is waiting on the published head with no tracked edits and no
+   commits it has not yet published with `push` (in the worktree, `git status`
+   shows no tracked changes and `git rev-parse HEAD` is the `published_head`
+   that `status` reports, with no `pending_push`), exit it in its pane and press
+   `I`: it restarts in the same tab with the same budget. Exiting during
+   unpublished work instead keeps and reports that work, and nothing is
+   restarted until a human decides whose it is.
 5. After it records its result, press `I` again (also with the network down):
    it only focuses the fixer. Exit the fixer in its pane and press `I` again:
    nothing is restarted or prompted, and the notification and `status` report
-   the recorded result. Run the handoff command again: no second fixer.
+   the recorded result. Run the handoff command again in the implementer's
+   pane: no second fixer.
 6. Disable the fixer in `mf-config`, then press `I` on another issue: the
    original native-CI workflow runs, with no fixer tab, while the first issue's
    branch keeps its fixer.
