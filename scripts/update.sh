@@ -22,6 +22,7 @@ plan_detail=''
 plan_manual=''
 plan_path=''
 probe_directory=''
+probe_unsafe=' '
 plan_targets=()
 upgraded=()
 declined=()
@@ -127,19 +128,26 @@ fast_forward() {
 # A launcher script that runs mise use (as omarchy-mise-install's do) writes your global mise configuration every
 # run, even offline once its tool is installed. As in doctor, gh, Gum, npm, and the node acpx starts run behind a
 # private directory with a probe for each such launcher of these tools: the installed tool it would run, with the
-# environment mise gives it (see mf_link_configuring_launchers); it is removed on exit. Such a launcher whose tool is
-# not installed is lazy and gets no probe: discovery reports it and never runs it.
+# environment mise gives it (see mf_link_configuring_launchers); it is removed on exit. Such a launcher whose tool
+# cannot be resolved (as while it is not installed) gets no probe, so it stays in probe_unsafe for the whole run, even
+# if its tool is installed meanwhile: discovery reports it and never runs it.
 prepare_probes() {
+	local probes name
 	case "$platform" in macos | ubuntu) return 0 ;; esac
 	probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-update.XXXXXX")" ||
 		die 'cannot create a temporary directory for the discovery probes; nothing was changed by them'
 	trap 'rm -rf -- "$probe_directory"' EXIT
-	mf_link_configuring_launchers "$probe_directory" gh gum codex claude cursor-agent node npm >/dev/null
+	probes="$(mf_link_configuring_launchers "$probe_directory" gh gum codex claude cursor-agent node npm)" ||
+		die 'cannot place the discovery probes; nothing was changed by them'
+	while IFS= read -r name; do
+		[ -z "$name" ] || [[ "$name" == *$'\t'* ]] || probe_unsafe="$probe_unsafe$name "
+	done <<<"$probes"
 }
 
-# Runs a command with PATH presented as prepare_probes arranged it.
+# Runs a command with PATH presented as prepare_probes arranged it, never one it found unsafe.
 probe() {
 	if [ -n "$probe_directory" ]; then
+		case "$probe_unsafe" in *" $1 "*) return 127 ;; esac
 		PATH="$probe_directory:$PATH" "$@"
 	else
 		"$@"
@@ -209,9 +217,14 @@ plan_package() {
 }
 
 # Lazy mise launchers (Omarchy's, or your own mise's on Arch) install their tool when run, so discovery never runs
-# one whose tool is not installed yet (nor on an unrecognized platform, such as an incomplete Omarchy installation).
+# one whose tool is not installed yet (nor on an unrecognized platform, such as an incomplete Omarchy installation),
+# nor one that prepare_probes found unsafe.
 lazy_pending() {
+	local name
 	case "$platform" in macos | ubuntu) return 1 ;; esac
+	for name in "$@"; do
+		case "$probe_unsafe" in *" $name "*) return 0 ;; esac
+	done
 	[ -n "$(mf_lazy_pending "$@")" ]
 }
 
@@ -220,6 +233,15 @@ daemon_lazy_pending() {
 	local PATH="$1"
 	shift
 	lazy_pending "$@"
+}
+
+# Where the probe directory cannot run scripts (such as a noexec TMPDIR), a launcher's probe is a link to its installed
+# tool, which runs without the environment mise gives it (see mf_probe_lacks_environment). Discovery still reads
+# through it, but the upgrade you would approve (plan_text) stays manual rather than running outside the account or
+# registry your mise environment selects.
+plan_lacks_environment() {
+	[ -n "$probe_directory" ] && mf_probe_lacks_environment "$probe_directory" "$1" || return 1
+	plan_manual="$plan_text runs $1 with the environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]), and its probe cannot run from ${TMPDIR:-/tmp}, where scripts cannot run (as on a noexec mount); rerun make update with TMPDIR set to a directory where scripts can run"
 }
 
 # mise- and pacman-managed installations update through their manager (on Omarchy, omarchy update). make update
@@ -275,8 +297,11 @@ plan_acpx() {
 		esac
 		;;
 	esac
-	plan_kind=npm
 	plan_text="npm ${plan_targets[*]}"
+	if plan_lacks_environment npm; then
+		return 0
+	fi
+	plan_kind=npm
 	plan_detail="npm package acpx (the ACP runner No-Mistakes uses for Cursor); npm's prefix setting is unchanged"
 }
 
@@ -292,8 +317,11 @@ plan_gh_dash() {
 	fi
 	list="$(MISE_OFFLINE=1 probe gh extension list 2>/dev/null)" || true
 	if grep -Eq "[[:space:]]dlvhdr/gh-dash([[:space:]]|\$)" <<<"$list"; then
-		plan_kind=extension
 		plan_text='gh extension upgrade dash'
+		if plan_lacks_environment gh; then
+			return 0
+		fi
+		plan_kind=extension
 		plan_detail='the dlvhdr/gh-dash GitHub CLI extension; never --force'
 	elif MISE_OFFLINE=1 probe gh dash --version >/dev/null 2>&1; then
 		plan_manual='gh dash is not the dlvhdr/gh-dash extension; update it the way you installed it'
@@ -438,9 +466,10 @@ run_plan() {
 		fi
 		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
-	# Offline for mise only, as for the extension below: a mise npm or Node.js with an auto-update due would otherwise
-	# update Node.js first; npm itself still downloads acpx.
-	npm) MISE_OFFLINE=1 PATH="$bin_directory:$PATH" probe_npm "${plan_targets[@]}" ;;
+	# The npm (and so the Node.js and global prefix) that plan_acpx checked, offline for mise only, as for the extension
+	# below: a mise npm or Node.js with an auto-update due would otherwise update Node.js first; npm itself still
+	# downloads acpx.
+	npm) MISE_OFFLINE=1 probe_npm "${plan_targets[@]}" ;;
 	# Offline for mise only: a mise gh with an auto-update due would otherwise update itself first; gh itself still
 	# fetches the extension.
 	extension) MISE_OFFLINE=1 probe gh extension upgrade dash ;;

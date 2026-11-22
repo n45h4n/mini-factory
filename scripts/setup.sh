@@ -828,7 +828,17 @@ shell_tool_unavailable() {
 # offline, so no mise launcher updates its tool first. The tool itself runs as usual (its browser or device login, or gh
 # fetching the extension).
 run_approved() {
+	! approval_lacks_environment "$@" || return 1
 	MISE_OFFLINE=1 PATH="$shell_probes$PATH" "$@"
+}
+
+# Where setup's probe directory cannot run scripts (such as a noexec TMPDIR), a launcher's probe is a link to its
+# installed tool, which runs without the environment mise gives it (see mf_probe_lacks_environment). Checks still run
+# it, but the action you approve (the arguments) stays a remaining action, reported here, rather than running outside
+# the account or registry your mise environment selects.
+approval_lacks_environment() {
+	[ -n "$shell_probes" ] && mf_probe_lacks_environment "${shell_probes%:}" "$1" || return 1
+	notice "Remaining action: $*, once setup can run $1 with the environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]): setup's probe for it cannot run from ${TMPDIR:-/tmp}, where scripts cannot run (as on a noexec mount). Rerun make setup with TMPDIR set to a directory where scripts can run."
 }
 
 # The reason a pending action waits for a command that shell_tool_unavailable reports.
@@ -1069,6 +1079,10 @@ ensure_node_and_acpx() {
 		*) prefix='' ;;
 		esac
 		[ -n "$prefix" ] || npm_arguments=(install -g --prefix "$HOME/.local" acpx@latest)
+		if approval_lacks_environment npm "${npm_arguments[@]}"; then
+			pending=1
+			return 0
+		fi
 		if consent "acpx is the ACP runner No-Mistakes uses for Cursor. Install it with its documented npm ${npm_arguments[*]}?"; then
 			# Offline for mise only: a mise npm or Node.js with an auto-update due would otherwise update Node.js first;
 			# npm itself still downloads acpx.

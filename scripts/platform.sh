@@ -304,8 +304,8 @@ mf_configuring_launchers() {
 # trust for the project configurations it loads, so where mise env (which records none) finds one you have not
 # trusted, the probe runs in mise's safe mode, which records no trust and ignores project configuration. A launcher
 # without such a statement, or a directory where scripts cannot run (such as a noexec TMPDIR, where command lookup
-# would skip the probe), gets a link to the installed tool. A configured path (such as an absolute acpx_path) gets no
-# probe. Fails when a probe cannot be placed, so no caller runs that launcher instead.
+# would skip the probe), gets a link to the installed tool (see mf_probe_lacks_environment). A configured path (such as
+# an absolute acpx_path) gets no probe. Fails when a probe cannot be placed, so no caller runs that launcher instead.
 mf_link_configuring_launchers() {
 	local directory="$1" name tool request mise deps
 	shift
@@ -326,6 +326,15 @@ mf_link_configuring_launchers() {
 		ln -s -- "$tool" "$directory/$name" || return 1
 	done < <(mf_configuring_launchers "$@")
 	return 0
+}
+
+# Whether the directory's (the first argument's) probe for a command name (the second) is the link that stands in for
+# a launcher's mise x statement where scripts cannot run (see above): through it the installed tool runs without the
+# environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]). Checks still read through it, but
+# no action you approve runs through it, as it could store a login or install a package outside the account or registry
+# your mise environment selects. Only read, never run.
+mf_probe_lacks_environment() {
+	[ -L "$1/$2" ] && mf_configuring_launcher_request "$2" >/dev/null
 }
 
 # Prints each named command that PATH resolves to a mise launcher whose tool is not installed yet, so running

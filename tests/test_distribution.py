@@ -43,7 +43,7 @@ entry = {"tool": name, "args": args, "cwd": os.getcwd(), "path": os.path.realpat
          "env": {k: v for k, v in os.environ.items()
                  if k.startswith("GH_DASH_SOURCE_") or k in ("GH_REPO", "DOTFILES_DIR", "GIT_SSH_COMMAND",
                                                             "GUM_CONFIRM_TIMEOUT", "NPM_CONFIG_REGISTRY",
-                                                            "GH_CONFIG_DIR", "MISE_OFFLINE")}}
+                                                            "GH_CONFIG_DIR", "GLAB_CONFIG_DIR", "MISE_OFFLINE")}}
 with open(os.environ["MOCK_LOG"], "a") as stream:
     stream.write(json.dumps(entry) + "\n")
 def fail(message="forbidden external action"):
@@ -357,8 +357,10 @@ elif name == "acpx":
     else:
         fail()
 elif name == "glab":
-    if args == ["auth", "status"]:
-        print("gitlab.com: logged in")
+    if args[:3] == ["auth", "status", "--hostname"] and len(args) == 4:
+        if os.environ.get("MOCK_GLAB_AUTH") == "fail":
+            fail(args[3] + ": not logged in")
+        print(args[3] + ": logged in")
     else:
         fail()
 elif name == "node":
@@ -443,28 +445,37 @@ elif name == "no-mistakes":
     elif args == ["doctor"]:
         if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
             fail("doctor diagnostics must not send telemetry or check for updates")
+        mock_rejected = os.environ.get("MOCK_NM_REJECT") and re.search(os.environ["MOCK_NM_REJECT"], config.read_text())
+        # Like native doctor, a loaded configuration's forge profiles are checked first, each with its CLI from PATH in
+        # that profile's configuration directory: gh auth status --active --hostname HOST with GH_CONFIG_DIR for a
+        # gh_config_dir, glab auth status --hostname HOST with GLAB_CONFIG_DIR for a glab_config_dir. A failed check
+        # fails native doctor.
+        forge_failed = False
+        text = config.read_text() if config.exists() and not rejected and not mock_rejected else ""
+        for host, cli, directory in re.findall(r"^  ([^\s:]+):\n    (gh|glab)_config_dir: (.+)$", text, re.M):
+            variable = {"gh": "GH_CONFIG_DIR", "glab": "GLAB_CONFIG_DIR"}[cli]
+            command = [cli, "auth", "status", *(["--active"] if cli == "gh" else []), "--hostname", host]
+            try:
+                check = subprocess.run(command, env=dict(os.environ, **{variable: json.loads(directory)}),
+                                       capture_output=True, text=True)
+                problem = check.returncode and "authentication failed (" + (check.stdout + check.stderr).strip() + ")"
+            except OSError:
+                problem = cli + " not found"
+            print("  ✗ forge " + host + "  " + problem if problem else "  ✓ forge " + host + "  authenticated")
+            forge_failed = forge_failed or bool(problem)
         if rejected:
             print("  \u2717 gate validation  unavailable: load config (parse global config: yaml: unmarshal errors:\n"
                   + "\n".join("  line " + str(number) + ": field " + field + " not found in type " + kind
                               for number, field, kind in rejected)
                   + ")\n\n  some checks failed")
-        elif os.environ.get("MOCK_NM_REJECT") and re.search(os.environ["MOCK_NM_REJECT"], config.read_text()):
+        elif mock_rejected:
             # A native load rejection that nm-config's own checks cannot predict.
-            rejection = re.search(os.environ["MOCK_NM_REJECT"], config.read_text()).group()
-            print("  \u2717 gate validation  unavailable: load config (mock rejection: " + rejection
+            print("  \u2717 gate validation  unavailable: load config (mock rejection: " + mock_rejected.group()
                   + ")\n\n  some checks failed")
         elif os.environ.get("MOCK_NM_DOCTOR") == "fail":
             print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
         else:
-            print("  \u2713 gate validation  codex is runnable")
-        # Like native doctor, check each forge profile's CLI login from PATH: gh for gh_config_dir, glab for
-        # glab_config_dir.
-        for cli in ("gh", "glab"):
-            if config.exists() and re.search(r"^\s+" + cli + r"_config_dir:", config.read_text(), re.M):
-                try:
-                    subprocess.run([cli, "auth", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except OSError:
-                    pass
+            print("  \u2713 gate validation  codex is runnable" + ("\n\n  some checks failed" if forge_failed else ""))
     elif args == ["update"]:
         # The native updater refuses to restart the daemon while runs are active (without --force).
         if os.environ.get("MOCK_NM_ACTIVE_RUNS"):
@@ -5312,6 +5323,31 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.lazy_triggered(), [])
         self.assertEqual(launcher.read_text(), text)
 
+    def test_omarchy_update_never_runs_a_launcher_whose_tool_its_discovery_could_not_resolve(self):
+        self.clone_fixture()
+        self.omarchy_system(installed=("codex", "claude", "cursor-agent", "node"))
+        # Your gh launcher writes your global mise configuration every run, and its tool is not installed when make
+        # update places its probes; another process installs it right after.
+        launcher = self.home / ".local/bin/gh"
+        text = self.configuring_launcher(launcher, "gh")
+        update = self.bundle / "scripts/update.sh"
+        original = update.read_text()
+        patched = original.replace("\tprepare_probes\n", '\tprepare_probes\n\t: >"$MOCK_BIN/mise-installed-gh"\n', 1)
+        self.assertNotEqual(patched, original)
+        update.write_text(patched)
+        # Only make update's own upgrades run here: without make, its later setup phase cannot start.
+        (self.mock / "make").unlink()
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8)
+        # gh has no probe, so discovery keeps it unrunnable for the whole run: neither the launcher nor gh runs.
+        self.assertIn("gh-dash extension: manual update only: GitHub CLI, a lazy mise gh, is not installed yet",
+                      result.stdout)
+        self.assertTrue((self.mock / "mise-installed-gh").exists())
+        self.assertFalse(self.calls("gh"))
+        self.assertFalse(self.mise_changes())
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertEqual(launcher.read_text(), text)
+
     def test_omarchy_approved_acpx_npm_install_and_update_never_start_a_due_node_auto_update(self):
         self.clone_fixture()
         system, _ = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
@@ -5576,6 +5612,60 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.run_script(helper, "probes", probes, "gh").stdout.splitlines(), ["gh\t" + installed])
         self.assertEqual(os.readlink(probes / "gh"), installed)
 
+    def test_omarchy_approved_actions_wait_where_probes_cannot_keep_the_mise_environment(self):
+        self.clone_fixture()
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        # Your gh and npm launchers write your global mise configuration every run; mise's [env] gives gh your GitHub CLI
+        # account configuration and npm the only registry it can reach.
+        launchers = {self.home / ".local/bin/gh": ("gh", "gh"), self.home / ".local/bin/npm": ("npm", "node")}
+        texts = {path: self.configuring_launcher(path, *names) for path, names in launchers.items()}
+        self.env["MOCK_MISE_ENV"] = json.dumps({"GH_CONFIG_DIR": str(self.home / "work gh account"),
+                                                "NPM_CONFIG_REGISTRY": "https://registry.internal.example/"})
+        self.assert_success(self.interactive_setup("y"))
+        # Where the probe directory cannot run scripts (such as a noexec TMPDIR), each probe is a link to the installed
+        # tool, which runs without that environment.
+        helper = self.bundle / "scripts/platform.sh"
+        original = helper.read_text()
+        patched = original.replace('[ -x "$directory/$name" ] && continue', 'false && continue', 1)
+        self.assertNotEqual(patched, original)
+        helper.write_text(patched)
+        install = "npm install -g --prefix " + str(self.home / ".local") + " acpx@latest"
+
+        def unchanged():
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse(self.mise_changes())
+            for path, text in texts.items():
+                self.assertEqual(path.read_text(), text)
+
+        # make update still checks the gh-dash extension and acpx through those links, but their upgrades stay manual.
+        self.native_layouts("acpx")
+        (self.mock / "make").unlink()
+        self.log.write_text("")
+        result = self.interactive_update(["y"] * 8)
+        self.assertIn("gh-dash extension: manual update only: gh extension upgrade dash runs gh with the environment "
+                      "mise gives it", result.stdout)
+        self.assertIn("acpx: manual update only: " + install + " runs npm with the environment mise gives it",
+                      result.stdout)
+        self.assertIn("rerun make update with TMPDIR set to a directory where scripts can run.", result.stdout)
+        self.assertTrue([c for c in self.calls("gh") if c["args"] == ["extension", "list"]])
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["extension", "upgrade"]])
+        self.assertFalse(self.npm_changes())
+        unchanged()
+        # Setup's checks still run, but the login and the acpx installation you approve stay remaining actions.
+        self.acpx.unlink()
+        self.log.write_text("")
+        result = self.interactive_setup("y", MOCK_GH_AUTH="pending")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Remaining action: gh auth login --hostname github.com --web --scopes project, once setup can "
+                      "run gh with the environment mise gives it", result.stdout)
+        self.assertIn("Remaining action: " + install + ", once setup can run npm with the environment mise gives it",
+                      result.stdout)
+        self.assertIn("Rerun make setup with TMPDIR set to a directory where scripts can run.", result.stdout)
+        self.assertTrue([c for c in self.calls("gh") if c["args"][:2] == ["auth", "status"]])
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["auth", "login"]])
+        self.assertFalse(self.npm_changes())
+        unchanged()
+
     def test_omarchy_probes_never_trust_a_checkouts_mise_configuration_or_prepare_its_deps(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         # Your gh launcher writes your global mise configuration every run. Your global mise [env] selects one GitHub CLI
@@ -5653,8 +5743,10 @@ os.execv(executable, [executable, *args])
         self.assert_success(self.interactive_setup("y"))
         source = self.bundle / "no-mistakes/config.yaml"
         original = source.read_text()
-        profile = (original + "forge_profiles:\n  gitlab.com:\n    glab_config_dir: " + json.dumps(str(self.home / "glab"))
-                   + "\n")
+        glab_config = str(self.home / "glab")
+        profile = original + "forge_profiles:\n  gitlab.com:\n    glab_config_dir: " + json.dumps(glab_config) + "\n"
+        # Native doctor checks the profile's own host and glab configuration.
+        check = ["auth", "status", "--hostname", "gitlab.com"]
         # Your own mise provides glab lazily: its shim installs glab the first time it runs.
         (shims / "glab").symlink_to(system / "usr/bin/mise")
 
@@ -5686,15 +5778,22 @@ os.execv(executable, [executable, *args])
         result, ran = native_doctor(profile, MOCK_MISE_AUTO_UPDATE="glab")
         self.assert_success(result)
         self.assertTrue(ran)
-        self.assertEqual([c["args"] for c in self.calls("glab")], [["auth", "status"]])
+        self.assertEqual([(c["args"], c["env"].get("GLAB_CONFIG_DIR")) for c in self.calls("glab")],
+                         [(check, glab_config)])
+        # A failed GitLab login fails native doctor, and so doctor's No-Mistakes check.
+        result, ran = native_doctor(profile, MOCK_GLAB_AUTH="fail")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(ran)
+        self.assertIn("FAIL: No-Mistakes pipeline agent not ready (native doctor: ", result.stdout)
+        self.assertEqual([c["args"] for c in self.calls("glab")], [check])
         # A glab launcher that writes your global mise configuration every run is run as the installed glab instead.
         launcher = self.home / ".local/bin/glab"
         text = self.configuring_launcher(launcher, "glab")
         result, ran = native_doctor(profile)
         self.assert_success(result)
         self.assertTrue(ran)
-        self.assertEqual([(c["args"], c["path"]) for c in self.calls("glab")],
-                         [(["auth", "status"], str(self.home / ".local/share/mise/installs/glab/latest/bin/glab"))])
+        self.assertEqual([(c["args"], c["path"], c["env"].get("GLAB_CONFIG_DIR")) for c in self.calls("glab")],
+                         [(check, str(self.home / ".local/share/mise/installs/glab/latest/bin/glab"), glab_config)])
         self.assertEqual(launcher.read_text(), text)
 
     def test_mocked_arch_guards_your_own_lazy_mise_tools_by_ownership(self):
@@ -7110,6 +7209,36 @@ os.execv(executable, [executable, *args])
         self.assertFalse(self.npm_changes())
         self.assert_safe_clone_actions()
         self.assert_no_actions()
+
+    def test_update_installs_acpx_with_the_npm_whose_global_prefix_it_checked(self):
+        self.clone_fixture()
+        self.install()
+        # acpx (your acpx_path) is in the writable global prefix that the npm your PATH finds first reports. Another npm
+        # is in ~/.local/bin, which comes after it on this PATH.
+        prefix = self.root / "npm prefix"
+        target = prefix / "lib/node_modules/acpx/dist/cli.js"
+        target.parent.mkdir(parents=True)
+        shutil.copyfile(self.mock / "mock-cli", target)
+        target.chmod(0o755)
+        (prefix / "bin").mkdir()
+        (prefix / "bin/acpx").symlink_to(target)
+        source = self.bundle / "no-mistakes/config.yaml"
+        source.write_text(source.read_text() + "acpx_path: " + json.dumps(str(prefix / "bin/acpx")) + "\n")
+        other = self.home / ".local/bin/npm"
+        shutil.copyfile(self.mock / "mock-cli", other)
+        other.chmod(0o755)
+        # Only make update's own upgrades run here: without make, its later setup phase cannot start.
+        (self.mock / "make").unlink()
+        self.log.write_text("")
+        # Prompt order: gh-dash, acpx.
+        result = self.interactive_update(["n", "y"], MOCK_NPM_PREFIX=str(prefix),
+                                         PATH=str(self.mock) + os.pathsep + str(self.home / ".local/bin"))
+        self.assertIn("acpx (0.20.0): npm package acpx", result.stdout)
+        # The approved install runs the npm whose prefix the plan checked, never the other one.
+        npm = str(self.mock / "mock-cli")
+        self.assertEqual({c["path"] for c in self.calls("npm") if c["args"] == ["prefix", "-g"]}, {npm})
+        self.assertEqual([(c["args"], c["path"]) for c in self.npm_changes()], [(["install", "-g", "acpx@latest"], npm)])
+        self.assertFalse([c for c in self.calls("npm") if c["path"] == str(other)])
 
     def test_update_offers_each_native_upgrade_with_consent_and_reports_decline_and_failure(self):
         self.clone_fixture()

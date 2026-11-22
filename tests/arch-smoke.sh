@@ -120,19 +120,26 @@ pending="$(sed -n 's/^ERROR: dependencies pending: //p' /tmp/noninteractive.log 
 
 # In a terminal, one consent (setup's plain prompt, as Gum is missing, then pacman's own confirmation of the
 # whole transaction) runs one full-upgrade transaction. Each answer is typed once its prompt appears: sudo
-# discards input typed ahead of the command it starts.
+# discards input typed ahead of the command it starts. Once setup has exited, no prompt can appear, so the
+# answers stop waiting and its log is reported at once.
 answer() {
 	local waited=0
 	until grep -qF "$1" /tmp/setup.log 2>/dev/null; do
-		[ "$waited" -lt 900 ] || return 0
+		[ ! -e /tmp/setup.exited ] && [ "$waited" -lt 900 ] || return 0
 		sleep 1
 		waited=$((waited + 1))
 	done
 	printf 'y\n'
 }
 : >/tmp/setup.log
+rm -f /tmp/setup.exited
 if ! { answer 'Proceed? [y/N]'; answer 'Proceed with installation? [Y/n]'; } |
-	as_tester 'script -qec ./scripts/setup.sh /dev/null' >/tmp/setup.log 2>&1; then
+	{
+		status=0
+		as_tester 'script -qec ./scripts/setup.sh /dev/null' >/tmp/setup.log 2>&1 || status=$?
+		: >/tmp/setup.exited
+		exit "$status"
+	}; then
 	fail 'consented setup did not pass' /tmp/setup.log
 fi
 grep -q 'WARNING: this also upgrades every installed package (a full system upgrade)' /tmp/setup.log ||

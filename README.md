@@ -183,7 +183,11 @@ packages and tools, and setup reuses them:
   mise offline, so none of them installs or updates a tool or writes your mise
   configuration. Checks and approved actions keep the environment the launcher's
   own `mise x` gives its tool (such as `GH_CONFIG_DIR` from mise's `[env]`), as
-  `ghd` runs it. In a directory whose mise configuration you have not trusted,
+  `ghd` runs it. Where the temporary directory cannot run scripts (such as a
+  `noexec` `TMPDIR`), checks run that installed tool without this environment,
+  and the logins, installations, and upgrades you would approve through it stay
+  remaining actions until you rerun with `TMPDIR` set to a directory where
+  scripts can run. In a directory whose mise configuration you have not trusted,
   they use mise's safe mode instead, which records no trust and ignores that
   project configuration. The `acpx` installation you approve also runs npm with
   mise offline, so no Node.js auto-update runs first. A managed tool that is
@@ -886,7 +890,8 @@ checks.
   user-level installations (for example your own native Claude Code), setup's
   `acpx`, No-Mistakes, and the gh-dash extension keep their consented updates;
   the gh-dash and `acpx` upgrades run mise offline, so neither updates a
-  mise-managed `gh` or Node.js.
+  mise-managed `gh` or Node.js, and the `acpx` upgrade runs the npm whose global
+  prefix it checked.
   Discovery never runs a lazy tool that is not installed yet (Gum included: a
   lazy Gum leaves the upgrades unasked); it reports it, and setup asks before
   installing it.
