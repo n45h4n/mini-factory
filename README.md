@@ -693,8 +693,8 @@ the branch or holding its custody, no publication since that head was
 checked, and no selected-bot feedback posted or edited since `evidence` or
 `wait` last showed it), **review/CI pending or unverifiable**, **round
 limit reached** (only after the final head's reviews and hosted CI were
-verified, including any required check still running beside one that already
-failed; CI still pending, with no registered check, or a pull request with a
+verified, including any required check or workflow run still running beside a
+failure; CI still pending, with no registered check, or a pull request with a
 merge conflict is reported as pending or blocked instead), or **blocked**.
 Ready and round limit are recorded only if, read again just before recording,
 the head, its hosted CI, and the selected bots' reviews and feedback are
