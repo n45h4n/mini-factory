@@ -228,8 +228,8 @@ gh extension install dlvhdr/gh-dash
 ```
 
 Agent authentication stays in each agent's CLI. Setup and doctor require login
-only for agents that are actually used: by a gh-dash role (`i`, `I`, or PRs
-`I`), or by a No-Mistakes duty (the pipeline `agent` and any
+only for agents that are actually used: by a gh-dash role (`i`, `I`, PRs
+`I`, or the PR Fixer while it is enabled), or by a No-Mistakes duty (the pipeline `agent` and any
 `review_agents` reviewer/fixer/later-round role, with `acp:cursor` counting as
 Cursor). Setup offers only the missing logins; installed but unused agents may
 stay logged out. With the defaults, that is Codex only.
@@ -1089,7 +1089,8 @@ launch from this context**. It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
 effective agent, authentication for the agents a gh-dash role or No-Mistakes
-duty uses, Herdr integrations for the gh-dash roles' agents only, the
+duty uses, Herdr integrations for the gh-dash roles' agents only (an enabled
+PR Fixer counts as a role, and doctor also checks the interfaces it needs), the
 No-Mistakes configuration link, and the pipeline agent's readiness via native
 `no-mistakes doctor` (run without update checks or telemetry). Unused agents may
 stay logged out. Doctor checks No-Mistakes login only for duties set to
