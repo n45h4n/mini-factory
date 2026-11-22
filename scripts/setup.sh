@@ -17,6 +17,7 @@ issue_agent=''
 prepare_agent=''
 implement_agent=''
 review_agent=''
+fixer_agent=''
 role_agents=()
 duty_agents=()
 # The No-Mistakes daemon runs as a user service started with this fixed PATH (its
@@ -198,7 +199,8 @@ contains() {
 
 # mf-config resolves each gh-dash role's harness (issue keys: per-key selection, shared agent,
 # Codex; PR reviewer: its selection, Codex). PR_REVIEW_AGENT is saved as that selection;
-# setup never rewrites an issue key's selection.
+# setup never rewrites an issue key's selection. The optional PR Fixer counts as a role only
+# while it is enabled, so a disabled one needs no login or Herdr integration.
 select_role_agents() {
 	local role output kind
 	if [ -n "${PR_REVIEW_AGENT:-}" ]; then
@@ -222,6 +224,17 @@ select_role_agents() {
 		contains "$kind" "${role_agents[@]+"${role_agents[@]}"}" || role_agents+=("$kind")
 	done
 	notice "Issues i preparer: $prepare_agent; Issues I implementer: $implement_agent; PRs I reviewer: $review_agent (see mf-config show)."
+	output="$(python3 -I -B "$bundle/scripts/mf_config.py" fixer 2>&1)" ||
+		die "cannot read the mf-config PR Fixer profile: $output"
+	if printf '%s\n' "$output" | jq -e '.enabled == true' >/dev/null 2>&1; then
+		fixer_agent="$(printf '%s\n' "$output" | jq -r '.agent')"
+		case "$fixer_agent" in
+		claude | codex | cursor) ;;
+		*) die "unexpected mf-config PR Fixer agent: $output" ;;
+		esac
+		contains "$fixer_agent" "${role_agents[@]+"${role_agents[@]}"}" || role_agents+=("$fixer_agent")
+		notice "PR Fixer: enabled with $fixer_agent (its login and Herdr integration are checked like the other roles; see mf-config show)."
+	fi
 }
 
 # Only first-time linking of an unedited template follows the issue agent. Rewriting the template line
@@ -534,6 +547,7 @@ install_bundle() {
 	local input source relative quoted
 	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config bin/nm-config gh-dash/config.yml no-mistakes/config.yaml
 		scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py scripts/nm_config.py
+		scripts/pr_fixer.py scripts/integrations/gh-dash/gh-dash-pr-fixer.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh

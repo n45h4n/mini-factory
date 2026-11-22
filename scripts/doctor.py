@@ -84,6 +84,21 @@ def role_agents():
     return agents
 
 
+def fixer_profile():
+    """The optional PR Fixer's effective settings from the bundled mf-config; it is a role only while enabled."""
+    helper = Path(__file__).resolve().parent / "mf_config.py"
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", str(helper), "fixer"],
+                                capture_output=True, text=True, timeout=15)
+        profile = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+        raise ValueError(str(error))
+    if (not isinstance(profile, dict) or type(profile.get("enabled")) is not bool or profile.get("agent") not in AGENTS
+            or not isinstance(profile.get("bots"), list) or type(profile.get("max_rounds")) is not int):
+        raise ValueError((result.stderr or result.stdout).strip() or "no result")
+    return profile
+
+
 def managed_launcher(path, target):
     expected = output([
         "bash", "-c", 'printf \'#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %q "$@"\n\' "$1"',
@@ -181,12 +196,12 @@ def integrity(bundle):
     workers = bundle / "scripts/integrations/gh-dash"
     required = [bundle / "Makefile", bundle / "README.md", bundle / "gh-dash/config.yml",
                 bundle / "no-mistakes/config.yaml", bundle / "scripts/doctor.py", bundle / "scripts/mf_config.py",
-                bundle / "scripts/nm_config.py"]
+                bundle / "scripts/nm_config.py", bundle / "scripts/pr_fixer.py"]
     executables = [bundle / "bin/ghd", bundle / "bin/mf-config", bundle / "bin/nm-config", bundle / "scripts/setup.sh",
                    bundle / "scripts/update.sh", bundle / "scripts/doctor.sh"]
     executables += [workers / name for name in (
         "gh-dash-codex-issue.sh", "gh-dash-codex-issue-dispatch.sh",
-        "gh-dash-codex-pr-review.sh", "gh-dash-codex-pr-review-dispatch.sh")]
+        "gh-dash-codex-pr-review.sh", "gh-dash-codex-pr-review-dispatch.sh", "gh-dash-pr-fixer.sh")]
     for path in required + executables:
         if path.is_symlink() or not path.is_file():
             raise ValueError("missing regular bundle file: " + str(path))
@@ -203,7 +218,7 @@ def integrity(bundle):
                 "--factory", "$HOME/dotfiles", "diffnav", "repoPaths:", "pager:",
                 "universal:", "octo", "tuicr", "lazygit", "sandbox"))):
         raise ValueError("bundle config does not contain the isolated PR I and issue i/I routes")
-    for script in ("scripts/doctor.py", "scripts/mf_config.py", "scripts/nm_config.py"):
+    for script in ("scripts/doctor.py", "scripts/mf_config.py", "scripts/nm_config.py", "scripts/pr_fixer.py"):
         compile((bundle / script).read_bytes(), str(bundle / script), "exec")
 
 
@@ -358,13 +373,17 @@ def main():
 
     issue_agent, setting = issue_agent_setting()
     try:
-        roles, role_problem = role_agents(), None
+        roles, fixer, role_problem = role_agents(), fixer_profile(), None
     except ValueError as error:
         # Fall back to the shared choice and the Codex reviewer so the remaining checks still run.
-        roles, role_problem = {}, str(error)
+        roles, fixer, role_problem = {}, None, str(error)
     # gh-dash roles need login, Herdr integration, and detection; No-Mistakes duties need login only.
     role_kinds = list(dict.fromkeys(kind for kind, _ in roles.values())) or list(dict.fromkeys(
         (issue_agent or "codex", "codex")))
+    # The PR Fixer is a Herdr agent like the other roles, but only while it is enabled.
+    fixer_enabled = bool(fixer and fixer["enabled"])
+    if fixer_enabled and fixer["agent"] not in role_kinds:
+        role_kinds.append(fixer["agent"])
     no_mistakes_config = Path(os.environ.get("NM_HOME") or str(Path.home() / ".no-mistakes")) / "config.yaml"
     duties, duty_problem = [], None
     if no_mistakes_config.exists():
@@ -432,6 +451,18 @@ def main():
     ):
         text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
         check(all(token in text for token in tokens), label + " available", label + " capability missing")
+    # The enabled PR Fixer path delegates the CI stage per run and opens a tab in the issue workspace.
+    for argv, flags, label in ((
+        (["no-mistakes", "axi", "run", "--help"], ("--skip",), "No-Mistakes per-run stage skip (axi run --skip)"),
+        (["no-mistakes", "axi", "sync", "--help"], ("--check",), "No-Mistakes guarded synchronization (axi sync --check)"),
+        (["herdr", "tab", "create", "--help"], ("--workspace", "--cwd", "--label", "--no-focus"), "Herdr tab create"),
+        (["herdr", "tab", "list", "--help"], ("--workspace",), "Herdr tab list"),
+        (["herdr", "pane", "list", "--help"], ("--workspace",), "Herdr pane list"),
+    ) if fixer_enabled else ()):
+        text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
+        check(all(flag_available(text, flag) for flag in flags), label + " available for the enabled PR Fixer",
+              label + " capability missing for the enabled PR Fixer; update that tool, or turn the PR Fixer off "
+              "with mf-config")
     installation_failed = bool(failures)
     print("Installation: " + ("incomplete" if installation_failed else "installed"))
     if args.installation_only:
@@ -447,6 +478,11 @@ def main():
         for role, label in ROLES:
             kind, source = roles[role]
             print("OK: " + label + ": " + AGENTS[kind][1] + " (" + sources.get(source, source) + ")")
+        if fixer_enabled:
+            print("OK: PR Fixer: enabled - " + AGENTS[fixer["agent"]][1] + " (bots: " + ", ".join(fixer["bots"])
+                  + "; maximum fix rounds: " + str(fixer["max_rounds"]) + "; login and Herdr integration checked)")
+        else:
+            print("OK: PR Fixer: disabled (no login or Herdr integration required; enable it with mf-config)")
     for duty, agent, kind in duties:
         if kind:
             print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "

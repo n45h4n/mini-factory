@@ -71,6 +71,141 @@ elif name == "gh":
                               "defaultBranchRef": {"name": "main"}}))
         else:
             print("friend/target")
+    elif os.environ.get("MOCK_FIXER_GITHUB") and (args[:2] in (["pr", "view"], ["pr", "comment"], ["api", "--paginate"],
+                                                              ["api", "graphql"], ["api", "-H"])
+                                                  or args[:2] == ["api", "repos/friend/target/branches/feature%2Ffriend"]
+                                                  or args[:2] == ["api", "repositories/1"]
+                                                  or args[:1] == ["api"] and args[1:2] != []
+                                                  and args[1].startswith("repos/friend/target/activity?")):
+        # The PR Fixer's GitHub: one pull request for agent/issue-8 whose head follows the remote fixture.
+        fixture_file = pathlib.Path(os.environ["MOCK_FIXER_GITHUB"])
+        github = json.loads(fixture_file.read_text()) if fixture_file.exists() else {}
+        pull = github.get("pr")
+        if "GH_REPO" in os.environ:
+            fail("inherited GH_REPO contaminated the pull request lookup")
+        if os.environ.get("MOCK_GH_API") == "fail":
+            fail("simulated GitHub API outage")
+        live = subprocess.run([os.environ["REAL_GIT"], "-C", os.environ["MOCK_REMOTE"], "rev-parse", "--verify", "--quiet",
+                               "refs/heads/agent/issue-8"], capture_output=True, text=True).stdout.strip()
+        def pages(items):
+            # Two items per page, each page its own JSON document, as gh api --paginate prints them.
+            return [items[index:index + 2] for index in range(0, len(items), 2)] or [[]]
+        if args[:2] == ["pr", "view"]:
+            if (pull is None or args[2] not in ("agent/issue-8", str(pull["number"]))
+                    or args[3:6] != ["--repo", "friend/target", "--json"]):
+                fail("no pull requests found for branch agent/issue-8")
+            print(json.dumps({"number": pull["number"], "url": "https://github.com/friend/target/pull/" + str(pull["number"]),
+                              "state": pull.get("state", "OPEN"), "headRefName": pull.get("head_branch", "agent/issue-8"),
+                              "headRefOid": pull.get("head") or live, "baseRefName": pull.get("base", "feature/friend"),
+                              "isCrossRepository": pull.get("cross", False),
+                              "mergeable": pull.get("mergeable", "MERGEABLE"),
+                              "mergeStateStatus": pull.get("merge_state", "CLEAN")}))
+        elif args[:2] == ["pr", "comment"]:
+            if args[2:] != [str(pull["number"]), "--repo", "friend/target", "--body", args[-1]]:
+                fail("unexpected pull request comment")
+            if os.environ.get("MOCK_GH_COMMENT") == "fail":
+                fail("simulated comment failure")
+            github.setdefault("comments", []).append({
+                "id": 9000 + len(github.get("comments", [])), "user": {"login": "operator", "type": "User"},
+                "body": args[-1], "created_at": "2099-01-01T00:00:00Z", "updated_at": "2099-01-01T00:00:00Z",
+                "html_url": "https://github.com/friend/target/pull/12#issuecomment-request"})
+            fixture_file.write_text(json.dumps(github))
+            if os.environ.get("MOCK_GH_COMMENT") == "lost":
+                fail("simulated connection loss after the comment was accepted")
+        elif args[1].startswith("repos/friend/target/activity?"):
+            # GitHub's push records of the issue branch, most recent first: pushes is [[sha, timestamp], ...].
+            if args[1:] != ["repos/friend/target/activity?per_page=100&ref=refs%2Fheads%2Fagent%2Fissue-8"]:
+                fail("unexpected repository activity request")
+            print(json.dumps([{"id": index, "before": "0" * 40, "after": sha, "ref": "refs/heads/agent/issue-8",
+                               "timestamp": at, "activity_type": "push", "actor": {"login": "someone"}}
+                              for index, (sha, at) in enumerate(github.get("pushes", []))]))
+        elif args[:2] == ["api", "repositories/1"]:
+            # The repository a ruleset's required workflow file lives in, by its ID.
+            print(json.dumps({"id": 1, "full_name": "friend/target"}))
+        elif args[:2] == ["api", "repos/friend/target/branches/feature%2Ffriend"]:
+            # Classic branch protection of the captured base, as GitHub shows it to readers.
+            contexts = github.get("protected_checks", [])
+            print(json.dumps({"name": "feature/friend", "protected": bool(contexts), "protection": {
+                "enabled": bool(contexts), "required_status_checks": {
+                    "enforcement_level": "non_admins" if contexts else "off", "contexts": contexts, "checks": []}}}))
+        elif args[:2] == ["api", "--paginate"]:
+            number = str(pull["number"])
+            if args[2] == "repos/friend/target/pulls/" + number + "/reviews?per_page=100":
+                items = github.get("reviews", [])
+            elif args[2] == "repos/friend/target/issues/" + number + "/comments?per_page=100":
+                items = github.get("comments", [])
+            elif args[2] == "repos/friend/target/issues/" + number + "/reactions?per_page=100":
+                items = github.get("reactions", [])
+            elif args[2] == "repos/friend/target/rules/branches/feature%2Ffriend":
+                items = [{"type": "required_status_checks", "ruleset_id": 1, "parameters": {
+                    "required_status_checks": [{"context": name} for name in github.get("ruleset_checks", [])]}}]
+                # A ruleset's required workflows name workflow files, not the checks their jobs report.
+                items += [{"type": "workflows", "ruleset_id": 2, "parameters": {"do_not_enforce_on_create": False,
+                           "workflows": [{"path": path, "repository_id": 1, "ref": "refs/heads/main"}]}}
+                          for path in github.get("ruleset_workflows", [])]
+            else:
+                fail("unexpected paginated GitHub request")
+            print("".join(json.dumps(page) for page in pages(items)))
+        elif args[:2] == ["api", "graphql"]:
+            query = next(arg for arg in args if arg.startswith("query="))
+            if "PullRequestReviewThread" in query:
+                # Later reply pages of one inline thread, after the cursor its first page ended with.
+                thread = next(item for item in github.get("threads", []) if "id=" + item["id"] in args)
+                if "endCursor=" + thread["comments"]["pageInfo"]["endCursor"] not in args:
+                    fail("unexpected reply cursor")
+                for page in pages(thread.get("more_comments", [])):
+                    print(json.dumps({"data": {"node": {"comments": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": page}}}}))
+                sys.exit(0)
+            if (args[2:4] != ["--paginate", "-f"] or "$endCursor" not in query
+                    or [arg for arg in args if arg.startswith(("owner=", "name=", "number="))]
+                    != ["owner=friend", "name=target", "number=" + str(pull["number"])]):
+                fail("unexpected GraphQL request")
+            if "reviewThreads" in query:
+                if re.search(r"\bdatabaseId\b", query) and any(
+                        int(((comment.get("pullRequestReview") or {}).get("fullDatabaseId")) or 0) >= 2 ** 31
+                        for thread in github.get("threads", []) for comment in thread["comments"]["nodes"]):
+                    # The deprecated 32-bit review databaseId, enforced as its announced removal will.
+                    fail("GraphQL: Int cannot represent non 32-bit signed integer value (databaseId)")
+                for page in pages(github.get("threads", [])):
+                    print(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": page}}}}}))
+            elif "potentialMergeCommit" in query:
+                if "after_evidence" in github:
+                    # Once, as an evidence read ends, GitHub changes meanwhile: its fields replace the fixture's,
+                    # and remote_head moves the branch (another actor's push).
+                    changes = github.pop("after_evidence")
+                    if changes.get("remote_head"):
+                        subprocess.run([os.environ["REAL_GIT"], "-C", os.environ["MOCK_REMOTE"], "update-ref",
+                                        "refs/heads/agent/issue-8", changes.pop("remote_head")], check=True)
+                    github.update(changes)
+                    fixture_file.write_text(json.dumps(github))
+                # GitHub's test merge commit of the head (or of merge_parent, an earlier head), if it exists.
+                if "merge_checks" not in github:
+                    print(json.dumps({"data": {"repository": {"pullRequest": {"potentialMergeCommit": None}}}}))
+                for page in pages(github["merge_checks"]) if "merge_checks" in github else []:
+                    print(json.dumps({"data": {"repository": {"pullRequest": {"potentialMergeCommit": {
+                        "oid": "f" * 40, "parents": {"nodes": [{"oid": github.get("merge_parent") or live},
+                                                               {"oid": "e" * 40}]},
+                        "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                           "nodes": page}}}}}}}))
+            elif "statusCheckRollup" in query:
+                for page in pages(github.get("checks", [])):
+                    print(json.dumps({"data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
+                        "oid": github.get("checks_commit") or pull.get("head") or live,
+                        "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                           "nodes": page}}}}]}}}}}))
+            else:
+                fail("unexpected GraphQL query")
+        elif args[2:] == ["Accept: application/vnd.github.raw+json", "repos/friend/target/contents/.no-mistakes.yaml"]:
+            if github.get("no_ci") is True:
+                print("commands:\n  test: make test\nno_ci: true # owner declaration\n")
+            elif github.get("no_ci") == "unreadable":
+                fail("gh: Bad Gateway (HTTP 502)")
+            else:
+                fail("gh: Not Found (HTTP 404)")
+        else:
+            fail("unexpected GitHub request")
     elif args[:2] == ["pr", "view"]:
         if "GH_REPO" in os.environ or args[2:5] != ["7", "--repo", "friend/target"]:
             fail("unexpected pull request lookup")
@@ -346,6 +481,12 @@ elif name == "no-mistakes":
     elif args == ["axi", "run", "--help"]:
         if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
             fail("capability probes must not send telemetry or check for updates")
+        if os.environ.get("MOCK_PROFILE_SAVED_DURING_PROBE"):
+            # Another mf-config session atomically saves its profiles while the PR Fixer's interfaces are probed.
+            profiles = pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "mini-factory/agent-profiles.json"
+            saved = profiles.with_name(".agent-profiles.concurrent")
+            saved.write_text(os.environ["MOCK_PROFILE_SAVED_DURING_PROBE"])
+            os.replace(saved, profiles)
         if numeric < (1, 50, 0):
             # An older fixture without the stable interface; its --intent-file alone must not count.
             print("      --intent-file string   file containing the run intent\n      --wait duration")
@@ -356,10 +497,92 @@ elif name == "no-mistakes":
         elif numeric < (1, 105, 0):
             print("      --base-branch string   integration branch to open the PR against for this run only\n"
                   "      --intent string   what the user set out to accomplish\n"
+                  "      --skip string   comma-separated pipeline steps to skip\n"
                   "  -y, --yes   auto-resolve eligible gates\n      --wait duration")
         else:
             print("      --base-branch string\n      --intent string\n      --intent-file string\n  -y, --yes\n"
-                  "      --closes int\n      --wait duration")
+                  "      --skip string\n      --closes int\n      --wait duration")
+    elif args in (["axi", "sync", "--help"], ["axi", "status", "--help"]):
+        # Guarded synchronization and status exist from the stable release that added --base-branch.
+        if numeric < (1, 84, 0):
+            fail('unknown command "' + args[1] + '" for "no-mistakes axi"')
+        print("      --check   freshly verify and return the plan without changing HEAD\n      --recover"
+              if args[1] == "sync" else "      --run string   inspect a specific run ID")
+    elif args in (["axi", "status"], ["axi", "sync", "--check"], ["axi", "sync"]):
+        # The issue branch's own run and its branch_sync object, as TOON; MOCK_NM_RUN is a JSON fixture.
+        fixture_file = pathlib.Path(os.environ.get("MOCK_NM_RUN", "/nonexistent"))
+        run = json.loads(fixture_file.read_text()) if fixture_file.exists() else None
+        # Native run IDs are ULIDs; unless the fixture names one, the run was created when it was written.
+        created = int(fixture_file.stat().st_mtime * 1000) if run is not None else 0
+        run_id = (run or {}).get("id") or "".join("0123456789ABCDEFGHJKMNPQRSTVWXYZ"[(created >> (5 * (9 - index))) & 31]
+                                                  for index in range(10)) + "0" * 16
+        if args == ["axi", "status"] and os.environ.get("MOCK_STATUS_RETARGETS"):
+            # The pull request is retargeted while the fixer is between its evidence and its verdict.
+            github_file = pathlib.Path(os.environ["MOCK_STATUS_RETARGETS"])
+            github = json.loads(github_file.read_text())
+            github["pr"]["base"] = "main"
+            github_file.write_text(json.dumps(github))
+        if args == ["axi", "status"] and os.environ.get("MOCK_CHECKPOINT_PUBLISHES"):
+            # Another fixer call publishes a new head while this one is between its checks and its verdict.
+            checkpoint, published = os.environ["MOCK_CHECKPOINT_PUBLISHES"].rsplit("|", 1)
+            record = json.loads(pathlib.Path(checkpoint).read_text())
+            record["published_head"] = published
+            pathlib.Path(checkpoint).write_text(json.dumps(record))
+        git_here = lambda *arguments: subprocess.run([os.environ["REAL_GIT"], *arguments], capture_output=True,
+                                                     text=True).stdout.strip()
+        local = git_here("rev-parse", "HEAD")
+        if run is None:
+            print("current_branch: agent/issue-8\nruns_on_current_branch: 0\nrecent_runs[0]:")
+            sys.exit(0 if args == ["axi", "status"] else 1)
+        pushed = run.get("pushed_head") or git_here("-C", os.environ["MOCK_REMOTE"], "rev-parse", "refs/heads/agent/issue-8")
+        sync = dict(run.get("sync") or {})
+        if args == ["axi", "sync"]:
+            if sync.get("action") != "sync":
+                fail("error: no synchronization is offered")
+            # The guarded native fast-forward to the exact pipeline-pushed head.
+            subprocess.run([os.environ["REAL_GIT"], "fetch", "-q", os.environ["MOCK_REMOTE"], pushed], check=True)
+            subprocess.run([os.environ["REAL_GIT"], "merge", "-q", "--ff-only", pushed], check=True)
+            run["sync"] = sync = {}
+            run["id"] = run_id
+            fixture_file.write_text(json.dumps(run))
+            local = pushed
+        if not sync:
+            sync = ({"state": "synchronized", "safety": "already_synchronized"} if local == pushed
+                    else {"state": "local_ahead", "safety": "blocked_local_ahead", "action": "run_pipeline",
+                          "command": "no-mistakes axi run"})
+        status = run.get("status", "completed")
+        steps = run.get("steps") or {"intent": "completed", "rebase": "completed", "review": "completed",
+                                     "test": "completed", "document": "completed", "lint": "completed",
+                                     "push": "completed", "pr": "completed", "ci": "skipped"}
+        lines = []
+        if args == ["axi", "status"]:
+            lines += ["run:", "  id: " + run_id, "  branch: " + run.get("branch", "agent/issue-8"), "  status: " + status,
+                      "  head: " + pushed[:8], "  head_sha: " + pushed, "  verification_plan: none"]
+            if run.get("test_override"):
+                lines.append('  test_override_reason: "' + run["test_override"] + '"')
+            if run.get("pr", True):
+                lines.append('  pr: "' + (run["pr"] if isinstance(run.get("pr"), str)
+                                           else "https://github.com/friend/target/pull/12") + '"')
+            lines += ["  findings: none", "  steps[" + str(len(steps)) + "]{step,status,findings,duration_ms}:"]
+            lines += ["    " + step + "," + state + ",0,12" for step, state in steps.items()]
+            if run.get("active"):
+                lines += ["  active_steps[1]{step,status,active_for,round_active_for,last_activity,agent_pid,round}:",
+                          '    ci,running,2m,2m,"watching checks",,round 1']
+        lines += ["branch_sync:", "  state: " + sync["state"], "  changed: false", "  local:",
+                  "    branch: agent/issue-8", "    head: " + local, "    clean: true", "  pipeline:", "    run: " + run_id,
+                  "    status: " + status, "    pushed_head: " + pushed, "  target:", "    kind: origin",
+                  '    ref: "refs/heads/agent/issue-8"', "  relation: " + sync.get("relation", "equal"),
+                  "  safety: " + sync["safety"], "  pr_state: open"]
+        if sync.get("note"):
+            lines.append('  note: "' + sync["note"] + '"')
+        if sync.get("action"):
+            lines += ["  next_action:", "    code: " + sync["action"],
+                      '    command: "' + sync.get("command", "no-mistakes axi sync") + '"']
+        if args == ["axi", "status"] and status in ("completed", "failed", "cancelled", "checks_passed", "handed_off",
+                                                     "ci_monitor_interrupted"):
+            lines.append("outcome: " + run.get("outcome", "passed"))
+        print("\n".join(lines))
+        sys.exit(0 if sync["safety"] in ("already_synchronized", "safe_fast_forward", "safe_equivalent_advance") else 1)
     elif args == ["doctor"]:
         if os.environ.get("NO_MISTAKES_TELEMETRY") != "0" or os.environ.get("NO_MISTAKES_NO_UPDATE_CHECK") != "1":
             fail("doctor diagnostics must not send telemetry or check for updates")
@@ -469,6 +692,20 @@ elif name == "herdr":
                 "tab_id": item["tab"], "pane_id": os.environ.get("MOCK_AGENT_PANE", item["pane"]),
                 "agent_status": os.environ.get("MOCK_AGENT_STATUS", state.get("agent_status", "working"))}
     started = [branch for branch in sessions if issue_state.get(branch, {}).get("agent_started")]
+    # PR Fixer tabs live in the implementation workspace: [{"tab", "pane", "cwd", optional "agent"}].
+    def fixer_tabs():
+        return [(branch, tab) for branch in sessions for tab in issue_state.get(branch, {}).get("fixer_tabs", [])]
+    def fixer_tab(key, value):
+        return next(((branch, tab) for branch, tab in fixer_tabs() if tab[key] == value), (None, None))
+    def fixer_agent(branch, tab):
+        return {"name": tab["agent"]["name"], "agent": tab["agent"]["kind"], "workspace_id": sessions[branch]["ws"],
+                "tab_id": tab["tab"], "pane_id": tab["pane"],
+                "agent_status": os.environ.get("MOCK_FIXER_STATUS", tab["agent"].get("agent_status", "idle"))}
+    def tab_info(branch, tab_id, label):
+        return {"tab_id": tab_id, "workspace_id": sessions[branch]["ws"], "label": label}
+    def pane_info(branch, tab):
+        return {"pane_id": tab["pane"], "tab_id": tab["tab"], "workspace_id": sessions[branch]["ws"],
+                "foreground_cwd": tab["cwd"]}
     if args == ["--version"] or args == ["version"]:
         print("herdr version 0.20.0")
     elif args == ["--help"]:
@@ -477,7 +714,8 @@ elif name == "herdr":
     elif args == ["update"]:
         native_update()
     elif "--help" in args:
-        print("integration install status list claude codex cursor --json --cwd --workspace --pane --kind --timeout --wait --base --branch --path server agent-manifests")
+        print("integration install status list claude codex cursor --json --cwd --workspace --pane --kind --timeout --wait --base --branch --path server agent-manifests"
+              + ("" if os.environ.get("MOCK_HERDR_HELP") == "old" else " --label --focus --no-focus"))
     elif args[:1] == ["integration"] and args[1:2] in (["status"], ["list"]):
         for kind in ("claude", "codex", "cursor"):
             pending = os.environ.get("MOCK_INTEGRATION") == "pending" and not (root / ("herdr-integrated-" + kind)).exists()
@@ -497,7 +735,47 @@ elif name == "herdr":
         print(json.dumps({"server": {"running": True,
             "compatible": os.environ.get("MOCK_SERVER") != "incompatible"}}))
     elif args[:2] == ["workspace", "get"]:
+        if issue_mode and args[2] in os.environ.get("MOCK_CLOSED_WORKSPACES", "").split():
+            print(json.dumps({"id": "test", "error": {"code": "workspace_not_found", "message": "workspace not found"}}))
+            sys.exit(1)
         envelope("workspace_info", "workspace", {"workspace_id": args[2] if issue_mode else "ws"})
+    elif issue_mode and args[:2] == ["tab", "get"] and args[2].startswith("fix-tab-"):
+        branch, tab = fixer_tab("tab", args[2])
+        if tab is None:
+            print(json.dumps({"id": "test", "error": {"code": "tab_not_found", "message": "tab not found"}}))
+            sys.exit(1)
+        envelope("tab_info", "tab", tab_info(branch, tab["tab"], "PR Fixer"))
+    elif issue_mode and args[:2] == ["pane", "get"] and args[2].startswith("fix-pane-"):
+        branch, tab = fixer_tab("pane", args[2])
+        if tab is None:
+            print(json.dumps({"id": "test", "error": {"code": "pane_not_found", "message": "pane not found"}}))
+            sys.exit(1)
+        envelope("pane_info", "pane", pane_info(branch, tab))
+    elif issue_mode and args[:3] == ["tab", "list", "--workspace"] and session("ws", args[3]):
+        branch = session("ws", args[3])
+        envelope("tab_list", "tabs", [tab_info(branch, sessions[branch]["tab"], "1")]
+                 + [tab_info(branch, tab["tab"], "PR Fixer") for tab in issue_state[branch].get("fixer_tabs", [])])
+    elif issue_mode and args[:3] == ["pane", "list", "--workspace"] and session("ws", args[3]):
+        branch = session("ws", args[3])
+        envelope("pane_list", "panes", [{"pane_id": sessions[branch]["pane"], "tab_id": sessions[branch]["tab"],
+                                         "workspace_id": args[3], "foreground_cwd": issue_state[branch]["path"]}]
+                 + [pane_info(branch, tab) for tab in issue_state[branch].get("fixer_tabs", [])])
+    elif issue_mode and args[:2] == ["tab", "create"]:
+        branch = session("ws", args[3]) if args[2:3] == ["--workspace"] else None
+        if (branch is None or "path" not in issue_state.get(branch, {})
+                or args[4:] != ["--cwd", issue_state[branch]["path"], "--label", "PR Fixer", "--no-focus"]):
+            fail("unexpected tab creation")
+        if os.environ.get("MOCK_TAB_CREATE") == "fail":
+            fail("simulated tab creation failure")
+        tabs = issue_state[branch].setdefault("fixer_tabs", [])
+        number = str(issue_state[branch].get("fixer_tab_count", 0) + 1)
+        issue_state[branch]["fixer_tab_count"] = int(number)
+        tabs.append({"tab": "fix-tab-" + number, "pane": "fix-pane-" + number, "cwd": issue_state[branch]["path"]})
+        save()
+        if os.environ.get("MOCK_TAB_CREATE") == "lost":
+            fail("simulated lost tab-creation response")
+        print(json.dumps({"id": "test", "result": {"type": "tab_created",
+            "tab": tab_info(branch, tabs[-1]["tab"], "PR Fixer"), "root_pane": pane_info(branch, tabs[-1])}}))
     elif args[:2] == ["tab", "get"]:
         branch = issue_mode and session("tab", args[2])
         envelope("tab_info", "tab", {"tab_id": args[2] if issue_mode else "tab",
@@ -533,14 +811,45 @@ elif name == "herdr":
         elif "path" not in state:
             fail("cannot open absent issue worktree")
         item = sessions[branch]
+        # Like native Herdr, an opened workspace reports its active tab, which may be the PR Fixer's.
+        # An operator's shell tab reports its own directory, outside the worktree.
+        active = ((state.get("fixer_tabs") or [{}])[-1] if os.environ.get("MOCK_ACTIVE_TAB") == "fixer" else
+                  {"tab": "shell-tab", "pane": "shell-pane", "cwd": "/"} if os.environ.get("MOCK_ACTIVE_TAB") == "shell"
+                  else {})
+        tab_id, pane_id = active.get("tab", item["tab"]), active.get("pane", item["pane"])
         print(json.dumps({"id": "test", "result": {"type": "worktree_created" if args[1] == "create" else "worktree_opened",
             "workspace": {"workspace_id": item["ws"]},
-            "tab": {"tab_id": item["tab"], "workspace_id": item["ws"]},
-            "root_pane": {"pane_id": item["pane"], "tab_id": item["tab"], "workspace_id": item["ws"],
-                          "foreground_cwd": state["path"]},
+            "tab": {"tab_id": tab_id, "workspace_id": item["ws"]},
+            "root_pane": {"pane_id": pane_id, "tab_id": tab_id, "workspace_id": item["ws"],
+                          "foreground_cwd": active.get("cwd", state["path"])},
             "worktree": issue_worktree(branch)}}))
     elif issue_mode and args[:2] == ["agent", "list"]:
-        envelope("agent_list", "agents", [issue_agent(branch) for branch in started])
+        envelope("agent_list", "agents", [issue_agent(branch) for branch in started]
+                 + [fixer_agent(branch, tab) for branch, tab in fixer_tabs() if tab.get("agent")]
+                 + json.loads(os.environ.get("MOCK_EXTRA_AGENTS", "[]")))
+    elif issue_mode and args[:2] == ["agent", "start"] and fixer_tab("pane", args[6] if len(args) > 6 else "")[1]:
+        branch, tab = fixer_tab("pane", args[6])
+        if (args[2] != sessions[branch]["alias"].replace("-", "-fix-", 1) or tab.get("agent")
+                or args[3:9] != ["--kind", args[4], "--pane", tab["pane"], "--timeout", "30000"]
+                or args[9:10] not in ([], ["--"]) or args[4] not in ("claude", "codex", "cursor")):
+            fail("unexpected PR Fixer launch")
+        if os.environ.get("MOCK_FIXER_START") == "fail":
+            fail("simulated PR Fixer start failure")
+        tab["agent"] = {"name": args[2], "kind": args[4], "agent_status": "idle"}
+        save()
+        if os.environ.get("MOCK_FIXER_START") == "lost":
+            fail("simulated lost agent-start response")
+        envelope("agent_started", "agent", fixer_agent(branch, tab))
+    elif issue_mode and args[:2] in (["agent", "prompt"], ["agent", "focus"]) and fixer_tab("pane", args[2])[1]:
+        branch, tab = fixer_tab("pane", args[2])
+        if not tab.get("agent"):
+            fail("PR Fixer action escaped a started agent")
+        if args[1] == "prompt":
+            if os.environ.get("MOCK_FIXER_PROMPT") == "fail":
+                fail("simulated prompt failure")
+            tab["agent"]["agent_status"] = "working"
+            save()
+        envelope("agent_prompted" if args[1] == "prompt" else "agent_info", "agent", fixer_agent(branch, tab))
     elif issue_mode and args[:2] == ["agent", "get"]:
         branch = session("alias", args[2])
         if branch not in started:
@@ -603,6 +912,25 @@ elif name == "git":
             sys.exit(0)
     if "merge-base" in args and os.environ.get("MOCK_MERGE_BASE") == "fail":
         fail("mock ancestry comparison failure")
+    if "push" in args and os.environ.get("MOCK_FIXER_GITHUB") and os.environ.get("MOCK_REMOTE"):
+        # Only the PR Fixer's exact push: one commit to the issue branch of GitHub's sshUrl, leased to the head it
+        # verified, so it can only fast-forward that head.
+        if (args[2:3] != ["push"] or args[4:5] != ["git@github.com:friend/target.git"] or len(args) != 6
+                or not re.fullmatch(r"--force-with-lease=refs/heads/agent/issue-8:[0-9a-f]{40}", args[3])
+                or not re.fullmatch(r"[0-9a-f]{40}:refs/heads/agent/issue-8", args[5])):
+            fail("unexpected push")
+        if os.environ.get("MOCK_PUSH") == "fail":
+            fail("simulated push rejection")
+        if os.environ.get("MOCK_PUSH") == "rewound":
+            # Another actor moves the branch back one commit after the helper verified it.
+            subprocess.run([os.environ["REAL_GIT"], "-C", os.environ["MOCK_REMOTE"], "update-ref",
+                            "refs/heads/agent/issue-8", "refs/heads/agent/issue-8~1"], check=True)
+        pushed = subprocess.run([os.environ["REAL_GIT"], *args[:4], os.environ["MOCK_REMOTE"], args[5]],
+                                capture_output=True, text=True)
+        if os.environ.get("MOCK_PUSH") == "lost":
+            fail("simulated connection loss after the push was accepted")
+        sys.stderr.write(pushed.stderr)
+        sys.exit(pushed.returncode)
     if ("fetch" in args or "ls-remote" in args) and os.environ.get("MOCK_REMOTE"):
         # Preparation reads and fetches GitHub's sshUrl; route it to a disposable local fixture.
         if "fetch" in args and os.environ.get("MOCK_FETCH") == "fail":
@@ -704,6 +1032,61 @@ NM_MENU = {"agent": "Pipeline agent (agent)", "agent_config": "Harness model/eff
 INHERIT_CODEX = "Inherit agent_config.codex (clear)"
 STABLE_DEFAULT = ("agent: codex # Initialized from the issue agent during first setup.\n"
                   "auto_fix:\n  review: 5\n  ci: 3\n")
+
+FIXER_SCRIPT = "scripts/integrations/gh-dash/gh-dash-pr-fixer.sh"
+BOT_LOGINS = {"coderabbit": "coderabbitai", "greptile": "greptile-apps"}
+CURRENT = "2099-01-01T00:00:00Z"  # after any handoff; STALE is before it
+STALE = "2000-01-01T00:00:00Z"
+
+
+def bot_review(bot, commit, body="", number=1):
+    """A submitted GitHub review by a provider's GitHub App bot, bound to the commit it reviewed."""
+    return {"id": number, "user": {"login": BOT_LOGINS[bot] + "[bot]", "type": "Bot"}, "state": "COMMENTED",
+            "commit_id": commit, "body": body, "submitted_at": CURRENT,
+            "html_url": "https://github.com/friend/target/pull/12#pullrequestreview-" + str(number)}
+
+
+def pr_comment(login, body, kind="Bot", created=CURRENT, updated=CURRENT, number=1):
+    return {"id": number, "user": {"login": login + ("[bot]" if kind == "Bot" else ""), "type": kind}, "body": body,
+            "created_at": created, "updated_at": updated,
+            "html_url": "https://github.com/friend/target/pull/12#issuecomment-" + str(number)}
+
+
+def review_thread(bot, body, replies=(), resolved=False, number=1, more=(), review=None):
+    """An inline review thread opened by a bot, optionally as part of the submitted review whose ID is review;
+    replies and later reply pages are (login, typename[, body])."""
+    def reply(login, typename, text="Fixed in the latest push."):
+        return {"author": {"__typename": typename, "login": login}, "body": text, "createdAt": CURRENT,
+                "url": "https://github.com/friend/target/pull/12#discussion_r9"}
+    # GitHub deprecates a review's GraphQL databaseId (a 32-bit Int) for removal because it cannot represent IDs
+    # from 2**31 on, which real reviews already have; fullDatabaseId is its BigInt (string) replacement. Live GitHub
+    # still serves the deprecated field for now, but the mock enforces its Int contract, as its removal will.
+    comments = [{"author": {"__typename": "Bot", "login": BOT_LOGINS[bot]}, "body": body, "createdAt": STALE,
+                 "url": "https://github.com/friend/target/pull/12#discussion_r" + str(number),
+                 "pullRequestReview": {"databaseId": review if review < 2 ** 31 else None,
+                                       "fullDatabaseId": str(review)} if review is not None else None}]
+    comments += [reply(*item) for item in replies]
+    return {"id": "thread-" + str(number), "isResolved": resolved, "isOutdated": False, "path": "feature.txt",
+            "line": 1, "comments": {"pageInfo": {"hasNextPage": bool(more), "endCursor": "cursor-" + str(number)},
+                                    "nodes": comments},
+            "more_comments": [reply(*item) for item in more]}
+
+
+def check_run(name, conclusion="SUCCESS", status="COMPLETED", required=True, app="github-actions", completed=None,
+              title="", workflow=None, event="pull_request", pulls=(12,)):
+    """A check run; workflow is the (repository, path) of the Actions workflow file whose run, triggered by event,
+    reported it, and pulls are the open pull requests GitHub matches to that run's check suite."""
+    suite = {"app": {"slug": app}, "matchingPullRequests": {"nodes": [{"number": number} for number in pulls]}}
+    if workflow:
+        suite["workflowRun"] = {"event": event, "file": {"repositoryName": workflow[0], "path": workflow[1]}}
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion, "title": title,
+            "completedAt": completed, "isRequired": required, "checkSuite": suite}
+
+
+def commit_status(context, state="SUCCESS", required=True):
+    """A commit status reported by external CI, which GitHub keeps apart from a check run of the same name."""
+    return {"__typename": "StatusContext", "context": context, "state": state, "description": "",
+            "createdAt": CURRENT, "isRequired": required, "creator": {"__typename": "User", "login": "jenkins"}}
 
 
 class DistributionTests(unittest.TestCase):
@@ -966,7 +1349,8 @@ class DistributionTests(unittest.TestCase):
                          "scripts/doctor.sh", "scripts/integrations/gh-dash/gh-dash-codex-issue.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh",
                          "scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh",
-                         "scripts/integrations/gh-dash/gh-dash-codex-pr-review-dispatch.sh"):
+                         "scripts/integrations/gh-dash/gh-dash-codex-pr-review-dispatch.sh",
+                         "scripts/integrations/gh-dash/gh-dash-pr-fixer.sh"):
             self.assertTrue(os.access(self.bundle / relative, os.X_OK), relative)
 
     def test_clean_install_and_idempotent_second_run(self):
@@ -2981,6 +3365,1514 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertFalse(self.calls("ssh"))
         self.assert_no_actions()
 
+    # The optional PR Fixer: enrollment, the verified handoff, its tab, review/CI evidence, budget, and recovery.
+
+    def fixer_issue(self, name="fixer", fixer=None, **overrides):
+        """Dispatch issue 8 with Issues I under a PR Fixer profile; a separate bare repository plays GitHub."""
+        if fixer is not None:
+            self.profiles_file({"pr-fixer": fixer})
+        repo, git = self.source_repo(base=self.root / name)
+        remote, _ = self.github_fixture(repo, git, {"feature/friend": git("rev-parse", "HEAD")})
+        route = self.issue_environment(repo, git, cwd=repo, MOCK_REMOTE=str(remote), MOCK_CODEX_VERSION="0.166.0",
+                                       **overrides)
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**route))
+        return {"repo": repo, "git": git, "remote": remote, "route": route,
+                "worktree": repo.parent / "issue worktree with spaces",
+                "github": repo.parent / "github fixture.json", "run": repo.parent / "no-mistakes run.json"}
+
+    def fixer_route(self, issue, **env):
+        """Issues I pressed again, with the PR Fixer's GitHub and No-Mistakes fixtures available."""
+        return dict(issue["route"], MOCK_FIXER_GITHUB=str(issue["github"]), MOCK_NM_RUN=str(issue["run"]), **env)
+
+    def pr_fixer(self, issue, command, *args, **env):
+        """The helper as the implementer or the fixer runs it in the issue worktree's pane: the fixer's own
+        commands (request-review, keep-open, finish) from the fixer's recorded pane, the rest from the implementer's."""
+        environment = {key: value for key, value in self.fixer_route(issue).items() if key != "cwd"}
+        pane = (self.fixer_pane() if command in ("request-review", "keep-open", "finish")
+                else {"HERDR_TAB_ID": "issue-tab", "HERDR_PANE_ID": "issue-pane"})
+        environment.update(dict({"HERDR_WORKSPACE_ID": "issue-ws", "GH_DASH_PR_FIXER_POLL_SECONDS": "0"}, **pane))
+        environment.update(env)
+        return self.run_script(self.bundle / FIXER_SCRIPT, command, "friend/target", "8", *args,
+                               cwd=issue["worktree"], env=environment)
+
+    def fixer_json(self, issue, command, *args, **env):
+        result = self.pr_fixer(issue, command, *args, **env)
+        self.assert_success(result)
+        return json.loads(result.stdout)
+
+    def fixer_pane(self, **env):
+        """The PR Fixer's own pane: only it may publish."""
+        return dict({"HERDR_TAB_ID": "fix-tab-1", "HERDR_PANE_ID": "fix-pane-1"}, **env)
+
+    def publish_implementation(self, issue, pipeline_fix=False, **run):
+        """The implementer commits; No-Mistakes publishes it as PR #12, optionally with a fix of its own."""
+        git, worktree = issue["git"], str(issue["worktree"])
+        (issue["worktree"] / "feature.txt").write_text("implementation\n")
+        git("-C", worktree, "add", "feature.txt")
+        git("-C", worktree, "commit", "-q", "-m", "Implement issue 8")
+        if pipeline_fix:
+            (issue["worktree"] / "feature.txt").write_text("implementation with a No-Mistakes fix\n")
+            git("-C", worktree, "commit", "-qam", "no-mistakes(review): fix a finding")
+        git("-C", worktree, "push", "-q", str(issue["remote"]), "HEAD:refs/heads/agent/issue-8")
+        if pipeline_fix:
+            # The pipeline's fix commit is published, but the issue worktree has not caught up with it yet.
+            git("-C", worktree, "reset", "-q", "--hard", "HEAD~1")
+            run.setdefault("sync", {"state": "behind", "safety": "safe_fast_forward", "action": "sync",
+                                    "relation": "behind"})
+        issue["run"].write_text(json.dumps(run))
+        issue["github"].write_text(json.dumps({"pr": {"number": 12}}))
+        return self.remote_branch(issue)
+
+    def remote_branch(self, issue):
+        return issue["git"]("-C", str(issue["remote"]), "rev-parse", "refs/heads/agent/issue-8")
+
+    def fixer_commit(self, issue, text):
+        git, worktree = issue["git"], str(issue["worktree"])
+        (issue["worktree"] / "feature.txt").write_text(text + "\n")
+        git("-C", worktree, "commit", "-qam", "Address review finding: " + text)
+        return git("-C", worktree, "rev-parse", "HEAD")
+
+    def set_github(self, issue, **changes):
+        state = json.loads(issue["github"].read_text())
+        state.update(changes)
+        issue["github"].write_text(json.dumps(state))
+
+    def fixer_records(self):
+        return list((Path(self.env["XDG_STATE_HOME"]) / "gh-dash-codex-issue/intents").glob("*.pr-fixer.json"))
+
+    def fixer_tab_actions(self):
+        return [args for args in self.herdr_calls("tab") if args[1:2] in (["create"], ["list"])]
+
+    def fixer_tabs_created(self):
+        return [args for args in self.herdr_calls("tab", "create") if "--help" not in args]
+
+    def fixer_launches(self):
+        return [args for args in self.herdr_calls("agent", "start") if args[2] == "target-fix-8"]
+
+    def fixer_pushes(self):
+        return [call["args"][2:] for call in self.calls("git") if call["args"][2:3] == ["push"]]
+
+    def test_disabled_pr_fixer_and_unenrolled_branches_keep_the_original_issue_workflow(self):
+        # A saved but disabled fixer, even with its own harness and bots, changes nothing and probes nothing.
+        issue = self.fixer_issue(fixer={"agent": "claude", "enabled": False, "bots": "greptile", "max_rounds": 2})
+        self.assertEqual([args[2:5] for args in self.herdr_calls("agent", "start")], [["target-8", "--kind", "codex"]])
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        self.assertIn('no-mistakes axi run --yes --base-branch feature/friend --intent "$(cat -- "$intent_file")"', prompt)
+        self.assertIn("Do not reattach forever to an empty check list", prompt)
+        self.assertNotIn("--skip", prompt)
+        self.assertNotIn("gh-dash-pr-fixer.sh", prompt)
+        self.assertFalse(self.calls("no-mistakes") or self.fixer_tab_actions() or self.fixer_records())
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:1] == ["api"] or c["args"][:2] == ["pr", "view"]])
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no PR Fixer enrollment", result.stderr)
+        self.assertFalse(self.fixer_tabs_created() or self.fixer_launches())
+        # Enabling the fixer later never enrolls this retained branch: it keeps native CI monitoring.
+        self.profiles_file({"pr-fixer": {"agent": "codex", "enabled": True}})
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**dict(issue["route"], MOCK_AGENT_STATUS="idle")))
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        self.assertIn("no-mistakes axi run --yes --base-branch feature/friend", prompt)
+        self.assertNotIn("--skip ci", prompt)
+        self.assertFalse(self.calls("no-mistakes") or self.fixer_tab_actions() or self.fixer_records())
+        # Issues i stays a separate preparation session without the fixer.
+        self.log.write_text("")
+        self.assert_success(self.issue_helper("prepare", **issue["route"]))
+        prepare = self.herdr_calls("agent", "prompt")[0][3]
+        self.assertTrue(prepare.startswith("Prepare issue friend/target#8 for dispatch"))
+        self.assertNotIn("no-mistakes", prepare)
+        self.assertFalse(self.calls("no-mistakes") or self.fixer_tab_actions() or self.fixer_records())
+        # An installation without the enabled path's interfaces is reported before a new branch exists.
+        repo, git = self.source_repo(base=self.root / "unsupported")
+        config = (self.bundle / "no-mistakes/config.yaml").read_bytes()
+        self.log.write_text("")
+        result = self.issue_helper(**self.issue_environment(repo, git, cwd=repo, MOCK_HERDR_HELP="old"))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("this installation does not support it", result.stderr)
+        self.assertIn("herdr tab create", result.stderr)
+        self.assertEqual(git("branch", "--list", "agent/issue-8"), "")
+        self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start")
+                         or self.fixer_records())
+        self.assertEqual((self.bundle / "no-mistakes/config.yaml").read_bytes(), config)
+
+    def test_enabled_pr_fixer_is_captured_at_enrollment_and_starts_only_after_a_verified_handoff(self):
+        issue = self.fixer_issue(fixer={"agent": "claude", "model": "opus", "effort": "high", "enabled": True,
+                                        "bots": "both", "max_rounds": 2})
+        git, worktree = issue["git"], issue["worktree"]
+        # The implementer keeps its own profile (Codex) and delegates only hosted CI with the per-run skip.
+        self.assertEqual([args[2:5] for args in self.herdr_calls("agent", "start")], [["target-8", "--kind", "codex"]])
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        self.assertIn('no-mistakes axi run --yes --skip ci --base-branch feature/friend --intent "$(cat -- '
+                      '"$intent_file")"', prompt)
+        handoff = next(line for line in prompt.splitlines() if line.endswith(" handoff friend/target 8"))
+        self.assertEqual(shlex.split(handoff), [str(self.bundle / FIXER_SCRIPT), "handoff", "friend/target", "8"])
+        self.assertIn("make ordinary engineering decisions yourself", prompt)
+        self.assertNotIn("Do not reattach forever to an empty check list", prompt)
+        # Selecting this path read only native help: no tab, fixer, or PR/review traffic exists yet.
+        self.assertTrue(self.calls("no-mistakes"))
+        self.assertTrue(all("--help" in call["args"] for call in self.calls("no-mistakes")))
+        self.assertFalse(self.fixer_tabs_created() or self.fixer_launches())
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:1] == ["api"] or c["args"][:2] == ["pr", "view"]])
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["owner"], status["harness"], status["bots"], status["base_branch"], status["rounds"]),
+                         ("implementer", "claude", ["coderabbit", "greptile"], "feature/friend",
+                          {"used": 0, "allowed": 2, "remaining": 2}))
+        # Later mf-config edits apply to future branches only; a replacement implementer is not a new enrollment.
+        self.profiles_file({"pr-fixer": {"agent": "cursor", "enabled": False, "bots": "greptile", "max_rounds": 9}})
+        self.close_issue_agent(issue["repo"], "agent/issue-8")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**issue["route"]))
+        self.assertIn("--skip ci", self.herdr_calls("agent", "prompt")[0][3])
+        self.assertFalse(self.calls("no-mistakes"))
+        self.assertEqual(self.fixer_json(issue, "status"), status)
+        # Another Herdr session cannot see the recorded implementer: it opens no workspace, prompts no second
+        # writer, and keeps the recorded route.
+        route = json.loads(self.fixer_records()[0].read_text())["route"]
+        self.log.write_text("")
+        result = self.issue_helper(**dict(issue["route"], HERDR_SOCKET_PATH=str(self.root / "other.sock")))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("recorded in another Herdr session", result.stderr)
+        self.assertFalse(self.herdr_calls("worktree", "open") or self.herdr_calls("worktree", "create")
+                         or self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+        self.assertEqual(json.loads(self.fixer_records()[0].read_text())["route"], route)
+
+        # Dispatch startup or an idle implementer is not a handoff: nothing is published or released yet.
+        for run, reason in ((None, "publication is unverified"),
+                            ({"status": "running", "active": True}, "is still running"),
+                            ({"status": "failed", "outcome": "failed", "pr": False,
+                              "steps": {"review": "completed", "test": "failed", "push": "pending", "pr": "pending",
+                                        "ci": "skipped"}}, "without a completed Push and PR stage")):
+            with self.subTest(run=run):
+                if run is not None:
+                    issue["run"].write_text(json.dumps(run))
+                result = self.pr_fixer(issue, "handoff", MOCK_AGENT_STATUS="idle")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(reason, result.stderr)
+        published = self.publish_implementation(issue, pipeline_fix=True)
+        local = git("-C", str(worktree), "rev-parse", "HEAD")
+        # Local work that could be lost, or a divergence No-Mistakes cannot synchronize safely, is preserved.
+        (worktree / "notes.txt").write_text("keep me\n")
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("uncommitted changes", result.stderr)
+        self.assertEqual((worktree / "notes.txt").read_text(), "keep me\n")
+        (worktree / "notes.txt").unlink()
+        issue["run"].write_text(json.dumps({"sync": {"state": "diverged", "safety": "blocked_diverged",
+                                                     "action": "checkout", "command": "git checkout --detach " + published}}))
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no safe synchronization", result.stderr)
+        self.assertIn("git checkout --detach " + published, result.stderr)
+        self.assertEqual(git("-C", str(worktree), "rev-parse", "HEAD"), local)
+        issue["run"].write_text(json.dumps({"sync": {"state": "behind", "safety": "safe_fast_forward", "action": "sync"}}))
+        # A closed or retargeted pull request is never handed over, and the worktree is not synchronized for it.
+        self.log.write_text("")
+        for pull, reason in (({"number": 12, "state": "CLOSED"}, "pull request #12 is closed"),
+                             ({"number": 12, "base": "main"}, "targets main, not the captured base feature/friend")):
+            with self.subTest(pull=pull):
+                self.set_github(issue, pr=pull)
+                result = self.pr_fixer(issue, "handoff")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(git("-C", str(worktree), "rev-parse", "HEAD"), local)
+        self.assertNotIn(["axi", "sync"], [call["args"] for call in self.calls("no-mistakes")])
+        self.assertFalse(self.fixer_tabs_created() or self.fixer_launches())
+        self.assertEqual(self.fixer_json(issue, "status")["owner"], "implementer")
+
+        self.set_github(issue, pr={"number": 12})
+        self.log.write_text("")
+        report = self.fixer_json(issue, "handoff")
+        # Only No-Mistakes' own guarded fast-forward brought the pipeline's fix into the worktree.
+        self.assertEqual(git("-C", str(worktree), "rev-parse", "HEAD"), published)
+        self.assertIn(["axi", "sync"], [call["args"] for call in self.calls("no-mistakes")])
+        self.assertEqual((report["handoff"], report["published_head"], report["pull_request"]),
+                         ("transferred", published, "https://github.com/friend/target/pull/12"))
+        self.assertEqual((report["no_mistakes"]["status"], report["no_mistakes"]["skipped"]), ("completed", ["ci"]))
+        self.assertEqual(self.fixer_tabs_created(), [["tab", "create", "--workspace", "issue-ws", "--cwd", str(worktree),
+                                                      "--label", "PR Fixer", "--no-focus"]])
+        self.assertEqual(self.fixer_launches(), [["agent", "start", "target-fix-8", "--kind", "claude", "--pane",
+                                                  "fix-pane-1", "--timeout", "30000", "--", "--model", "opus",
+                                                  "--effort", "high"]])
+        prompts = self.herdr_calls("agent", "prompt")
+        self.assertEqual([args[2] for args in prompts], ["fix-pane-1"])
+        for fact in ("https://github.com/friend/target/pull/12", published, "base feature/friend",
+                     "CodeRabbit and Greptile (both must complete; one shared budget)",
+                     "2 fix-and-push rounds in total, 0 used, 2 remaining", "ci skipped"):
+            self.assertIn(fact, prompts[0][3])
+        self.assertFalse(self.herdr_calls("agent", "focus"), "launch never steals focus")
+        self.assertFalse([call for call in self.calls("no-mistakes") if call["args"][:2] not in (["axi", "status"],
+                                                                                                 ["axi", "sync"])])
+        self.assertFalse(self.fixer_pushes())
+        self.assertEqual(self.fixer_json(issue, "status")["owner"], "fixer")
+        # Repeating the handoff or pressing I never starts a second fixer, resends implementation, or needs GitHub.
+        self.log.write_text("")
+        self.assertEqual(self.fixer_json(issue, "handoff")["handoff"], "already transferred")
+        self.assertFalse(self.fixer_tabs_created() or self.herdr_calls("agent", "start")
+                         or self.herdr_calls("agent", "prompt"))
+        for implementer_present, active in ((True, "implementer"), (True, "fixer"), (True, "shell"),
+                                            (False, "implementer"), (False, "fixer"), (False, "shell")):
+            with self.subTest(implementer_present=implementer_present, active=active):
+                if not implementer_present:
+                    self.close_issue_agent(issue["repo"], "agent/issue-8")
+                self.log.write_text("")
+                # Whichever tab is active, each role is identified by its recorded tab and pane.
+                self.assert_success(self.issue_helper(**self.fixer_route(
+                    issue, MOCK_GH_API="fail", MOCK_GH_REPO="fail", MOCK_TRANSPORT="pending", MOCK_FETCH="fail",
+                    MOCK_ACTIVE_TAB=active)))
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+                self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt")
+                                 or self.fixer_tabs_created())
+                self.assertFalse(self.calls("gh") or self.remote_reads())
+                self.assertIn("implementation was not resent", self.notifications()[-1])
+        # The two-role allowance covers only this fixer: an unrelated agent in the workspace still conflicts.
+        stranger = json.dumps([{"name": "stranger", "agent": "codex", "workspace_id": "issue-ws", "tab_id": "other-tab",
+                                "pane_id": "other-pane", "agent_status": "idle"}])
+        self.log.write_text("")
+        result = self.issue_helper(**self.fixer_route(issue, MOCK_EXTRA_AGENTS=stranger))
+        self.assert_success(result)
+        self.assertIn("conflict", result.stderr)
+        self.assertFalse(self.herdr_calls("agent", "focus") or self.herdr_calls("agent", "prompt")
+                         or self.herdr_calls("agent", "start"))
+        result = self.pr_fixer(issue, "handoff", MOCK_EXTRA_AGENTS=stranger)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unrelated or ambiguous agent", result.stderr)
+
+    def test_pr_fixer_handoff_is_bound_to_this_enrollments_run_and_reports_its_actual_ci_step(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        git, worktree = issue["git"], str(issue["worktree"])
+        steps = {"intent": "completed", "review": "completed", "test": "completed", "push": "completed",
+                 "pr": "completed", "ci": "completed"}
+        # A branch of the same name published earlier left its completed run, open pull request, and remote
+        # branch: that is not this implementation's publication, so nothing is synchronized or transferred.
+        published = self.publish_implementation(issue, pipeline_fix=True, id="01" + "0" * 24, steps=steps)
+        local = git("-C", worktree, "rev-parse", "HEAD")
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("predates the enrollment", result.stderr)
+        self.assertEqual(git("-C", worktree, "rev-parse", "HEAD"), local)
+        self.assertNotIn(["axi", "sync"], [call["args"] for call in self.calls("no-mistakes")])
+        self.assertFalse(self.fixer_tabs_created() or self.fixer_launches())
+        self.assertEqual(self.fixer_json(issue, "status")["owner"], "implementer")
+        # This enrollment's own run is handed over, and the fixer learns what its CI stage actually did.
+        run = json.loads(issue["run"].read_text())
+        del run["id"]
+        issue["run"].write_text(json.dumps(run))
+        report = self.fixer_json(issue, "handoff")
+        self.assertEqual((report["handoff"], report["published_head"]), ("transferred", published))
+        prompt = self.herdr_calls("agent", "prompt")[-1][3]
+        self.assertIn("ci completed", prompt)
+        self.assertNotIn("deliberately skipped", prompt)
+
+    def test_pr_fixer_recovers_lost_launch_responses_and_exited_agents_without_a_second_writer(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "max_rounds": 3})
+        self.publish_implementation(issue)
+        # Herdr creates the tab but its response is lost: ownership has moved, but no fixer runs yet.
+        result = self.pr_fixer(issue, "handoff", MOCK_TAB_CREATE="lost")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("ownership of agent/issue-8 was transferred", result.stderr)
+        self.assertEqual(len(self.fixer_tabs_created()), 1)
+        self.assertFalse(self.fixer_launches())
+        self.assertEqual(self.fixer_json(issue, "status")["owner"], "fixer")
+        # The retry recovers that tab instead of creating another; this time the agent's start response is lost.
+        self.log.write_text("")
+        result = self.pr_fixer(issue, "handoff", MOCK_FIXER_START="lost")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(self.fixer_tabs_created())
+        self.assertEqual(len(self.fixer_launches()), 1)
+        # Issues I adopts the started agent and prompts it once; nothing is launched twice or resent.
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertFalse(self.fixer_tabs_created() or self.herdr_calls("agent", "start"))
+        prompts = self.herdr_calls("agent", "prompt")
+        self.assertEqual([args[2] for args in prompts], ["fix-pane-1"])
+        self.assertTrue(prompts[0][3].startswith("You are the PR Fixer"))
+        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+        # An exited fixer is recreated in its tab only once GitHub confirms the PR and its published head.
+        state_file = issue["repo"].parent / "issue-workflow.json"
+        state = json.loads(state_file.read_text())
+        del state["agent/issue-8"]["fixer_tabs"][0]["agent"]
+        state_file.write_text(json.dumps(state))
+        self.log.write_text("")
+        result = self.issue_helper(**self.fixer_route(issue, MOCK_GH_API="fail"))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertEqual(self.fixer_launches(), [["agent", "start", "target-fix-8", "--kind", "codex", "--pane",
+                                                  "fix-pane-1", "--timeout", "30000", "--", "--config",
+                                                  "check_for_update_on_startup=false"]])
+        self.assertFalse(self.fixer_tabs_created())
+        self.assertTrue(self.herdr_calls("agent", "prompt")[0][3].startswith("You are resuming as the PR Fixer"))
+        self.assertEqual(self.fixer_json(issue, "status")["rounds"], {"used": 0, "allowed": 3, "remaining": 3})
+        # A closed tab is replaced by exactly one new tab in the same workspace and worktree.
+        state = json.loads(state_file.read_text())
+        state["agent/issue-8"]["fixer_tabs"] = []
+        state_file.write_text(json.dumps(state))
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertEqual(self.fixer_tabs_created(), [["tab", "create", "--workspace", "issue-ws", "--cwd",
+                                                      str(issue["worktree"]), "--label", "PR Fixer", "--no-focus"]])
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-2"])
+        # An unreadable checkpoint is ambiguous: nothing is started, focused, or prompted, and work is kept.
+        self.fixer_records()[0].write_text("{not json")
+        self.log.write_text("")
+        result = self.issue_helper(**self.fixer_route(issue))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PR Fixer checkpoint", result.stderr)
+        self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt")
+                         or self.herdr_calls("agent", "focus"))
+        self.assertEqual(self.pr_fixer(issue, "handoff").returncode, 1)
+
+    def test_pr_fixer_recovery_revalidates_the_pull_request_and_never_adopts_unrecorded_local_work(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "max_rounds": 3})
+        git, worktree = issue["git"], str(issue["worktree"])
+        head = self.publish_implementation(issue)
+        self.assertEqual(self.pr_fixer(issue, "handoff", MOCK_TAB_CREATE="lost").returncode, 1)
+        # The pull request closes before the retry: no fixer is launched or prompted to write.
+        self.set_github(issue, pr={"number": 12, "state": "CLOSED"})
+        self.log.write_text("")
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("pull request #12 is closed", result.stderr)
+        self.assertFalse(self.fixer_launches() or self.herdr_calls("agent", "prompt"))
+        # Reopened, the fixer starts but its start response is lost; offline, it is focused but never prompted.
+        self.set_github(issue, pr={"number": 12})
+        self.assertEqual(self.pr_fixer(issue, "handoff", MOCK_FIXER_START="lost").returncode, 1)
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue, MOCK_GH_API="fail")))
+        self.assertFalse(self.herdr_calls("agent", "prompt") or self.herdr_calls("agent", "start"))
+        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+        # An operator's local commit is never handed to the fixer to publish, whether it is idle or has exited.
+        (issue["worktree"] / "operator.txt").write_text("operator\n")
+        git("-C", worktree, "add", "operator.txt")
+        git("-C", worktree, "-c", "user.name=Operator", "-c", "user.email=operator@example.invalid", "commit", "-qm",
+            "Operator work")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
+        state_file = issue["repo"].parent / "issue-workflow.json"
+        state = json.loads(state_file.read_text())
+        del state["agent/issue-8"]["fixer_tabs"][0]["agent"]
+        state_file.write_text(json.dumps(state))
+        self.log.write_text("")
+        result = self.issue_helper(**self.fixer_route(issue))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("local work the PR Fixer did not record", result.stderr)
+        self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt")
+                         or self.fixer_pushes())
+        self.assertEqual(self.remote_branch(issue), head)
+        # Once a human moves that work aside, the fixer starts with its first prompt, exactly once.
+        git("-C", worktree, "reset", "-q", "--hard", head)
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertEqual(len(self.fixer_launches()), 1)
+        prompts = self.herdr_calls("agent", "prompt")
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0][3].startswith("You are the PR Fixer"))
+
+    def test_pr_fixer_records_the_round_limit_only_after_the_final_push_is_confirmed(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 1})
+        first = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.set_github(issue, reviews=[bot_review("coderabbit", first)], checks=[check_run("test")],
+                        threads=[review_thread("coderabbit", "Handle empty input")])
+        final = self.fixer_commit(issue, "round 1")
+        self.assertEqual(self.pr_fixer(issue, "push", final, **self.fixer_pane(MOCK_PUSH="fail")).returncode, 1)
+        # The previous head's settled evidence never stands in for the unconfirmed final push.
+        result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "Findings remain")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("final permitted push of " + final[:12] + " is unconfirmed", result.stderr)
+        self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        self.assertEqual(self.fixer_json(issue, "push", **self.fixer_pane())["published_head"], final)
+        self.set_github(issue, reviews=[bot_review("coderabbit", final, number=2)])
+        report = self.fixer_json(issue, "finish", "round-limit", "--reason", "Findings remain")
+        self.assertEqual((report["result"], report["verified_head"], report["rounds"]["used"]),
+                         ("round limit reached", final, 1))
+
+    def test_pr_fixer_accepts_only_completed_reviews_of_the_published_head_from_each_selected_bot(self):
+        for bots, selected in (("coderabbit", ["coderabbit"]), ("greptile", ["greptile"]),
+                               ("both", ["coderabbit", "greptile"])):
+            with self.subTest(bots=bots):
+                issue = self.fixer_issue(name=bots, fixer={"agent": "codex", "enabled": True, "bots": bots})
+                head = self.publish_implementation(issue)
+                self.assert_success(self.pr_fixer(issue, "handoff"))
+                older = issue["git"]("rev-parse", "feature/friend")
+                # Old reviews, resolved threads, and green checks never prove a clean review of this head.
+                self.set_github(issue, checks=[check_run("test")],
+                                reviews=[bot_review(bot, older, number=index) for index, bot in enumerate(BOT_LOGINS)],
+                                threads=[review_thread(bot, "Old finding", resolved=True, number=index)
+                                         for index, bot in enumerate(BOT_LOGINS)])
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertEqual((sorted(evidence["bots"]), evidence["head"], evidence["ci"]["state"]),
+                                 (selected, head, "passing"))
+                self.assertEqual([(bot["completed"], bot["stale_reviews"]) for bot in evidence["bots"].values()],
+                                 [(False, 1)] * len(selected))
+                self.assertFalse(evidence["ready_gate"])
+                result = self.pr_fixer(issue, "finish", "ready")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("has not completed a review of " + head[:12], result.stderr)
+                # Completed incremental reviews of this head: a CodeRabbit review bound to it, and Greptile's
+                # edited summary naming it. An unselected bot's review is ignored, not required.
+                self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                                comments=[pr_comment("greptile-apps", "<h3>Greptile Summary</h3>\nNo new findings.\n\n"
+                                                     "Last reviewed commit: [Implement issue 8](https://github.com/"
+                                                     "friend/target/commit/" + head + ")", created=STALE)])
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertTrue(all(bot["completed"] for bot in evidence["bots"].values()))
+                self.assertTrue(evidence["ready_gate"])
+                report = self.fixer_json(issue, "finish", "ready")
+                self.assertEqual((report["result"], report["verified_head"], report["rounds"], sorted(report["bots"])),
+                                 ("ready for human review", head, {"used": 0, "allowed": 5, "remaining": 5}, selected))
+                self.assertEqual(report["no_mistakes"]["skipped"], ["ci"])
+                self.assertFalse(self.fixer_pushes() or [c for c in self.calls("gh") if c["args"][:2] == ["pr", "comment"]])
+                self.assertFalse([c for c in self.calls("gh") if c["args"][:2] in (["pr", "merge"], ["pr", "edit"])])
+
+    def test_pr_fixer_never_turns_stale_missing_or_paused_evidence_into_a_clean_result(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        # A same-named user account, a summary still in progress, and a rate-limit notice are not reviews.
+        self.set_github(issue, checks=[check_run("test")], comments=[
+            pr_comment("coderabbitai", "Reviewed " + head, kind="User", number=1),
+            pr_comment("coderabbitai", "<!-- review in progress by coderabbit.ai -->\nCurrently processing new changes "
+                       "in this PR. Reviewing files between " + head[:7] + " and " + head, number=2),
+            pr_comment("greptile-apps", "Rate limit exceeded: Greptile will review " + head + " later.", number=3),
+            pr_comment("operator", "@greptileai is this thread-safe?", kind="User", number=5)])
+        evidence = self.fixer_json(issue, "evidence")
+        coderabbit, greptile = evidence["bots"]["coderabbit"], evidence["bots"]["greptile"]
+        self.assertFalse(coderabbit["completed"] or greptile["completed"])
+        self.assertTrue(coderabbit["in_progress"])
+        self.assertEqual([notice["kind"] for notice in greptile["notices"]], ["rate-limited"])
+        # One provider-supported request per head: never while a review runs, and never twice.
+        result = self.pr_fixer(issue, "request-review", "coderabbit")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already reviewing", result.stderr)
+        self.assertEqual(self.fixer_json(issue, "request-review", "greptile")["comment"], "@greptileai")
+        result = self.pr_fixer(issue, "request-review", "greptile")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already asked", result.stderr)
+        self.assertEqual([c["args"][2:] for c in self.calls("gh") if c["args"][:2] == ["pr", "comment"]],
+                         [["12", "--repo", "friend/target", "--body", "@greptileai"]])
+        # Waiting is bounded per head; a bot that never completes yields pending, never ready.
+        comments = json.loads(issue["github"].read_text())["comments"]
+        self.set_github(issue, reviews=[bot_review("coderabbit", head)],
+                        comments=[comment for comment in comments if comment["id"] != 2])
+        bounded = {"GH_DASH_PR_FIXER_CALL_POLLS": "2", "GH_DASH_PR_FIXER_HEAD_POLLS": "3"}
+        waited = self.fixer_json(issue, "wait", **bounded)
+        self.assertEqual((waited["wait"], waited["waiting_on"], waited["wait_budget"]["polls_used"]),
+                         ("still-waiting: run wait again", ["Greptile review"], 2))
+        waited = self.fixer_json(issue, "wait", **bounded)
+        self.assertTrue(waited["wait"].startswith("budget-spent"))
+        self.assertEqual(waited["wait_budget"]["polls_used"], 3)
+        self.assertEqual(self.pr_fixer(issue, "finish", "ready").returncode, 1)
+        self.assertIn("needs --reason", self.pr_fixer(issue, "finish", "pending").stderr)
+        report = self.fixer_json(issue, "finish", "pending", "--reason", "Greptile did not review the head")
+        self.assertEqual(report["result"], "review/CI pending or unverifiable")
+        self.assertEqual(report["bots"]["greptile"], {"completed_for_head": False, "unresolved_threads": 0,
+                                                      "kept_open_threads": [], "notices": ["rate-limited"]})
+        # Hosted CI: an empty list is not success, no_ci never waives a bot, and required failures block ready.
+        summary = pr_comment("greptile-apps", "Greptile Summary. Last reviewed commit: " + head, number=4)
+        for changes, state, ready in (({"checks": [], "comments": [summary]}, "none", False),
+                                      ({"no_ci": True}, "declared-no-ci", True),
+                                      ({"no_ci": "unreadable"}, "unknown", False),
+                                      ({"no_ci": False, "checks": [check_run("lint", conclusion="FAILURE"),
+                                                                   check_run("test")]}, "failing", False),
+                                      ({"checks": [check_run("test"), check_run("optional", conclusion="FAILURE",
+                                                                                required=False)]}, "passing", True),
+                                      ({"checks": [check_run("test", status="IN_PROGRESS", conclusion=None)]},
+                                       "pending", False)):
+            with self.subTest(changes=changes):
+                self.set_github(issue, **changes)
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, ready))
+        self.set_github(issue, checks=[], pr={"number": 12, "mergeable": "CONFLICTING"}, no_ci=False)
+        self.assertIn("merge conflict", self.fixer_json(issue, "evidence")["ci"]["trigger_blocker"])
+        self.set_github(issue, comments=[summary], reviews=[], no_ci=True)
+        result = self.pr_fixer(issue, "finish", "ready")
+        self.assertIn("CodeRabbit has not completed a review", result.stderr)
+
+    def test_pr_fixer_ready_gate_needs_provider_completion_expected_required_checks_and_resolved_threads(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        older = issue["git"]("rev-parse", "feature/friend")
+        greptile_done = pr_comment("greptile-apps", "<h3>Greptile Summary</h3>\n" + "Details. " * 1000
+                                   + "\nLast reviewed commit: [Handle \\[empty\\] input](https://github.com/friend/"
+                                   "target/commit/" + head + ")", updated="2098-01-01T00:00:00Z", number=4)
+        def evidence_of(**changes):
+            self.set_github(issue, **changes)
+            return self.fixer_json(issue, "evidence")
+        # Before anything completes: an uncertain review request is reconciled with GitHub, never duplicated.
+        self.set_github(issue, checks=[check_run("test")])
+        result = self.pr_fixer(issue, "request-review", "greptile", MOCK_GH_COMMENT="fail")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unconfirmed", result.stderr)
+        self.assertEqual(self.fixer_json(issue, "request-review", "greptile")["comment"], "@greptileai")
+        result = self.pr_fixer(issue, "request-review", "coderabbit", MOCK_GH_COMMENT="lost")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+        self.assertEqual([call["args"][-1] for call in self.calls("gh") if call["args"][:2] == ["pr", "comment"]],
+                         ["@greptileai", "@greptileai", "@coderabbitai review"])
+        self.assertEqual([comment["body"] for comment in json.loads(issue["github"].read_text())["comments"]],
+                         ["@greptileai", "@coderabbitai review"])
+        # A comment that mentions the head while its footer names an older reviewed commit, or a failed Greptile
+        # job without a review, is not a completed review of the head.
+        evidence = evidence_of(reviews=[bot_review("coderabbit", head)], comments=[pr_comment(
+            "greptile-apps", "Greptile Summary: compare " + head[:7] + ".\nLast reviewed commit: " + older, number=4)],
+            checks=[check_run("test"), check_run("Greptile Review", conclusion="FAILURE", required=False,
+                                                 app="greptile-apps")])
+        self.assertEqual((evidence["bots"]["coderabbit"]["completed"], evidence["bots"]["greptile"]["completed"],
+                          evidence["ci"]["state"], evidence["ready_gate"]), (True, False, "passing", False))
+        # Complete feedback reaches the fixer: a long summary in full, and every reply page of a thread.
+        evidence = evidence_of(comments=[greptile_done], checks=[check_run("test")], threads=[review_thread(
+            "greptile", "Possible None dereference", replies=[("operator", "User", "Why would it be None here?")],
+            more=[("greptile-apps", "Bot", "Because load() can return None.")])])
+        greptile = evidence["bots"]["greptile"]
+        self.assertTrue(greptile["completed"])
+        self.assertEqual([summary["body"] for summary in greptile["summaries"]], [greptile_done["body"]])
+        self.assertEqual([comment["body"] for comment in greptile["open_threads"][0]["comments"]],
+                         ["Possible None dereference", "Why would it be None here?", "Because load() can return None."])
+        # A human's question does not settle the thread; only resolving it records the fixer's judgment.
+        self.assertEqual((greptile["unresolved_threads"], evidence["ready_gate"]), (1, False))
+        self.assertTrue(evidence_of(threads=[])["ready_gate"])
+        # A later failed bot check outweighs an earlier review of the head, and a known merge conflict blocks
+        # ready even when checks have registered and pass.
+        evidence = evidence_of(checks=[check_run("test"), check_run("CodeRabbit", conclusion="FAILURE", required=False,
+                                                                    app="coderabbitai", completed="2099-06-01T00:00:00Z")])
+        self.assertEqual((evidence["bots"]["coderabbit"]["completed"], evidence["ready_gate"]), (False, False))
+        evidence = evidence_of(checks=[check_run("test")], pr={"number": 12, "mergeable": "CONFLICTING"})
+        self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), ("passing", False))
+        self.assertIn("merge conflict", self.pr_fixer(issue, "finish", "ready").stderr)
+        self.set_github(issue, pr={"number": 12})
+        # A summary the bot edits in place keeps its earlier version across restarts, so a finding it dropped
+        # without an inline thread is still carried forward.
+        dropped = pr_comment("greptile-apps", "<h3>Greptile Summary</h3>\nP1: load() can return None.\n"
+                             "Last reviewed commit: " + older, number=6)
+        evidence_of(comments=[greptile_done, dropped])
+        edited = dict(dropped, body="<h3>Greptile Summary</h3>\nNo new findings.\nLast reviewed commit: " + head,
+                      updated_at="2099-02-01T00:00:00Z")
+        for _ in range(2):
+            summary = evidence_of(comments=[greptile_done, edited])["bots"]["greptile"]["summaries"][1]
+            self.assertEqual((summary["body"], [version["body"] for version in summary["earlier_versions"]]),
+                             (edited["body"], [dropped["body"]]))
+        self.set_github(issue, comments=[greptile_done])
+        # A review still running for the head, or a newer failed attempt, outweighs earlier completion.
+        evidence = evidence_of(checks=[check_run("test"), check_run("CodeRabbit", status="IN_PROGRESS", conclusion=None,
+                                                                    required=False, app="coderabbitai")])
+        self.assertEqual((evidence["bots"]["coderabbit"]["completed"], evidence["bots"]["coderabbit"]["in_progress"],
+                          evidence["ready_gate"]), (False, True, False))
+        evidence = evidence_of(checks=[check_run("test")], comments=[
+            greptile_done, pr_comment("greptile-apps", "Rate limit exceeded; the review failed.", number=5)])
+        self.assertEqual((evidence["bots"]["greptile"]["completed"], evidence["ready_gate"]), (False, False))
+        # Required checks: a required bot check stays CI, and a required check that has not registered keeps CI
+        # pending even when a registered optional check passes.
+        self.set_github(issue, comments=[greptile_done])
+        ci_workflow = ".github/workflows/ci.yml"
+        ci_run = ("friend/target", ci_workflow)
+        for changes, state in (({"checks": [check_run("test"), check_run("Greptile Review", conclusion="FAILURE",
+                                                                          app="greptile-apps")]}, "failing"),
+                               ({"checks": [check_run("lint", required=False)], "protected_checks": ["build"]},
+                                "pending"),
+                               ({"checks": [check_run("lint", required=False)], "protected_checks": [],
+                                 "ruleset_checks": ["build"]}, "pending"),
+                               # A required workflow's checks cannot be named from its rule, so other passing
+                               # checks never stand in for it: GitHub's clean merge state for the head, or the
+                               # workflow file's own passing runs on the head, show it satisfied.
+                               ({"checks": [check_run("lint", required=False), check_run("build")],
+                                 "ruleset_checks": [], "ruleset_workflows": [ci_workflow],
+                                 "pr": {"number": 12, "merge_state": "BLOCKED"}}, "pending"),
+                               ({"checks": [check_run("build"), check_run("test", required=False,
+                                                                          workflow=("other/central", ci_workflow))]},
+                                "pending"),
+                               ({"checks": [check_run("build"), check_run("test", status="IN_PROGRESS", conclusion=None,
+                                                                          required=False, workflow=ci_run)]}, "pending"),
+                               ({"checks": [check_run("build"), check_run("test", conclusion="FAILURE", required=False,
+                                                                          workflow=ci_run)]}, "failing"),
+                               ({"checks": [check_run("build"), check_run("test", required=False, workflow=ci_run)]},
+                                "passing"),
+                               ({"checks": [check_run("lint", required=False), check_run("build")],
+                                 "pr": {"number": 12}}, "passing"),
+                               ({"checks": [check_run("lint", required=False), check_run("build")],
+                                 "ruleset_workflows": []}, "passing")):
+            with self.subTest(changes=changes):
+                evidence = evidence_of(**changes)
+                self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, state == "passing"))
+                if state == "pending" and json.loads(issue["github"].read_text()).get("ruleset_workflows"):
+                    self.assertEqual(evidence["ci"]["unverified_required_workflows"], [ci_workflow])
+                    self.assertIn("hosted CI", evidence["waiting_on"])
+                    self.assertIn("required hosted CI is pending", self.pr_fixer(issue, "finish", "ready").stderr)
+        self.assertEqual(evidence_of(checks=[], ruleset_checks=["build"])["ci"]["missing_required"], ["build"])
+        # Every wait attempt is charged before GitHub is contacted, so outages still exhaust the head's budget.
+        bounded = {"GH_DASH_PR_FIXER_CALL_POLLS": "1", "GH_DASH_PR_FIXER_HEAD_POLLS": "2"}
+        self.assertEqual(self.pr_fixer(issue, "wait", MOCK_GH_API="fail", **bounded).returncode, 1)
+        waited = self.fixer_json(issue, "wait", MOCK_GH_API="fail", **bounded)
+        self.assertTrue(waited["wait"].startswith("budget-spent"), waited["wait"])
+        self.assertIn("simulated GitHub API outage", waited["last_error"])
+        self.log.write_text("")
+        for environment in ({"MOCK_GH_API": "fail"}, {}):
+            waited = self.fixer_json(issue, "wait", **environment, **bounded)
+            self.assertTrue(waited["wait"].startswith("budget-spent"), waited["wait"])
+            self.assertEqual(waited["wait_budget"]["polls_used"], 2)
+        self.assertFalse(self.calls("gh"))
+
+    def test_pr_fixer_round_budget_survives_interrupted_pushes_and_the_final_round_is_verified(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 2})
+        git, worktree = issue["git"], str(issue["worktree"])
+        first = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        finding = review_thread("coderabbit", "Handle empty input in feature.txt")
+        self.set_github(issue, reviews=[bot_review("coderabbit", first)], threads=[finding],
+                        checks=[check_run("test", conclusion="FAILURE")])
+        evidence = self.fixer_json(issue, "evidence")
+        coderabbit = evidence["bots"]["coderabbit"]
+        self.assertEqual((coderabbit["completed"], coderabbit["unresolved_threads"], evidence["ci"]["state"]),
+                         (True, 1, "failing"))
+        # Inspection and waiting use no round, and neither does a push with nothing new.
+        self.assertEqual(self.fixer_json(issue, "push", **self.fixer_pane())["rounds"],
+                         {"used": 0, "allowed": 2, "remaining": 2})
+        self.log.write_text("")
+        # Round 1: a rejected push keeps its single round; retrying that same commit does not use another.
+        second = self.fixer_commit(issue, "round 1")
+        result = self.pr_fixer(issue, "push", second, **self.fixer_pane(MOCK_PUSH="fail"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Its round stays counted once", result.stderr)
+        self.assertEqual(self.remote_branch(issue), first)
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["rounds"]["used"], status["pending_push"]["commit"]), (1, second))
+        # Another commit on top is never published under that charged round; a human resolves ownership first.
+        operator = self.fixer_commit(issue, "operator change")
+        result = self.pr_fixer(issue, "push", second, operator, **self.fixer_pane())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("still unconfirmed, but HEAD is " + operator[:12], result.stderr)
+        self.assertEqual(self.remote_branch(issue), first)
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["rounds"]["used"], status["pending_push"]["commit"]), (1, second))
+        git("-C", worktree, "reset", "-q", "--hard", second)  # the operator moves their commit aside
+        report = self.fixer_json(issue, "push", **self.fixer_pane())
+        self.assertEqual((report["pushed"], report["round"], report["commits"], self.remote_branch(issue)),
+                         (True, 1, [second], second))
+        self.assertEqual(self.fixer_pushes(), [["push", "--force-with-lease=refs/heads/agent/issue-8:" + first,
+                                                "git@github.com:friend/target.git",
+                                                second + ":refs/heads/agent/issue-8"]] * 2)
+        # The earlier finding is carried forward by the new head's incremental review until it is answered.
+        self.set_github(issue, reviews=[bot_review("coderabbit", first), bot_review("coderabbit", second, number=2)],
+                        checks=[check_run("test")])
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertTrue(evidence["bots"]["coderabbit"]["completed"])
+        self.assertEqual([thread["id"] for thread in evidence["bots"]["coderabbit"]["open_threads"]], ["thread-1"])
+        self.assertIn("CodeRabbit has 1 unresolved thread(s)", self.pr_fixer(issue, "finish", "ready").stderr)
+        # Round 2 reaches GitHub but its response is lost: it is reconciled, counted once, and never pushed again.
+        third = self.fixer_commit(issue, "round 2")
+        result = self.pr_fixer(issue, "push", third, **self.fixer_pane(MOCK_PUSH="lost"))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.remote_branch(issue), third)
+        self.log.write_text("")
+        report = self.fixer_json(issue, "push", **self.fixer_pane())
+        self.assertFalse(report["pushed"])
+        self.assertIn("reached GitHub", report["note"])
+        self.assertEqual(report["rounds"], {"used": 2, "allowed": 2, "remaining": 0})
+        self.assertFalse(self.fixer_pushes())
+        # The budget is spent: another fix is not published.
+        fourth = self.fixer_commit(issue, "round 3")
+        self.assertIn("round limit is reached (2/2)", self.pr_fixer(issue, "push", fourth, **self.fixer_pane()).stderr)
+        self.assertEqual(self.remote_branch(issue), third)
+        # The final permitted push is still observed before a verdict; ready needs exactly that head locally.
+        self.assertIn("final permitted round has not been observed yet",
+                      self.pr_fixer(issue, "finish", "round-limit").stderr)
+        self.set_github(issue, reviews=[bot_review("coderabbit", third, number=3)],
+                        threads=[review_thread("coderabbit", "Handle empty input", replies=[("operator", "User")])])
+        self.assertIn("local work at " + fourth[:12] + " is not exactly the published head",
+                      self.pr_fixer(issue, "finish", "ready").stderr)
+        report = self.fixer_json(issue, "finish", "round-limit", "--reason", "One finding still needs a fix")
+        self.assertEqual((report["result"], report["published_head"], report["verified_head"], report["rounds"]["used"]),
+                         ("round limit reached", third, third, 2))
+        # Another actor's push is neither adopted nor overwritten.
+        other = git("-C", str(issue["remote"]), "-c", "user.name=Someone Else", "-c", "user.email=else@example.invalid",
+                    "commit-tree", third + "^{tree}", "-p", third, "-m", "Another actor")
+        git("-C", str(issue["remote"]), "update-ref", "refs/heads/agent/issue-8", other)
+        for command in ("evidence", "push"):
+            with self.subTest(command=command):
+                result = self.pr_fixer(issue, command, **self.fixer_pane())
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("another actor changed the pull request branch", result.stderr)
+        self.assertEqual((self.remote_branch(issue), git("-C", worktree, "rev-parse", "HEAD")), (other, fourth))
+
+    def test_pr_fixer_publishes_only_its_own_commits_from_its_pane_and_keeps_its_route(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        git, worktree = issue["git"], str(issue["worktree"])
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        mine = self.fixer_commit(issue, "round 1")
+        # The implementer's pane, or another session, cannot publish even a commit named as the fixer's.
+        for env in ({}, self.fixer_pane(HERDR_SOCKET_PATH=str(self.root / "other.sock"))):
+            with self.subTest(env=env):
+                result = self.pr_fixer(issue, "push", mine, **env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("recorded pane fix-pane-1", result.stderr)
+        # In its pane, the fixer publishes only exactly the commits it names; an operator's commit is kept.
+        operator = self.fixer_commit(issue, "operator change")
+        for named in ((), (mine,), (operator,), (mine[:12], operator)):
+            with self.subTest(named=named):
+                result = self.pr_fixer(issue, "push", *named, **self.fixer_pane())
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("nothing was pushed", result.stderr)
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["rounds"]["used"], status["pending_push"], self.remote_branch(issue)), (0, None, head))
+        self.assertFalse(self.fixer_pushes())
+        git("-C", worktree, "reset", "-q", "--hard", mine)  # the operator moves their commit aside
+        report = self.fixer_json(issue, "push", mine, **self.fixer_pane())
+        self.assertEqual((report["pushed"], report["commits"], report["round"]), (True, [mine], 1))
+        # A reopened workspace is adopted only in the recorded session once the recorded one is gone.
+        record = self.fixer_records()[0]
+        route = json.loads(record.read_text())["route"]
+        resume = ("resume", "--workspace", "new-ws", "--tab", "new-tab", "--pane", "new-pane", "--worktree", worktree)
+        for env, reason in (({"HERDR_SOCKET_PATH": str(self.root / "other.sock")}, "another Herdr session"),
+                            ({}, "did not confirm that the recorded issue workspace issue-ws is closed"),
+                            ({"MOCK_CLOSED_WORKSPACES": "issue-ws new-ws"}, "new-ws is not open")):
+            with self.subTest(env=env):
+                result = self.pr_fixer(issue, *resume, **env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(json.loads(record.read_text())["route"], route)
+
+    def test_pr_fixer_review_evidence_is_provider_specific_deduplicated_and_tracks_kept_open_threads(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True})
+        # GitHub published the head before the handoff; a request made in between already concerns this head.
+        head = self.publish_implementation(issue)
+        self.set_github(issue, pushes=[[head, "2005-01-01T00:00:00Z"]])
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        older = issue["git"]("rev-parse", "feature/friend")
+        eyes = {"user": {"login": "greptile-apps[bot]", "type": "Bot"}, "content": "eyes", "created_at": CURRENT}
+        self.set_github(issue, checks=[check_run("test")], reactions=[eyes], comments=[
+            pr_comment("operator", "@coderabbitai review", kind="User", created="2010-01-01T00:00:00Z",
+                       updated="2010-01-01T00:00:00Z")])
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertTrue(evidence["bots"]["coderabbit"]["requested"])
+        self.assertTrue(evidence["bots"]["greptile"]["in_progress"])
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+        self.assertIn("already reviewing", self.pr_fixer(issue, "request-review", "greptile").stderr)
+        self.assertFalse([c for c in self.calls("gh") if c["args"][:2] == ["pr", "comment"]])
+        # A bot's successful check other than its completed review check (such as CodeRabbit's pre-merge checks)
+        # or a review that only reports a skip is not a completed review.
+        self.set_github(issue, reactions=[], comments=[], checks=[
+            check_run("test"), check_run("CodeRabbit", required=False, app="coderabbitai"),
+            check_run("Greptile Tests", required=False, app="greptile-apps")], reviews=[
+            bot_review("coderabbit", head, body="**Review skipped**\n\nAuto reviews are disabled.")])
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertEqual([(bot["completed"], bot["in_progress"]) for bot in evidence["bots"].values()],
+                         [(False, False), (False, False)])
+        self.assertEqual([notice["kind"] for notice in evidence["bots"]["coderabbit"]["notices"]], ["skipped"])
+        self.assertIn("CodeRabbit has not completed a review", self.pr_fixer(issue, "finish", "ready").stderr)
+        # GitHub's test merge commit of this head decides a check it reports; one of an earlier head does not.
+        greptile_done = pr_comment("greptile-apps", "Greptile Summary.\nLast reviewed commit: " + head, number=4)
+        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                        comments=[greptile_done])
+        for changes, state in (({"merge_checks": [check_run("test", conclusion="FAILURE")]}, "failing"),
+                               ({"merge_checks": [check_run("jenkins", status="IN_PROGRESS", conclusion=None)]},
+                                "pending"),
+                               ({"merge_parent": older, "merge_checks": [check_run("test", conclusion="FAILURE")]},
+                                "passing"),
+                               # A check run and a commit status sharing a required name are both required: the
+                               # test merge commit's result replaces only the head's result of the same kind.
+                               ({"merge_parent": None, "merge_checks": [check_run("build")],
+                                 "checks": [check_run("test"), commit_status("build", "FAILURE")]}, "failing"),
+                               ({"merge_checks": [check_run("build")],
+                                 "checks": [check_run("test"), commit_status("build", "PENDING")]}, "pending"),
+                               ({"merge_checks": [commit_status("build")],
+                                 "checks": [check_run("test"), check_run("build", conclusion="FAILURE")]}, "failing"),
+                               ({"merge_checks": [check_run("build")],
+                                 "checks": [check_run("test"), check_run("build", conclusion="FAILURE"),
+                                            commit_status("build")]}, "passing")):
+            with self.subTest(changes=changes):
+                self.set_github(issue, **changes)
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, state == "passing"))
+        # A fixed bot finding whose thread stays open for a human's question is recorded, not blocking.
+        question = review_thread("coderabbit", "Handle empty input",
+                                 replies=[("operator", "User", "Should None be handled too?")])
+        unanswered = review_thread("coderabbit", "Rename this", number=2)
+        self.set_github(issue, threads=[question, unanswered])
+        result = self.pr_fixer(issue, "keep-open", "thread-2", "--reason", "Renamed")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("resolve it", result.stderr)
+        self.assertIn("needs --reason", self.pr_fixer(issue, "keep-open", "thread-1", "--reason", " ").stderr)
+        self.fixer_json(issue, "keep-open", "thread-1", "--reason", "Fixed in " + head[:12] + "; question is human")
+        self.set_github(issue, threads=[question])
+        evidence = self.fixer_json(issue, "evidence")
+        coderabbit = evidence["bots"]["coderabbit"]
+        self.assertEqual((coderabbit["unresolved_threads"], coderabbit["kept_open_threads"], evidence["ready_gate"]),
+                         (0, 1, True))
+        self.assertIn("question is human", coderabbit["open_threads"][0]["kept_open"])
+        # The bot raising the finding again in that thread makes it actionable once more.
+        reraised = review_thread("coderabbit", "Handle empty input", replies=[
+            ("operator", "User", "Should None be handled too?"), ("coderabbitai", "Bot", "Still unhandled.")])
+        self.set_github(issue, threads=[reraised])
+        self.assertIn("CodeRabbit has 1 unresolved thread(s)", self.pr_fixer(issue, "finish", "ready").stderr)
+        self.set_github(issue, threads=[question])
+        report = self.fixer_json(issue, "finish", "ready")
+        self.assertEqual((report["result"], report["bots"]["coderabbit"]["kept_open_threads"]),
+                         ("ready for human review", [question["comments"]["nodes"][0]["url"]]))
+
+    def test_pr_fixer_ownership_is_verified_at_handoff_before_each_push_and_before_ready(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 2})
+        git, worktree = issue["git"], str(issue["worktree"])
+        head = self.publish_implementation(issue)
+        # Only the recorded implementer, in its pane of the recorded workspace and Herdr session, hands over: not an
+        # unrelated pane of that workspace, another workspace or session, or a shell without a Herdr identity.
+        self.log.write_text("")
+        for env in ({"HERDR_TAB_ID": "other-tab", "HERDR_PANE_ID": "other-pane"}, {"HERDR_WORKSPACE_ID": "other-ws"},
+                    {"HERDR_SOCKET_PATH": str(self.root / "other.sock")}, {"HERDR_PANE_ID": ""}):
+            with self.subTest(env=env):
+                result = self.pr_fixer(issue, "handoff", **env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("the handoff must be run by the implementer in its recorded pane issue-pane",
+                              result.stderr)
+        self.assertEqual(self.fixer_json(issue, "status")["owner"], "implementer")
+        self.assertFalse(self.calls("no-mistakes") or self.fixer_tabs_created() or self.fixer_launches())
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.log.write_text("")
+        self.assertEqual(self.pr_fixer(issue, "handoff", HERDR_PANE_ID="other-pane").returncode, 1)
+        self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                        checks=[check_run("test")])
+        self.assertTrue(self.fixer_json(issue, "evidence")["ready_gate"])
+        # No-Mistakes owns the branch again (a run started or reattached there): no ready verdict, the idle fixer is
+        # focused but not asked to write, and its fix is neither published nor charged a round.
+        issue["run"].write_text(json.dumps({"status": "running", "active": True}))
+        result = self.pr_fixer(issue, "finish", "ready")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("owns or monitors agent/issue-8 again", result.stderr)
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue, MOCK_FIXER_STATUS="idle")))
+        self.assertFalse(self.herdr_calls("agent", "prompt"))
+        self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+        fix = self.fixer_commit(issue, "round 1")
+        result = self.pr_fixer(issue, "push", fix, **self.fixer_pane())
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("owns or monitors agent/issue-8 again", result.stderr)
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["rounds"]["used"], status["pending_push"], status["outcome"], self.remote_branch(issue)),
+                         (0, None, None, head))
+        self.assertFalse(self.fixer_pushes())
+        # A failed run that moved the head still holds native custody: no fix, round, or verdict either.
+        issue["run"].write_text(json.dumps({"status": "failed", "outcome": "failed", "sync": {
+            "state": "pipeline_owned", "safety": "blocked_recover_preserved_head_missing", "action": "recover_custody",
+            "command": "no-mistakes axi sync --recover --keep-local"}}))
+        for command, args, env in (("finish", ("ready",), {}), ("push", (fix,), self.fixer_pane())):
+            with self.subTest(command=command):
+                result = self.pr_fixer(issue, command, *args, **env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("still holds custody of agent/issue-8", result.stderr)
+                self.assertIn("no-mistakes axi sync --recover --keep-local", result.stderr)
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["rounds"]["used"], status["pending_push"], status["outcome"], self.remote_branch(issue)),
+                         (0, None, None, head))
+        self.assertFalse(self.fixer_pushes())
+        # Released again, the same commit is published as one round.
+        issue["run"].write_text("{}")
+        self.assertEqual(self.fixer_json(issue, "push", fix, **self.fixer_pane())["round"], 1)
+        # Ready needs the pull request's own branch: the same commit on another local branch is not it.
+        self.set_github(issue, reviews=[bot_review("coderabbit", fix, body="Actionable comments posted: 0", number=2)])
+        self.fixer_json(issue, "evidence")
+        git("-C", worktree, "checkout", "-q", "-b", "elsewhere")
+        result = self.pr_fixer(issue, "finish", "ready")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("the issue worktree is on elsewhere, not agent/issue-8", result.stderr)
+        self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        git("-C", worktree, "checkout", "-q", "agent/issue-8")
+        self.assertEqual(self.fixer_json(issue, "finish", "ready")["result"], "ready for human review")
+
+    def test_pr_fixer_ties_review_requests_to_github_publication_of_the_exact_head(self):
+        def request(at, number):
+            return pr_comment("operator", "@coderabbitai review", kind="User", created=at, updated=at, number=number)
+
+        def requests_posted():
+            return [call for call in self.calls("gh") if call["args"][:2] == ["pr", "comment"]]
+        # A backdated commit says nothing about publication: a request posted before GitHub's push of the head
+        # asked about an earlier head and does not stand for this one. Without that record the publication time is
+        # unverified, so the request may concern this head: it is never repeated, and evidence says so.
+        for name, recorded in (("recorded", True), ("unrecorded", False)):
+            with self.subTest(name):
+                issue = self.fixer_issue(name=name, fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+                self.env["GIT_COMMITTER_DATE"] = "2001-01-01T00:00:00Z"
+                try:
+                    head = self.publish_implementation(issue)
+                finally:
+                    del self.env["GIT_COMMITTER_DATE"]
+                self.set_github(issue, pushes=[[head, "2020-01-01T00:00:00Z"]] if recorded else [],
+                                checks=[check_run("test")], comments=[request("2010-01-01T00:00:00Z", 1)])
+                self.assert_success(self.pr_fixer(issue, "handoff"))
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertEqual((evidence["bots"]["coderabbit"]["requested"], evidence["publication_time_verified"]),
+                                 (not recorded, recorded))
+                self.log.write_text("")
+                if recorded:
+                    self.assertEqual(self.fixer_json(issue, "request-review", "coderabbit")["comment"],
+                                     "@coderabbitai review")
+                    self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+                    self.assertEqual(len(requests_posted()), 1)
+                else:
+                    self.assertIn("deduplication is unverifiable",
+                                  self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+                    self.assertFalse(requests_posted())
+        # An interrupted push is reconciled later than it published the fix. The attempt's retained start, not that
+        # recovery, dates the publication: a request for the previous head still does not stand for the fix ...
+        self.set_github(issue, comments=[], reviews=[bot_review("coderabbit", head)])
+        fix = self.fixer_commit(issue, "round 1")
+        self.assertEqual(self.pr_fixer(issue, "push", fix, **self.fixer_pane(MOCK_PUSH="lost")).returncode, 1)
+        self.assertEqual(self.remote_branch(issue), fix)
+        attempted = self.fixer_json(issue, "status")["pending_push"]["attempted_at"]
+        def stamp(moment):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
+        self.set_github(issue, comments=[request(stamp(attempted - 60), 1)])
+        while time.time() < attempted + 3:
+            time.sleep(0.1)
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertIn("reached GitHub", evidence["reconciled"])
+        self.assertFalse(evidence["bots"]["coderabbit"]["requested"])
+        # ... while one GitHub shows was posted after the fix was published, before that recovery, is not repeated.
+        self.set_github(issue, comments=[request(stamp(attempted - 60), 1), request(stamp(attempted + 1), 2)])
+        self.assertTrue(self.fixer_json(issue, "evidence")["bots"]["coderabbit"]["requested"])
+        self.log.write_text("")
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+        self.assertFalse(requests_posted())
+
+    def test_pr_fixer_publication_and_verdict_are_bound_to_the_verified_head(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        git = issue["git"]
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                        checks=[check_run("test")])
+        self.fixer_json(issue, "evidence")
+        # A publication saved between the verdict's checks and its record is not stamped ready.
+        record = self.fixer_records()[0]
+        saved = record.read_text()
+        result = self.pr_fixer(issue, "finish", "ready", MOCK_CHECKPOINT_PUBLISHES=str(record) + "|" + "f" * 40)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("changed while ready was being checked", result.stderr)
+        self.assertIsNone(json.loads(record.read_text())["outcome"])
+        record.write_text(saved)
+        # Neither is a pull request that GitHub shows retargeted after its evidence was read.
+        result = self.pr_fixer(issue, "finish", "ready", MOCK_STATUS_RETARGETS=str(issue["github"]))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("targets main, not the captured base feature/friend", result.stderr)
+        self.assertIsNone(json.loads(record.read_text())["outcome"])
+        self.set_github(issue, pr={"number": 12})
+        # Another actor rewinds the branch after the helper verified it: the push fails instead of restoring it.
+        fix = self.fixer_commit(issue, "round 1")
+        result = self.pr_fixer(issue, "push", fix, **self.fixer_pane(MOCK_PUSH="rewound"))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("did not complete", result.stderr)
+        rewound = git("rev-parse", head + "~1")
+        self.assertEqual(self.remote_branch(issue), rewound)
+        result = self.pr_fixer(issue, "push", **self.fixer_pane())
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("another actor changed the pull request branch", result.stderr)
+        self.assertEqual(self.remote_branch(issue), rewound)
+
+    def test_pr_fixer_accepts_each_providers_own_completed_review_check_for_the_head(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "both"})
+        head = self.publish_implementation(issue)
+        self.set_github(issue, pushes=[[head, "2005-01-01T00:00:00Z"]])
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+
+        def bots_with(*bot_checks):
+            self.set_github(issue, checks=[check_run("test"), *bot_checks])
+            return self.fixer_json(issue, "evidence")["bots"]
+        # CodeRabbit's check titled Finished and Greptile's review status check on this head complete each review
+        # without a commit-bound submitted review or a summary footer.
+        bots = bots_with(check_run("CodeRabbit", required=False, app="coderabbitai", title="Finished"),
+                         check_run("Greptile Review", required=False, app="greptile-apps"))
+        self.assertEqual([(bot["completed"], bot["notices"]) for bot in bots.values()], [(True, [])] * 2)
+        # A green CodeRabbit check reporting a skipped or rate-limited review, a pre-merge check, or another green
+        # result is not a review of the head.
+        for check, kinds in ((check_run("CodeRabbit", conclusion="SKIPPED", required=False, app="coderabbitai",
+                                        title="Review skipped"), ["skipped"]),
+                             (check_run("CodeRabbit", conclusion="NEUTRAL", required=False, app="coderabbitai",
+                                        title="Review rate limited"), ["rate-limited"]),
+                             (check_run("Docstring Coverage", required=False, app="coderabbitai", title="Finished"), []),
+                             (check_run("CodeRabbit", required=False, app="coderabbitai",
+                                        title="Pull request review passed"), [])):
+            with self.subTest(check=check["name"] + ": " + check["title"]):
+                coderabbit = bots_with(check)["coderabbit"]
+                self.assertEqual((coderabbit["completed"], [notice["kind"] for notice in coderabbit["notices"]]),
+                                 (False, kinds))
+        # Another check of the provider, optional, pending or failed, neither undoes nor delays its completed review.
+        for other in (check_run("Docstring Coverage", conclusion="FAILURE", required=False, app="coderabbitai",
+                                title="Docstring coverage is 40%", completed="2099-06-01T00:00:00Z"),
+                      check_run("Docstring Coverage", status="IN_PROGRESS", conclusion=None, required=False,
+                                app="coderabbitai")):
+            with self.subTest(other=other["status"]):
+                coderabbit = bots_with(check_run("CodeRabbit", required=False, app="coderabbitai", title="Finished"),
+                                       other)["coderabbit"]
+                self.assertEqual((coderabbit["completed"], coderabbit["in_progress"], coderabbit["notices"]),
+                                 (True, False, []))
+        # A failed review is retried with the full review CodeRabbit documents for it.
+        bots_with(check_run("CodeRabbit", conclusion="FAILURE", required=False, app="coderabbitai",
+                            title="Review failed"))
+        self.assertEqual(self.fixer_json(issue, "request-review", "coderabbit")["comment"], "@coderabbitai full review")
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+
+    def test_pr_fixer_tells_provider_notices_from_findings_that_use_the_same_words(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        # Completed reviews of the head whose findings mention rate limits or failures are findings, not notices.
+        finding = ("**Actionable comments posted: 1**\n\n<details>\n<summary>Potential issue</summary>\n\n`server.py`: "
+                   "the new upload handler has no rate limit, so rate limit exceeded responses are never sent and one "
+                   "client can exhaust the workers.\n</details>")
+        summary = ("<h3>Greptile Summary</h3>\n\nThe new upload handler lacks a rate limit, and its something went "
+                   "wrong branch swallows the error.\n\nLast reviewed commit: " + head)
+        self.set_github(issue, checks=[check_run("test")], reviews=[bot_review("coderabbit", head, body=finding)],
+                        comments=[pr_comment("greptile-apps", summary, number=1)])
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertEqual([(bot["completed"], bot["notices"]) for bot in evidence["bots"].values()],
+                         [(True, [])] * 2)
+        self.assertTrue(evidence["ready_gate"])
+        # Providers' own status messages, whatever markup they open with, are notices and never completion.
+        limited = ("<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n"
+                   "> ## Rate limit exceeded\n>\n> @operator has exceeded the limit for the number of commits or files "
+                   "that can be reviewed per hour. Please wait **12 minutes and 5 seconds** before requesting another "
+                   "review.\n")
+        self.set_github(issue, reviews=[], comments=[pr_comment("coderabbitai", limited, number=2)], checks=[
+            check_run("test"), check_run("Greptile Review", required=False, app="greptile-apps",
+                                         title="Rate limit exceeded")])
+        evidence = self.fixer_json(issue, "evidence")
+        self.assertEqual([([notice["kind"] for notice in bot["notices"]], bot["completed"])
+                          for bot in evidence["bots"].values()], [(["rate-limited"], False)] * 2)
+        # A request inside the cooldown the provider reports would be dropped: it is deferred, and nothing is spent.
+        self.log.write_text("")
+        result = self.pr_fixer(issue, "request-review", "coderabbit")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("accepts another review request after", result.stderr)
+        self.assertFalse([call for call in self.calls("gh") if call["args"][:2] == ["pr", "comment"]])
+        self.assertEqual(self.fixer_json(issue, "status")["requests"], {})
+
+        def stamp(moment):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
+        # Once it has passed, a genuine provider limit still gets its bounded re-review request.
+        self.set_github(issue, comments=[pr_comment("coderabbitai", limited, created=stamp(time.time() - 800),
+                                                    updated=stamp(time.time() - 800), number=2)])
+        self.assertEqual(self.fixer_json(issue, "request-review", "coderabbit")["comment"], "@coderabbitai review")
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+        # A request the provider answers with another rate limit was dropped: after that cooldown it is asked again.
+        dropped = limited.replace("12 minutes and 5 seconds", "30 seconds")
+        self.set_github(issue, comments=[
+            pr_comment("operator", "@coderabbitai review", kind="User", created=stamp(time.time() - 120),
+                       updated=stamp(time.time() - 120), number=3),
+            pr_comment("coderabbitai", dropped, created=stamp(time.time() - 60), updated=stamp(time.time() - 60),
+                       number=4)])
+        evidence = self.fixer_json(issue, "evidence")["bots"]["coderabbit"]
+        self.assertEqual((evidence["requested"], evidence["request_rate_limited"]), (False, True))
+        self.assertEqual(self.fixer_json(issue, "request-review", "coderabbit")["comment"], "@coderabbitai review")
+        self.assertEqual(self.fixer_json(issue, "status")["requests"]["coderabbit"]["attempts"], 2)
+        # Greptile's tiered request form is recognized as a request already made for this head.
+        self.set_github(issue, comments=[pr_comment("operator", "@greptileai review this at apex", kind="User")])
+        self.assertTrue(self.fixer_json(issue, "evidence")["bots"]["greptile"]["requested"])
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "greptile").stderr)
+
+    def test_pr_fixer_refusals_unassessed_feedback_and_review_requests_never_become_ready(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        coderabbit = bot_review("coderabbit", head, body="Actionable comments posted: 0", number=1)
+        summary = pr_comment("greptile-apps", "<h3>Greptile Summary</h3>\nNo new findings.\nLast reviewed commit: "
+                             + head, number=1)
+        # Greptile's billing refusal arrives as its only submitted review of the head, and a spent allowance as
+        # a comment: neither is a completed review.
+        trial = bot_review("greptile", head, number=2, body="Your free trial has ended. If you'd like to continue "
+                           "receiving code reviews, you can add a payment method.")
+        quota = pr_comment("greptile-apps", "You have used all of your monthly reviews. Upgrade to continue.", number=2)
+        for comments in ([], [quota]):
+            with self.subTest(comments=comments):
+                self.set_github(issue, checks=[check_run("test")], reviews=[coderabbit, trial], comments=comments)
+                greptile = self.fixer_json(issue, "evidence")["bots"]["greptile"]
+                self.assertFalse(greptile["completed"])
+                self.assertEqual({notice["kind"] for notice in greptile["notices"]}, {"unavailable"})
+                result = self.pr_fixer(issue, "finish", "ready")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("Greptile has not completed a review of " + head[:12], result.stderr)
+        # A Greptile review counts only with the inline findings it carries.
+        finding = bot_review("greptile", head, number=3)
+        self.set_github(issue, reviews=[coderabbit, finding], comments=[])
+        self.assertFalse(self.fixer_json(issue, "evidence")["bots"]["greptile"]["completed"])
+        self.set_github(issue, threads=[review_thread("greptile", "P1: load() can return None", review=3)])
+        self.assertTrue(self.fixer_json(issue, "evidence")["bots"]["greptile"]["completed"])
+        # The ready verdict covers only feedback the fixer was shown: a summary-only finding posted on the same
+        # head after evidence was read is returned for assessment first.
+        self.set_github(issue, reviews=[coderabbit], threads=[], comments=[summary])
+        self.assertTrue(self.fixer_json(issue, "evidence")["ready_gate"])
+        late = pr_comment("coderabbitai", "**Actionable comments posted: 1**\nP1: the parser drops the last line.",
+                          number=3)
+        self.set_github(issue, comments=[summary, late])
+        result = self.pr_fixer(issue, "finish", "ready")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("feedback for " + head[:12] + " changed since evidence or wait last showed it", result.stderr)
+        self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        self.assertIn(late["body"], [item["body"] for item in
+                                     self.fixer_json(issue, "evidence")["bots"]["coderabbit"]["summaries"]])
+        # Requests: a configuration skip gets CodeRabbit's overriding full review, a plain request it skipped is
+        # retried once that way, and Greptile's own @greptile-apps mention is a request already made.
+        skipped = pr_comment("coderabbitai", "> [!NOTE]\n> ## Review skipped\n>\n> Draft detected.", number=4)
+        self.set_github(issue, reviews=[], comments=[skipped])
+        self.assertEqual(self.fixer_json(issue, "request-review", "coderabbit")["comment"], "@coderabbitai full review")
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+        later = "2099-01-02T00:00:00Z"
+        self.set_github(issue, comments=[
+            pr_comment("operator", "@coderabbitai review", kind="User", number=5),
+            dict(skipped, created_at=later, updated_at=later)])
+        self.assertTrue(self.fixer_json(issue, "evidence")["bots"]["coderabbit"]["request_skipped"])
+        self.assertEqual(self.fixer_json(issue, "request-review", "coderabbit")["comment"], "@coderabbitai full review")
+        self.set_github(issue, comments=json.loads(issue["github"].read_text())["comments"]
+                        + [pr_comment("operator", "@greptile-apps", kind="User", number=6)])
+        self.assertIn("already asked", self.pr_fixer(issue, "request-review", "greptile").stderr)
+        self.assertEqual([call["args"][-1] for call in self.calls("gh") if call["args"][:2] == ["pr", "comment"]],
+                         ["@coderabbitai full review", "@coderabbitai full review"])
+        # The fixer's own commands run only in its pane; enrollment and route binding only in the dispatcher.
+        self.log.write_text("")
+        implementer = {"HERDR_TAB_ID": "issue-tab", "HERDR_PANE_ID": "issue-pane"}
+        for command, args in (("request-review", ("greptile",)), ("keep-open", ("thread-1", "--reason", "x")),
+                              ("finish", ("blocked", "--reason", "x"))):
+            with self.subTest(command=command):
+                result = self.pr_fixer(issue, command, *args, **implementer)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(command + " must be run by the PR Fixer in its recorded pane fix-pane-1", result.stderr)
+        self.assertFalse([call for call in self.calls("gh") if call["args"][:2] == ["pr", "comment"]])
+        fix = self.fixer_commit(issue, "round 1")
+        self.assertEqual(self.fixer_json(issue, "push", fix, **self.fixer_pane())["round"], 1)
+        saved = self.fixer_records()[0].read_text()
+        enroll = ("--base", "feature/friend", "--agent", "codex", "--bots", "coderabbit", "--max-rounds", "5")
+        result = self.pr_fixer(issue, "enroll", *enroll)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("run only by the issue dispatcher", result.stderr)
+        # Even a dispatcher holding the issue lock never re-enrolls a retained branch.
+        lock = Path(self.env["XDG_STATE_HOME"]) / "gh-dash-codex-issue/locks/repo-6-friend-6-target-issue-8.lock"
+        lock.mkdir(mode=0o700)
+        (lock / "owner").write_text(str(os.getpid()) + "\n0\n")
+        try:
+            result = self.pr_fixer(issue, "enroll", *enroll, GH_DASH_PR_FIXER_LOCK_HELD=str(os.getpid()))
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("agent/issue-8 already exists, so it is not a new enrollment", result.stderr)
+            result = self.pr_fixer(issue, "bind", "--workspace", "w", "--tab", "t", "--pane", "p", "--worktree",
+                                   str(issue["worktree"]), "--alias", "a")
+            self.assertIn("run only by the issue dispatcher", result.stderr)
+        finally:
+            (lock / "owner").unlink()
+            lock.rmdir()
+        self.assertEqual(self.fixer_records()[0].read_text(), saved)
+        status = self.fixer_json(issue, "status")
+        self.assertEqual((status["owner"], status["rounds"]["used"]), ("fixer", 1))
+
+    def fixer_herdr_tabs(self, issue, change):
+        """Apply change to the issue workspace's listed non-implementer tabs (each labelled PR Fixer by the mock)."""
+        state_file = issue["repo"].parent / "issue-workflow.json"
+        state = json.loads(state_file.read_text())
+        tabs = state["agent/issue-8"].setdefault("fixer_tabs", [])
+        change(tabs)
+        state_file.write_text(json.dumps(state))
+
+    def herdr_pane_actions(self, pane):
+        return [args for args in self.herdr_calls("agent") if args[1:2] in (["start"], ["prompt"], ["focus"])
+                and pane in args]
+
+    def test_pr_fixer_required_workflow_counts_only_its_run_for_this_pull_request(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        ci_workflow = ".github/workflows/ci.yml"
+        ci_run = ("friend/target", ci_workflow)
+        # The base's ruleset requires ci.yml, which also runs on push. GitHub's merge state is not clean (an approval
+        # is missing, say), so only the workflow's own run for this pull request can show it satisfied.
+        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                        ruleset_workflows=[ci_workflow], pr={"number": 12, "merge_state": "BLOCKED"})
+        pushed = check_run("test", required=False, workflow=ci_run, event="push")
+        for checks, state in (
+                # The push run reports the same check name on the same head, but it is not the required run.
+                ([pushed], "pending"),
+                # A pull request run GitHub does not attribute to exactly this pull request (another open PR from
+                # the same branch, or another PR's run) does not stand for it either.
+                ([pushed, check_run("test", required=False, workflow=ci_run, pulls=(12, 13))], "pending"),
+                ([pushed, check_run("test", required=False, workflow=ci_run, pulls=(13,))], "pending"),
+                ([pushed, check_run("test", status="IN_PROGRESS", conclusion=None, required=False, workflow=ci_run)],
+                 "pending"),
+                ([pushed, check_run("test", conclusion="FAILURE", required=False, workflow=ci_run)], "failing"),
+                ([check_run("test", required=False, workflow=ci_run, event="pull_request_target")], "passing"),
+                ([pushed, check_run("test", required=False, workflow=ci_run)], "passing")):
+            with self.subTest(checks=[(check["checkSuite"]["workflowRun"]["event"],
+                                       check["checkSuite"]["matchingPullRequests"]["nodes"], check["status"],
+                                       check["conclusion"]) for check in checks]):
+                self.set_github(issue, checks=checks)
+                evidence = self.fixer_json(issue, "evidence")
+                self.assertEqual((evidence["ci"]["state"], evidence["ready_gate"]), (state, state == "passing"))
+                self.assertEqual(evidence["ci"].get("unverified_required_workflows"),
+                                 [ci_workflow] if state == "pending" else None)
+        # The verdict agrees: a same-named push run never makes the pull request ready.
+        self.set_github(issue, checks=[pushed])
+        self.fixer_json(issue, "evidence")
+        result = self.pr_fixer(issue, "finish", "ready")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("required hosted CI is pending", result.stderr)
+        self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+
+    def test_pr_fixer_keeps_the_exact_identity_of_review_ids_beyond_32_bits(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "greptile"})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        # Real Greptile review IDs no longer fit GraphQL's 32-bit Int; 2**53 + 1 would also be lost as a float.
+        for review_id in (2 ** 31, 3_000_000_000, 2 ** 53 + 1):
+            with self.subTest(review_id=review_id):
+                self.set_github(issue, checks=[check_run("test")], reviews=[bot_review(
+                    "greptile", head, body="<h3>Greptile Summary</h3>\nOne P1 finding inline.", number=review_id)],
+                    threads=[review_thread("greptile", "P1: load() can return None", review=review_id)])
+                greptile = self.fixer_json(issue, "evidence")["bots"]["greptile"]
+                self.assertTrue(greptile["completed"])
+                self.assertEqual([(item["kind"], item["id"]) for item in greptile["evidence"]], [("review", review_id)])
+                self.assertEqual([summary["id"] for summary in greptile["summaries"]], [review_id])
+                # The checkpoint keeps the summary under that exact ID.
+                history = json.loads(self.fixer_records()[0].read_text())["summary_history"]
+                self.assertIn("greptile:review:" + str(review_id), history)
+        # A neighbouring ID is another review: its inline comments never complete this one.
+        self.set_github(issue, reviews=[bot_review("greptile", head, number=2 ** 53 + 1)],
+                        threads=[review_thread("greptile", "P1: load() can return None", review=2 ** 53)])
+        self.assertFalse(self.fixer_json(issue, "evidence")["bots"]["greptile"]["completed"])
+
+    def test_pr_fixer_rechecks_the_live_pull_request_and_bot_immediately_before_requesting_a_review(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 2})
+        git, remote = issue["git"], str(issue["remote"])
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        other = git("-C", remote, "-c", "user.name=Someone Else", "-c", "user.email=else@example.invalid",
+                    "commit-tree", head + "^{tree}", "-p", head, "-m", "Another actor")
+
+        def requests_posted():
+            return [call["args"][-1] for call in self.calls("gh") if call["args"][:2] == ["pr", "comment"]]
+        # Each change lands on GitHub while the evidence that decided to ask is still being read.
+        for changes, reason in (
+                ({"pr": {"number": 12, "base": "main"}}, "targets main, not the captured base feature/friend"),
+                ({"pr": {"number": 12, "state": "CLOSED"}}, "pull request #12 is closed"),
+                ({"remote_head": other}, "head moved from " + head[:12] + " to " + other[:12]),
+                ({"checks": [check_run("test"), check_run("CodeRabbit", status="IN_PROGRESS", conclusion=None,
+                                                          required=False, app="coderabbitai")]},
+                 "CodeRabbit is already reviewing " + head[:12]),
+                ({"reviews": [bot_review("coderabbit", head, body="Actionable comments posted: 0")]},
+                 "CodeRabbit already completed a review of " + head[:12]),
+                ({"comments": [pr_comment("operator", "@coderabbitai review", kind="User", number=7)]},
+                 "CodeRabbit was already asked to review " + head[:12])):
+            with self.subTest(changes=sorted(changes)):
+                self.set_github(issue, pr={"number": 12}, checks=[check_run("test")], reviews=[], comments=[],
+                                after_evidence=changes)
+                git("-C", remote, "update-ref", "refs/heads/agent/issue-8", head)
+                self.log.write_text("")
+                result = self.pr_fixer(issue, "request-review", "coderabbit")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(reason, result.stderr)
+                self.assertFalse(requests_posted())
+                self.assertNotIn("after_evidence", json.loads(issue["github"].read_text()))
+        self.set_github(issue, pr={"number": 12}, checks=[check_run("test")], reviews=[], comments=[])
+        git("-C", remote, "update-ref", "refs/heads/agent/issue-8", head)
+        self.assertEqual(self.fixer_json(issue, "status")["requests"], {})
+        # While the fixer's own publication is unconfirmed, the head it replaces is not asked about.
+        fix = self.fixer_commit(issue, "round 1")
+        self.assertEqual(self.pr_fixer(issue, "push", fix, **self.fixer_pane(MOCK_PUSH="fail")).returncode, 1)
+        self.log.write_text("")
+        result = self.pr_fixer(issue, "request-review", "coderabbit")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("publication of " + fix[:12] + " is still unconfirmed", result.stderr)
+        self.assertFalse(requests_posted())
+        # Once it is published, the new head is asked about exactly once, also across an interrupted request.
+        self.assertTrue(self.fixer_json(issue, "push", **self.fixer_pane())["pushed"])
+        self.assertEqual(self.pr_fixer(issue, "request-review", "coderabbit", MOCK_GH_COMMENT="lost").returncode, 1)
+        self.assertIn("already asked to review " + fix[:12], self.pr_fixer(issue, "request-review", "coderabbit").stderr)
+        self.assertEqual(requests_posted(), ["@coderabbitai review"])
+        reservation = self.fixer_json(issue, "status")["requests"]["coderabbit"]
+        self.assertEqual((reservation["head"], reservation["attempts"]), (fix, 1))
+
+    def test_pr_fixer_never_takes_over_a_tab_or_agent_it_did_not_create(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        self.publish_implementation(issue)
+        worktree = str(issue["worktree"])
+        # An operator's shell tab at the worktree happens to be labelled PR Fixer before the handoff.
+        self.fixer_herdr_tabs(issue, lambda tabs: tabs.append({"tab": "fix-tab-9", "pane": "fix-pane-9",
+                                                               "cwd": worktree}))
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.assertEqual(len(self.fixer_tabs_created()), 1)
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-1"])
+        self.assertFalse(self.herdr_pane_actions("fix-pane-9"))
+
+        def close(tab_id):
+            self.fixer_herdr_tabs(issue, lambda tabs: tabs.remove(next(tab for tab in tabs if tab["tab"] == tab_id)))
+        # The fixer's own tab is closed: a new one is created, and the operator's labelled tab is still left alone.
+        close("fix-tab-1")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertEqual(len(self.fixer_tabs_created()), 1)
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-2"])
+        self.assertFalse(self.herdr_pane_actions("fix-pane-9"))
+        # A creation response is lost: only the tab that appeared after the fixer's own request is recovered.
+        close("fix-tab-2")
+        self.log.write_text("")
+        self.assertEqual(self.issue_helper(**self.fixer_route(issue, MOCK_TAB_CREATE="lost")).returncode, 1)
+        self.assertFalse(self.fixer_launches())
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertFalse(self.fixer_tabs_created())
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-3"])
+        self.assertFalse(self.herdr_pane_actions("fix-pane-9"))
+        # Two labelled tabs appeared since its request: which one it created is ambiguous, so nothing is touched.
+        close("fix-tab-3")
+        self.assertEqual(self.issue_helper(**self.fixer_route(issue, MOCK_TAB_CREATE="lost")).returncode, 1)
+        self.fixer_herdr_tabs(issue, lambda tabs: tabs.append({"tab": "fix-tab-8", "pane": "fix-pane-8",
+                                                               "cwd": worktree}))
+        self.log.write_text("")
+        result = self.issue_helper(**self.fixer_route(issue))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("ambiguous", result.stderr)
+        self.assertFalse(self.fixer_tabs_created() or self.herdr_calls("agent", "start")
+                         or self.herdr_calls("agent", "prompt"))
+        close("fix-tab-8")
+        self.log.write_text("")
+        self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+        self.assertEqual([args[6] for args in self.fixer_launches()], ["fix-pane-4"])
+        # Before its tab is recorded, an agent with the fixer's name in another tab (an earlier run's, or anyone's)
+        # is not the fixer: it is neither adopted, focused, nor prompted, by the dispatcher or by the handoff.
+        close("fix-tab-4")
+        self.assertEqual(self.issue_helper(**self.fixer_route(issue, MOCK_TAB_CREATE="lost")).returncode, 1)
+        close("fix-tab-5")
+        self.fixer_herdr_tabs(issue, lambda tabs: tabs[0].update(agent={"name": "target-fix-8", "kind": "codex",
+                                                                        "agent_status": "idle"}))
+        self.log.write_text("")
+        result = self.issue_helper(**self.fixer_route(issue))
+        self.assertIn("conflict", result.stderr)
+        result = self.pr_fixer(issue, "handoff")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("unrelated or ambiguous agent", result.stderr)
+        self.assertFalse(self.herdr_pane_actions("fix-pane-9") or self.fixer_tabs_created()
+                         or self.herdr_calls("agent", "start"))
+        self.assertIsNone(json.loads(self.fixer_records()[0].read_text())["route"]["fixer"]["pane_id"])
+
+    def test_pr_fixer_reports_unverified_ci_rather_than_the_round_limit_when_rounds_are_spent(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit", "max_rounds": 1})
+        first = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        finding = review_thread("coderabbit", "Handle empty input")
+        self.set_github(issue, reviews=[bot_review("coderabbit", first)], checks=[check_run("test")], threads=[finding])
+        final = self.fixer_commit(issue, "round 1")
+        self.assertEqual(self.fixer_json(issue, "push", final, **self.fixer_pane())["rounds"]["remaining"], 0)
+        # The final head is reviewed, with a finding left, but no check registers within the bounded wait.
+        bounded = {"GH_DASH_PR_FIXER_REGISTRATION_POLLS": "1", "GH_DASH_PR_FIXER_CALL_POLLS": "1"}
+        self.set_github(issue, reviews=[bot_review("coderabbit", final, number=2)], checks=[])
+        waited = self.fixer_json(issue, "wait", **bounded)
+        self.assertEqual((waited["wait"], waited["ci"]["state"]), ("settled", "none"))
+        for changes, detail in (({}, "is none"),
+                                ({"pr": {"number": 12, "mergeable": "CONFLICTING"}}, "merge conflict")):
+            with self.subTest(changes=changes):
+                self.set_github(issue, **changes)
+                result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "A finding remains", **bounded)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("has no verified CI result and the round limit is not what stopped this run",
+                              result.stderr)
+                self.assertIn(detail, result.stderr)
+                self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
+        self.set_github(issue, pr={"number": 12})
+        report = self.fixer_json(issue, "finish", "pending", "--reason", "No CI check registered", **bounded)
+        self.assertEqual((report["result"], report["ci"], report["rounds"]["remaining"]),
+                         ("review/CI pending or unverifiable", "none", 0))
+        # With the final head's CI verified, the spent budget is the accurate verdict.
+        self.set_github(issue, checks=[check_run("test", conclusion="FAILURE")])
+        report = self.fixer_json(issue, "finish", "round-limit", "--reason", "A finding and a failing test remain")
+        self.assertEqual((report["result"], report["ci"], report["verified_head"]), ("round limit reached", "failing", final))
+
+    def test_pr_fixer_that_finished_is_never_restarted_or_prompted_again(self):
+        issue = self.fixer_issue(fixer={"agent": "codex", "enabled": True, "bots": "coderabbit"})
+        head = self.publish_implementation(issue)
+        self.assert_success(self.pr_fixer(issue, "handoff"))
+        self.set_github(issue, reviews=[bot_review("coderabbit", head, body="Actionable comments posted: 0")],
+                        checks=[check_run("test")])
+        self.fixer_json(issue, "evidence")
+        for result, args in (("ready", ()), ("pending", ("--reason", "Waiting on a human")),
+                             ("blocked", ("--reason", "Out of scope"))):
+            with self.subTest(result=result):
+                self.fixer_herdr_tabs(issue, lambda tabs: tabs[0].update(
+                    agent={"name": "target-fix-8", "kind": "codex", "agent_status": "idle"}))
+                self.fixer_json(issue, "finish", result, *args)
+                status = self.fixer_json(issue, "status")
+                # Pressing I again with the finished fixer idle only focuses it.
+                self.log.write_text("")
+                self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+                self.assertEqual(self.herdr_calls("agent", "focus"), [["agent", "focus", "fix-pane-1"]])
+                self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt"))
+                self.assertIn("has finished", self.notifications()[-1])
+                # Its agent exits, and then even its tab closes: I, or a repeated handoff, starts and prompts
+                # nothing, creates no tab, and keeps the verdict and budget.
+                for close in (lambda tabs: tabs[0].pop("agent"), lambda tabs: tabs.clear()):
+                    self.fixer_herdr_tabs(issue, close)
+                    self.log.write_text("")
+                    self.assert_success(self.issue_helper(**self.fixer_route(issue)))
+                    self.assertIn("has finished", self.notifications()[-1])
+                    self.assertIn("already transferred", self.fixer_json(issue, "handoff")["handoff"])
+                    self.assertFalse(self.herdr_calls("agent", "start") or self.herdr_calls("agent", "prompt")
+                                     or self.herdr_calls("agent", "focus") or self.fixer_tabs_created()
+                                     or self.fixer_pushes())
+                    self.assertEqual(self.fixer_json(issue, "status"), status)
+                self.fixer_herdr_tabs(issue, lambda tabs: tabs.append({"tab": "fix-tab-1", "pane": "fix-pane-1",
+                                                                       "cwd": str(issue["worktree"])}))
+
+    def test_pr_fixer_enrollment_captures_one_profile_snapshot_despite_a_concurrent_save(self):
+        # Another mf-config session saves a disabled Greptile/Sonnet profile while enrollment probes interfaces.
+        concurrent = {"version": 1, "profiles": {"pr-fixer": {"agent": "claude", "model": "sonnet", "enabled": False,
+                                                               "bots": "greptile", "max_rounds": 9}}}
+        issue = self.fixer_issue(fixer={"agent": "claude", "model": "opus", "effort": "high", "enabled": True,
+                                        "bots": "coderabbit", "max_rounds": 2},
+                                 MOCK_PROFILE_SAVED_DURING_PROBE=json.dumps(concurrent))
+        self.assertIn(["axi", "run", "--help"], [call["args"] for call in self.calls("no-mistakes")])
+        # Every captured setting, launch options included, comes from the one profile read before that save.
+        record = json.loads(self.fixer_records()[0].read_text())
+        self.assertEqual(record["config"], {"agent": "claude", "arguments": ["--model", "opus", "--effort", "high"],
+                                            "bots": ["coderabbit"], "max_rounds": 2})
+        self.assertIn("--skip ci", self.herdr_calls("agent", "prompt")[0][3])
+        self.assertEqual(self.fixer_json(issue, "status")["rounds"], {"used": 0, "allowed": 2, "remaining": 2})
+        # The concurrent save itself is kept whole for future issue branches.
+        self.assertEqual(json.loads(self.profiles_file().read_text()), concurrent)
+
+    def test_only_an_enabled_pr_fixer_adds_its_harness_login_integration_and_interface_checks(self):
+        pending = {"MOCK_CLAUDE_AUTH": "pending", "MOCK_INTEGRATION": "pending"}
+        self.profiles_file({"pr-fixer": {"agent": "claude", "enabled": False, "bots": "coderabbit"}})
+        result = self.interactive_setup("y", ISSUE_AGENT="cursor", PR_REVIEW_AGENT="cursor", **pending)
+        self.assert_success(result)
+        self.assertNotIn("PR Fixer: enabled", result.stdout)
+        self.assertNotIn(["auth", "login"], [call["args"] for call in self.calls("claude")])
+        self.assertNotIn(["integration", "install", "claude"], self.herdr_calls("integration", "install"))
+        self.env["PATH"] = str(self.wrapper.parent) + os.pathsep + str(self.mock)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env=pending)
+        self.assert_success(doctor)
+        self.assertIn("OK: PR Fixer: disabled (no login or Herdr integration required; enable it with mf-config)",
+                      doctor.stdout.splitlines())
+        self.assertNotIn("Claude Code authenticated", doctor.stdout)
+        self.assertNotIn("enabled PR Fixer", doctor.stdout)
+        # Enabled, its own harness needs login and Herdr integration like any role, and its interfaces are checked.
+        self.profiles_file({"pr-review": {"agent": "cursor"},
+                            "pr-fixer": {"agent": "claude", "enabled": True, "bots": "coderabbit"}})
+        self.log.write_text("")
+        result = self.interactive_setup("y", **pending)
+        self.assert_success(result)
+        self.assertIn("PR Fixer: enabled with claude", result.stdout)
+        self.assertIn(["auth", "login"], [call["args"] for call in self.calls("claude")])
+        self.assertIn(["integration", "install", "claude"], self.herdr_calls("integration", "install"))
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env=pending)
+        self.assert_success(doctor)
+        for line in ("OK: Claude Code authenticated", "OK: Herdr Claude Code integration current",
+                     "OK: PR Fixer: enabled - Claude Code (bots: coderabbit; maximum fix rounds: 5; login and Herdr "
+                     "integration checked)",
+                     "OK: No-Mistakes per-run stage skip (axi run --skip) available for the enabled PR Fixer",
+                     "OK: Herdr tab create available for the enabled PR Fixer"):
+            self.assertIn(line, doctor.stdout.splitlines())
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env=dict(pending, MOCK_HERDR_HELP="old"))
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: Herdr tab create capability missing for the enabled PR Fixer", doctor.stdout)
+        self.assert_no_actions(allow_onboarding=True)
+
     # mf-config: per-key agent profiles, the Gum editor, and fresh-launch options.
 
     def profiles_file(self, profiles=None):
@@ -3146,7 +5038,7 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertIn("unable to read the I agent preference", result.stderr)
         self.assertFalse(self.herdr_calls("worktree", "create") or self.herdr_calls("agent", "start"))
 
-    def test_editor_offers_three_profiles_and_saves_only_after_confirmation(self):
+    def test_editor_offers_four_profiles_and_saves_only_after_confirmation(self):
         self.save_issue_agent("claude")
         path = self.profiles_file()
         source = self.bundle / "no-mistakes/config.yaml"
@@ -3156,7 +5048,8 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(remaining, [])
         prompts = self.gum_prompts()
         self.assertEqual(prompts[0][0], "choose")
-        self.assertEqual(prompts[0][3], ["Issues i - preparer", "Issues I - implementer", "PRs I - reviewer"])
+        self.assertEqual(prompts[0][3], ["Issues i - preparer", "Issues I - implementer", "PRs I - reviewer",
+                                         "PR Fixer - after Issues I"])
         harness = prompts[1]
         self.assertEqual(harness[3], ["Shared issue agent: Claude Code (no per-role override)", "Codex",
                                       "Claude Code", "Cursor"])
@@ -3197,6 +5090,80 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                                                "Shared issue agent: Claude Code (no per-role override)")
         self.assert_success(result)
         self.assertIn("No change; nothing was saved.", result.stdout)
+
+    def test_pr_fixer_profile_is_independent_off_by_default_and_keeps_its_choices_when_off(self):
+        self.save_issue_agent("claude")
+        path = self.profiles_file({"issue-implement": {"agent": "cursor", "model": "gpt-5"}})
+        fixer = "PR Fixer - after Issues I"
+        # Existing installations keep their meaning: the fixer is off, Codex, both bots, and five rounds.
+        self.assertEqual(json.loads(self.mf_config("fixer").stdout),
+                         {"enabled": False, "agent": "codex", "bots": ["coderabbit", "greptile"], "max_rounds": 5})
+        self.assertEqual(self.mf_config("agent", "pr-fixer").stdout, "codex\ndefault\n",
+                         "the fixer never falls back to the shared issue agent")
+        lines = self.mf_config("show").stdout.splitlines()
+        self.assertIn(fixer + ": Codex - disabled; default (no saved selection)", lines)
+        self.assertIn("  PR Fixer: disabled; review bots: CodeRabbit and Greptile (both must complete); "
+                      "maximum fix rounds: 5", lines)
+        # Enabling it chooses bots, budget, and its own harness/model/effort; no other profile changes.
+        result, remaining = self.edit_profiles(fixer, "On", "Greptile", "3", "Claude Code", "opus", "high", "yes")
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        prompts = self.gum_prompts()
+        self.assertEqual([prompt[3] for prompt in prompts[1:5]],
+                         [["Off", "On"], ["Both", "CodeRabbit", "Greptile"], [], ["Codex", "Claude Code", "Cursor"]])
+        self.assertEqual([prompt[2] for prompt in prompts[1:5]], ["Off", "Both", "5", "Codex"])
+        self.assertIn("captured when Issues I first creates an issue branch", result.stdout)
+        profiles = json.loads(path.read_text())["profiles"]
+        self.assertEqual(profiles, {"issue-implement": {"agent": "cursor", "model": "gpt-5"},
+                                    "pr-fixer": {"agent": "claude", "model": "opus", "effort": "high", "enabled": True,
+                                                 "bots": "greptile", "max_rounds": 3}})
+        self.assertEqual(json.loads(self.mf_config("fixer").stdout),
+                         {"enabled": True, "agent": "claude", "bots": ["greptile"], "max_rounds": 3})
+        self.assertEqual(self.mf_config("launch-args", "pr-fixer", "claude").stdout, "--model\nopus\n--effort\nhigh\n")
+        self.assertEqual(self.mf_config("agent", "issue-implement").stdout, "cursor\noverride\n")
+        self.assertEqual(self.mf_config("agent", "issue-prepare").stdout, "claude\nshared\n")
+        lines = self.mf_config("show").stdout.splitlines()
+        self.assertIn(fixer + ": Claude Code - enabled; mf-config selection", lines)
+        self.assertIn("  PR Fixer: enabled; review bots: Greptile; maximum fix rounds: 3", lines)
+        # Off keeps the saved bots, budget, and harness; turning it on again starts from them.
+        result, remaining = self.edit_profiles(fixer, "Off", "yes")
+        self.assert_success(result)
+        self.assertEqual(json.loads(path.read_text())["profiles"]["pr-fixer"],
+                         {"agent": "claude", "model": "opus", "effort": "high", "enabled": False, "bots": "greptile",
+                          "max_rounds": 3})
+        self.assertFalse(json.loads(self.mf_config("fixer").stdout)["enabled"])
+        result, remaining = self.edit_profiles(fixer, "On", "Both", "4", "Codex", "Native default (no override)",
+                                               "low", "yes", MOCK_CODEX_VERSION="0.166.0", **self.codex_cache())
+        self.assert_success(result)
+        self.assertEqual(remaining, [])
+        self.assertEqual([prompt[2] for prompt in self.gum_prompts()[1:5]], ["Off", "Greptile", "3", "Claude Code"])
+        self.assertEqual(json.loads(path.read_text())["profiles"]["pr-fixer"],
+                         {"agent": "codex", "effort": "low", "enabled": True, "bots": "both", "max_rounds": 4})
+        self.assertEqual(self.mf_config("launch-args", "pr-fixer", "codex").stdout,
+                         "--config\ncheck_for_update_on_startup=false\n--config\nmodel_reasoning_effort=\"low\"\n")
+        # Invalid budgets, cancellation, and a declined save leave the saved file intact.
+        saved = path.read_bytes()
+        for answers, status in (((fixer, "On", "Both", "0"), 1), ((fixer, "On", "Both", "100"), 1),
+                                ((fixer, "On", "Both", "five"), 1), ((fixer, "<cancel>"), 130),
+                                ((fixer, "On", "CodeRabbit", "2", "<cancel>"), 130),
+                                ((fixer, "On", "CodeRabbit", "2", "Cursor", "Native default (no override)", "no"), 130)):
+            with self.subTest(answers=answers):
+                result, _ = self.edit_profiles(*answers, MOCK_CODEX_VERSION="0.166.0")
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assertEqual(path.read_bytes(), saved)
+        # Invalid saved fixer settings are reported without repair, and fixer fields belong to the fixer only.
+        for profile in ({"agent": "codex", "enabled": "yes"}, {"agent": "codex", "bots": "all"},
+                        {"agent": "codex", "max_rounds": 0}, {"agent": "codex", "max_rounds": 2.5},
+                        {"agent": "cursor", "effort": "high", "enabled": True}):
+            with self.subTest(profile=profile):
+                content = json.dumps({"version": 1, "profiles": {"pr-fixer": profile}})
+                path.write_text(content)
+                result = self.mf_config("fixer")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("mf-config:", result.stderr)
+                self.assertEqual(path.read_text(), content)
+        path.write_text(json.dumps({"version": 1, "profiles": {"issue-implement": {"agent": "codex", "enabled": True}}}))
+        self.assertIn("unsupported field(s)", self.mf_config("show").stderr)
 
     def test_codex_picker_uses_local_cache_effort_levels_and_fast_availability(self):
         cache = self.codex_cache()
