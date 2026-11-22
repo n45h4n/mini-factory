@@ -504,7 +504,7 @@ elif name == "no-mistakes":
                   "      --skip string\n      --closes int\n      --wait duration")
     elif args in (["axi", "sync", "--help"], ["axi", "status", "--help"]):
         # Guarded synchronization and status exist from the stable release that added --base-branch.
-        if numeric < (1, 84, 0):
+        if numeric < (1, 84, 0) or (args[1] == "status" and os.environ.get("MOCK_NM_STATUS") == "missing"):
             fail('unknown command "' + args[1] + '" for "no-mistakes axi"')
         print("      --check   freshly verify and return the plan without changing HEAD\n      --recover"
               if args[1] == "sync" else "      --run string   inspect a specific run ID")
@@ -4865,12 +4865,18 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         for line in ("OK: Claude Code authenticated", "OK: Herdr Claude Code integration current",
                      "OK: PR Fixer: enabled - Claude Code (bots: coderabbit; maximum fix rounds: 5; login and Herdr "
                      "integration checked)",
-                     "OK: No-Mistakes per-run stage skip (axi run --skip) available for the enabled PR Fixer",
-                     "OK: Herdr tab create available for the enabled PR Fixer"):
+                     "OK: No-Mistakes and Herdr interfaces available for the enabled PR Fixer"):
             self.assertIn(line, doctor.stdout.splitlines())
+        # Doctor reports the same interface gaps that make Issues I refuse the enabled path.
         doctor = self.run_script(self.installed / "scripts/doctor.sh", env=dict(pending, MOCK_HERDR_HELP="old"))
         self.assertNotEqual(doctor.returncode, 0)
-        self.assertIn("FAIL: Herdr tab create capability missing for the enabled PR Fixer", doctor.stdout)
+        self.assertIn("FAIL: Herdr tab creation in a named workspace (herdr tab create --workspace --cwd --label "
+                      "--no-focus) lacks --label, --no-focus (needed by the enabled PR Fixer)", doctor.stdout)
+        doctor = self.run_script(self.installed / "scripts/doctor.sh", env=dict(pending, MOCK_NM_STATUS="missing"))
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: No-Mistakes run status (no-mistakes axi status) is unavailable (needed by the enabled "
+                      "PR Fixer)", doctor.stdout)
+        self.assertNotIn("OK: No-Mistakes and Herdr interfaces available for the enabled PR Fixer", doctor.stdout)
         self.assert_no_actions(allow_onboarding=True)
 
     # mf-config: per-key agent profiles, the Gum editor, and fresh-launch options.

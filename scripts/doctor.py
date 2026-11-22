@@ -99,6 +99,20 @@ def fixer_profile():
     return profile
 
 
+def fixer_capability_problems():
+    """Interfaces the enabled PR Fixer needs, from the bundled helper that Issues I consults before enrolling."""
+    helper = Path(__file__).resolve().parent / "pr_fixer.py"
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", str(helper), "capabilities"],
+                                capture_output=True, text=True, timeout=150)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return ["PR Fixer capability check failed (" + str(error) + ")"]
+    problems = (result.stdout + result.stderr).strip().splitlines()
+    if result.returncode and not problems:
+        return ["PR Fixer capability check failed without a reason"]
+    return problems if result.returncode else []
+
+
 def managed_launcher(path, target):
     expected = output([
         "bash", "-c", 'printf \'#!/usr/bin/env bash\n# mini-factory managed launcher v1\nexec %q "$@"\n\' "$1"',
@@ -452,17 +466,11 @@ def main():
         text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
         check(all(token in text for token in tokens), label + " available", label + " capability missing")
     # The enabled PR Fixer path delegates the CI stage per run and opens a tab in the issue workspace.
-    for argv, flags, label in ((
-        (["no-mistakes", "axi", "run", "--help"], ("--skip",), "No-Mistakes per-run stage skip (axi run --skip)"),
-        (["no-mistakes", "axi", "sync", "--help"], ("--check",), "No-Mistakes guarded synchronization (axi sync --check)"),
-        (["herdr", "tab", "create", "--help"], ("--workspace", "--cwd", "--label", "--no-focus"), "Herdr tab create"),
-        (["herdr", "tab", "list", "--help"], ("--workspace",), "Herdr tab list"),
-        (["herdr", "pane", "list", "--help"], ("--workspace",), "Herdr pane list"),
-    ) if fixer_enabled else ()):
-        text = output(argv, NO_MISTAKES_ENVIRONMENT) or ""
-        check(all(flag_available(text, flag) for flag in flags), label + " available for the enabled PR Fixer",
-              label + " capability missing for the enabled PR Fixer; update that tool, or turn the PR Fixer off "
-              "with mf-config")
+    if fixer_enabled:
+        for problem in fixer_capability_problems() or [None]:
+            check(problem is None, "No-Mistakes and Herdr interfaces available for the enabled PR Fixer",
+                  str(problem) + " (needed by the enabled PR Fixer); update that tool, or turn the PR Fixer off "
+                  "with mf-config")
     installation_failed = bool(failures)
     print("Installation: " + ("incomplete" if installation_failed else "installed"))
     if args.installation_only:
