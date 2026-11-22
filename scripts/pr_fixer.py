@@ -828,16 +828,27 @@ def ref_commit(worktree, repository, ref):
     return sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", sha) else None
 
 
+def ref_contains(worktree, repository, commit, ref_head):
+    """Whether a commit is the ref's current commit or in its history, as GitHub's comparison shows it: a run
+    GitHub started while the ref named that earlier commit still stands for the rule after the ref moves on."""
+    result = gh(worktree, "api", "repos/" + repository + "/compare/" + commit + "..." + ref_head, check=False)
+    try:
+        return not result.returncode and json.loads(result.stdout)["status"] in ("identical", "ahead")
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
 def required_workflows(context, worktree, workflows, contexts, merge_state, number):
     """Required workflows not yet shown satisfied for the head, and whether any of them failed. GitHub's merge
     state CLEAN (or HAS_HOOKS) means every merge requirement, required workflows included, is met for the head;
     otherwise the workflow's own check runs for this pull request on the head must have reported and passed. A
     rule names a file at a ref (or a pinned commit), and the pull request's own run of the same file can execute
-    another version of it, so a run stands for a rule only when GitHub ties its workflow file to the commit that
-    rule names; a matching repository and path alone leave the rule unverified."""
+    another version of it, so a run stands for a rule only when GitHub ties its workflow file to the pinned commit,
+    or to the commit the ref names now or named earlier; a matching repository and path alone leave the rule
+    unverified."""
     if not workflows or merge_state in ("CLEAN", "HAS_HOOKS"):
         return [], False
-    runs, names, commits, unverified, failed = {}, {}, {}, [], False
+    runs, names, commits, contained, unverified, failed = {}, {}, {}, {}, [], False
     for item in contexts:
         source = workflow_file(item, number) if item.get("__typename") == "CheckRun" else None
         if source:
@@ -851,11 +862,19 @@ def required_workflows(context, worktree, workflows, contexts, merge_state, numb
                 names[repository_id] = None
         name = names.get(repository_id)
         commit = pinned.lower() if isinstance(pinned, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", pinned) else None
+        exact = commit is not None
         if commit is None and name and isinstance(ref, str) and ref:
             if (name, ref) not in commits:
                 commits[(name, ref)] = ref_commit(worktree, name, ref)
             commit = commits[(name, ref)]
-        states = runs.get((name, path, commit), []) if name and commit else []
+        states = []
+        for (repository, run_path, run_commit), found in runs.items():
+            if not (name and commit and run_commit and (repository, run_path) == (name, path)):
+                continue
+            if run_commit != commit and not exact and (name, run_commit, commit) not in contained:
+                contained[(name, run_commit, commit)] = ref_contains(worktree, name, run_commit, commit)
+            if run_commit == commit or not exact and contained[(name, run_commit, commit)]:
+                states += found
         if "failing" in states:
             failed = True
         elif not states or "pending" in states:
@@ -2157,6 +2176,11 @@ def command_finish(context, arguments):
         if not evidence["settled"]:
             raise Stop("the final permitted round has not been observed yet (waiting on "
                        + ", ".join(evidence["waiting_on"]) + "); wait for it, or finish pending if it cannot be verified")
+        if evidence["ci"]["mergeable"] == "CONFLICTING":
+            # Whatever its CI result, a conflicting pull request is blocked by the conflict, not by the budget.
+            raise Stop("the pull request has a merge conflict with " + record["base_branch"] + ", so the round "
+                       "limit is not what stopped this run and nothing was recorded. Finish blocked and report the "
+                       "merge conflict.")
         if evidence["ci"]["state"] not in ("passing", "failing", "declared-no-ci"):
             # Settled only means nothing more is awaited: no check registered, or a trigger blocker, is still no
             # verified CI result, and that, not the spent budget, is then what is unresolved.
@@ -2164,11 +2188,6 @@ def command_finish(context, arguments):
                        + (" (" + evidence["ci"]["trigger_blocker"] + ")" if evidence["ci"].get("trigger_blocker") else "")
                        + ", so it has no verified CI result and the round limit is not what stopped this run. Finish "
                        "pending, or blocked for an external blocker, and report that CI state.")
-        if evidence["ci"]["mergeable"] == "CONFLICTING":
-            # Whatever its CI result, a conflicting pull request is blocked by the conflict, not by the budget.
-            raise Stop("the pull request has a merge conflict with " + record["base_branch"] + ", so the round "
-                       "limit is not what stopped this run and nothing was recorded. Finish blocked and report the "
-                       "merge conflict.")
     if result in ("ready", "round-limit"):
         # The verdict is about the live pull request, so it is read again after every other check: one closed,
         # retargeted, or moved while the evidence was gathered, or whose hosted CI or selected-bot reviews and

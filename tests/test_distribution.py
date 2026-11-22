@@ -77,7 +77,8 @@ elif name == "gh":
                                                   or args[:2] == ["api", "repositories/1"]
                                                   or args[:1] == ["api"] and args[1:2] != []
                                                   and args[1].startswith(("repos/friend/target/activity?",
-                                                                          "repos/friend/target/commits/"))):
+                                                                          "repos/friend/target/commits/",
+                                                                          "repos/friend/target/compare/"))):
         # The PR Fixer's GitHub: one pull request for agent/issue-8 whose head follows the remote fixture.
         fixture_file = pathlib.Path(os.environ["MOCK_FIXER_GITHUB"])
         github = json.loads(fixture_file.read_text()) if fixture_file.exists() else {}
@@ -130,6 +131,14 @@ elif name == "gh":
             if args[2:] or ref not in refs:
                 fail("gh: Not Found (HTTP 404)")
             print(json.dumps({"sha": refs[ref]}))
+        elif args[1].startswith("repos/friend/target/compare/"):
+            # How a commit relates to a later one: history maps a ref's current commit to its earlier commits.
+            base, _, later = args[1][len("repos/friend/target/compare/"):].partition("...")
+            if args[2:] or not later:
+                fail("unexpected commit comparison")
+            status = ("identical" if base == later else "ahead" if base in github.get("history", {}).get(later, [])
+                      else "diverged")
+            print(json.dumps({"status": status, "files": []}))
         elif args[:2] == ["api", "repos/friend/target/branches/feature%2Ffriend"]:
             # Classic branch protection of the captured base, as GitHub shows it to readers.
             contexts = github.get("protected_checks", [])
@@ -4737,9 +4746,17 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 ([pinned], [main], [ci_workflow]),
                 ([pinned], [check_run("test", required=False, workflow=ci_run + ("e" * 40,))], None),
                 # A ref that GitHub does not resolve leaves its rule unverified.
-                ([{"path": ci_workflow, "ref": "refs/heads/gone"}], [main], [ci_workflow + "@refs/heads/gone"])):
-            with self.subTest(rules=rules, unverified=unverified):
-                self.set_github(issue, ruleset_workflows=rules, checks=checks, refs={"heads/release": "d" * 40})
+                ([{"path": ci_workflow, "ref": "refs/heads/gone"}], [main], [ci_workflow + "@refs/heads/gone"]),
+                # A run GitHub started while main named an earlier commit still stands after main moves on, but a
+                # pinned commit is exact, and a commit outside main's history is not main's version.
+                ([ci_workflow], [check_run("test", required=False, workflow=ci_run + ("b" * 40,))], None),
+                ([{"path": ci_workflow, "ref": None, "sha": "c" * 40}],
+                 [check_run("test", required=False, workflow=ci_run + ("b" * 40,))], [ci_workflow]),
+                ([ci_workflow], [check_run("test", required=False, workflow=ci_run + ("a" * 40,))],
+                 [ci_workflow + "@refs/heads/main"])):
+            with self.subTest(rules=rules, checks=checks, unverified=unverified):
+                self.set_github(issue, ruleset_workflows=rules, checks=checks, refs={"heads/release": "d" * 40},
+                                history={"c" * 40: ["b" * 40]})
                 evidence = self.fixer_json(issue, "evidence")
                 self.assertEqual((evidence["ci"]["state"], evidence["ci"].get("unverified_required_workflows")),
                                  ("pending" if unverified else "passing", unverified))
@@ -4920,15 +4937,19 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         bounded = {"GH_DASH_PR_FIXER_REGISTRATION_POLLS": "1", "GH_DASH_PR_FIXER_CALL_POLLS": "1"}
         waited = self.fixer_json(issue, "wait", **bounded)
         self.assertEqual((waited["wait"], waited["ci"]["state"]), ("settled", "none"))
-        for changes, detail in (({}, "is none"),
-                                ({"pr": {"number": 12, "mergeable": "CONFLICTING"}}, "merge conflict")):
+        # Unverified CI is what is unresolved, unless a merge conflict (which can itself keep CI from registering)
+        # blocks the pull request; that conflict is then what is reported.
+        for changes, details in (({}, ("is none", "has no verified CI result and the round limit is not what "
+                                       "stopped this run")),
+                                 ({"pr": {"number": 12, "mergeable": "CONFLICTING"}},
+                                  ("has a merge conflict with feature/friend, so the round limit is not what stopped "
+                                   "this run", "Finish blocked and report the merge conflict"))):
             with self.subTest(changes=changes):
                 self.set_github(issue, **changes)
                 result = self.pr_fixer(issue, "finish", "round-limit", "--reason", "A finding remains", **bounded)
                 self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn("has no verified CI result and the round limit is not what stopped this run",
-                              result.stderr)
-                self.assertIn(detail, result.stderr)
+                for detail in details:
+                    self.assertIn(detail, result.stderr)
                 self.assertIsNone(self.fixer_json(issue, "status")["outcome"])
         self.set_github(issue, pr={"number": 12})
         report = self.fixer_json(issue, "finish", "pending", "--reason", "No CI check registered", **bounded)

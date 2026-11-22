@@ -653,7 +653,8 @@ require (which names a file at a ref or commit, not its checks) keeps CI
 pending until GitHub reports the PR's merge state as clean for that head or that
 file's own run for this PR (a `pull_request` or `pull_request_target` run whose
 check suite GitHub matches to exactly this PR, and whose workflow file GitHub
-links at the commit the rule's pinned SHA or ref names) has passed on the head.
+links at the rule's pinned SHA, or at the commit its ref names or named
+earlier, so a run is not invalidated when the ref moves on) has passed on the head.
 Rules for the same file at different refs are separate requirements; a run of
 the same file that GitHub does not tie to that commit (such as the PR's own
 version of the file), or a push run with the same check names, never counts. A trusted default-branch
