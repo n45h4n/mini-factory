@@ -137,6 +137,23 @@ def acpx_executable(config):
     return result.stdout.rstrip("\n")
 
 
+def optional_agents(config):
+    """[(duty, agent, executable)] for each duty set to a native harness setup does not provision, with the executable
+    No-Mistakes runs for it (agent_path_override, else its command), read by the bundled nm-config."""
+    helper = Path(__file__).resolve().parent / "nm_config.py"
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", str(helper), "agent-paths", str(config)],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(str(error))
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout).strip().replace("nm-config: ", "", 1) or "no result")
+    found = [tuple(line.split("\t")) for line in result.stdout.splitlines()]
+    if not all(len(fields) == 3 for fields in found):
+        raise ValueError("unexpected nm-config agent-paths output")
+    return found
+
+
 def forge_profiles(config, cli):
     """Whether native no-mistakes doctor runs cli (gh or glab) auth status, as it does for each forge profile with a
     gh_config_dir (GitHub) or glab_config_dir (GitLab), read by the bundled nm-config; assumed when the file cannot be
@@ -547,6 +564,22 @@ def main():
                   "cannot read acpx_path (" + str(acpx_problem) + "); write it as one plain value" if acpx_problem
                   else "acpx" + configured + " or its Node.js does not run from the No-Mistakes daemon's PATH ("
                   + path + "); run make setup for the exact action")
+    # Native no-mistakes doctor counts an agent as runnable once PATH finds it, so a lazy mise tool counts before it is
+    # installed. Each duty's agent that setup does not provision is checked, without running it, as No-Mistakes
+    # resolves it (agent_path_override, else its command) from your shell's PATH (native doctor's) and the daemon's
+    # (which runs it); agents no duty selects are not.
+    optional, optional_problem, optional_lazy, optional_undiscovered = [], None, set(), False
+    if guarded and no_mistakes_config.exists() and duty_problem is None:
+        try:
+            optional = optional_agents(no_mistakes_config)
+        except ValueError as error:
+            optional_problem = str(error)
+        executables = list(dict.fromkeys(executable for _, _, executable in optional))
+        if executables:
+            found = [lazy_pending(executables), lazy_pending(executables, path)]
+            optional_undiscovered = None in found
+            optional_lazy = set(executables) if optional_undiscovered else found[0] | found[1]
+    pending = {duty: executable for duty, _, executable in optional if executable in optional_lazy}
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
     if "no-mistakes" not in lazy:
         help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
@@ -598,6 +631,12 @@ def main():
         if kind:
             print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "
                   "integration needed)")
+        elif duty in pending:
+            check(False, "", "No-Mistakes " + duty + " " + agent + " setup pending: " + pending[duty]
+                  + (" was not checked (lazy mise tool discovery failed) and may be" if optional_undiscovered
+                     else " is") + " a lazy mise tool that is not installed yet (running it would install it "
+                  "first). make setup provisions only Codex, Claude Code, and Cursor: install it with mise yourself "
+                  "(mise install " + Path(pending[duty]).name + "), log in through its own CLI, then run make doctor")
         else:
             # Native doctor only proves the resolved agent is runnable, not logged in.
             print("NOTE: No-Mistakes " + duty + " " + agent + " login not checked by this doctor; "
@@ -606,6 +645,9 @@ def main():
     check(duty_problem is None, "No-Mistakes agents read",
           "No-Mistakes agent login pending: cannot read their agents (" + str(duty_problem) + "); write "
           "agent and review_agents in block form (as nm-config does) so their login can be checked")
+    if optional_problem:
+        check(False, "", "No-Mistakes agents not checked for lazy mise tools: cannot read their executables ("
+              + optional_problem + "); write agent_path_override in block form")
     # Installed agents that no role or duty uses may stay logged out.
     for kind in agents:
         command, label, login = AGENTS[kind]
@@ -634,6 +676,10 @@ def main():
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor could start "
               + ("a launcher that lazy mise tool discovery could not check" if undiscovered or node_undiscovered
                  else "a lazy mise tool that is not installed yet") + "; run make setup")
+    elif "agent" in pending:
+        # Native doctor would report it runnable (and for Rovo Dev run it); its setup pending action is above.
+        print("NOTE: No-Mistakes pipeline agent readiness not checked: native no-mistakes doctor counts "
+              + pending["agent"] + " as runnable before it is installed")
     else:
         ready, detail = native_pipeline_status()
         action = "run no-mistakes doctor"

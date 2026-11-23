@@ -5146,6 +5146,80 @@ os.execv(executable, [executable, *args])
         self.assertIn("OK: acpx runs from the No-Mistakes daemon's PATH", result.stdout.splitlines())
         self.assertEqual([c["args"] for c in self.calls("acpx")], [["--version"]])
 
+    def omarchy_optional_agents(self, agents):
+        """Omarchy after setup, with lazy mise shims (not installed yet) for OpenCode and Pi, agents setup does not
+        provision, and the No-Mistakes config's pipeline agent replaced with the given agents."""
+        _, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        for name in ("opencode", "pi"):
+            (shims / name).symlink_to(self.root / "system root/usr/bin/mise")
+        source = self.bundle / "no-mistakes/config.yaml"
+        self.assertIn("agent: codex", source.read_text())
+        source.write_text(source.read_text().replace("agent: codex", agents, 1))
+
+    def optional_agent_doctor(self):
+        self.log.write_text("")
+        result = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertFalse(self.calls("opencode") + self.calls("pi"))
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse(self.mise_changes())
+        self.assertFalse(self.mise_installs())
+        return result
+
+    def test_omarchy_doctor_reports_a_selected_lazy_optional_agent_as_setup_pending(self):
+        self.omarchy_optional_agents("agent: opencode\nreview_agents:\n  reviewer:\n    agent: pi\n")
+        result = self.optional_agent_doctor()
+        self.assertNotEqual(result.returncode, 0)
+        for duty, agent in (("agent", "opencode"), ("review_agents.reviewer", "pi")):
+            self.assertIn("FAIL: No-Mistakes " + duty + " " + agent + " setup pending: " + agent + " is a lazy mise "
+                          "tool that is not installed yet", result.stdout)
+            self.assertIn("make setup provisions only Codex, Claude Code, and Cursor: install it with mise yourself "
+                          "(mise install " + agent + ")", result.stdout)
+        # Native doctor would count the uninstalled launcher as runnable, so it never reports the agent ready.
+        self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
+        self.assertIn("NOTE: No-Mistakes pipeline agent readiness not checked", result.stdout)
+        self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
+        self.assertIn("Authentication/setup: pending", result.stdout)
+        # Setup still installs only its own lazy tools.
+        self.log.write_text("")
+        self.setup()
+        self.assertFalse(self.mise_installs())
+        self.assertEqual(self.lazy_triggered(), [])
+
+    def test_omarchy_doctor_reports_a_selected_installed_optional_agent_ready(self):
+        self.omarchy_optional_agents("agent: opencode\nreview_agents:\n  reviewer:\n    agent: pi\n")
+        for name in ("opencode", "pi"):
+            (self.mock / ("mise-installed-" + name)).write_text("yes")
+        result = self.optional_agent_doctor()
+        self.assert_success(result)
+        self.assertNotIn("setup pending: opencode", result.stdout)
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+        # agent_path_override decides which executable is checked: an uninstalled launcher there is pending, while a
+        # native override is ready although the opencode on PATH is an uninstalled launcher.
+        (self.mock / "mise-installed-opencode").unlink()
+        override = self.root / "own opencode/opencode"
+        override.parent.mkdir()
+        override.symlink_to(self.root / "system root/usr/bin/mise")
+        source = self.bundle / "no-mistakes/config.yaml"
+        source.write_text(source.read_text() + "agent_path_override:\n  opencode: " + json.dumps(str(override)) + "\n")
+        result = self.optional_agent_doctor()
+        self.assertIn("FAIL: No-Mistakes agent opencode setup pending: " + str(override) + " is a lazy mise tool",
+                      result.stdout)
+        override.unlink()
+        shutil.copyfile(self.mock / "mock-cli", override)
+        override.chmod(0o755)
+        result = self.optional_agent_doctor()
+        self.assert_success(result)
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+
+    def test_omarchy_doctor_ignores_unselected_lazy_optional_agents(self):
+        self.omarchy_optional_agents("agent: codex")
+        result = self.optional_agent_doctor()
+        self.assert_success(result)
+        self.assertNotIn("opencode", result.stdout)
+        self.assertNotIn(" pi ", result.stdout)
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+
     def test_omarchy_setup_checks_a_shell_only_acpx_launcher_as_the_tool_it_runs(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         self.assert_success(self.interactive_setup("y"))

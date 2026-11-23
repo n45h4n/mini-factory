@@ -968,7 +968,13 @@ so no version, help, or login probe installs it; run `make setup`, which asks
 first. Setup installs only its own lazy tools, so for any other one, such as
 `glab` when a GitLab forge profile (`glab_config_dir`) makes native
 `no-mistakes doctor` run it, doctor names the step to run yourself (for example
-`mise install glab`).
+`mise install glab`). The same applies to a No-Mistakes pipeline or review
+agent you select that setup does not provision (such as `opencode` or `pi`):
+doctor reads the executable No-Mistakes would run (`agent_path_override`, else
+the agent's command) from your shell's and the daemon's PATH without running
+it. While that executable is a lazy mise tool that is not installed yet, the
+agent is setup pending, never reported ready, and doctor names the
+`mise install` step. Agents no duty selects are not checked.
 It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's

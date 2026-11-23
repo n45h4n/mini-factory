@@ -38,6 +38,9 @@ USAGE = """usage: nm-config [show | --help]
 # Internal, used by setup and doctor:
 #   nm-config duties FILE   print DUTY<TAB>AGENT<TAB>HARNESS per No-Mistakes duty; HARNESS is the
 #                           Mini-Factory-provisioned codex, claude, or cursor it needs, else "-"
+#   nm-config agent-paths FILE
+#                           print DUTY<TAB>AGENT<TAB>EXECUTABLE per duty set to a native harness setup does not
+#                           provision (agent_path_override, else its command), as No-Mistakes resolves it
 #   nm-config acpx-path FILE
 #                           print the acpx executable No-Mistakes runs for ACP agents: acpx_path, else acpx
 #   nm-config daemon-path   print the PATH the No-Mistakes daemon resolves at startup (see daemon_path)
@@ -647,6 +650,20 @@ def duties(document):
             for duty, agent in found]
 
 
+def agent_paths(document):
+    """(duty, agent, executable) for each duty set to a native harness Mini-Factory does not provision, resolved as
+    No-Mistakes resolves it: agent_path_override.<harness>, else its default command (an ACP alias runs its own
+    command through acpx). auto and fallback lists name no single harness and are left to No-Mistakes."""
+    found = []
+    for duty, agent, harness in duties(document):
+        if harness or agent not in COMMANDS:
+            continue
+        node = None if agent in ACP_ALIASES else mapping(document, ("agent_path_override",)).get(agent)
+        found.append((duty, agent, COMMANDS[agent] if is_null(node) else
+                      str(scalar(node, ("agent_path_override", agent)))))
+    return found
+
+
 def show(link, target, document):
     print("No-Mistakes global config: " + str(link) + " -> " + str(target))
     print("Global defaults only: a target repository's trusted .no-mistakes.yaml may override the agent and")
@@ -1096,6 +1113,15 @@ def main(argv):
             raise ConfigError("cannot safely read the No-Mistakes duties in " + str(target) + ": " + str(error))
         for duty, agent, harness in found:
             print(duty + "\t" + " ".join(agent.split()) + "\t" + (harness or "-"))
+        return 0
+    if len(argv) == 2 and argv[0] == "agent-paths":
+        target = Path(argv[1])
+        try:
+            found = agent_paths(load(read(target)[1], target))
+        except Unsafe as error:
+            raise ConfigError("cannot safely read the No-Mistakes agents in " + str(target) + ": " + str(error))
+        for fields in found:
+            print("\t".join(fields))
         return 0
     if len(argv) == 2 and argv[0] == "acpx-path":
         target = Path(argv[1])
