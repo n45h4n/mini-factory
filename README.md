@@ -971,11 +971,11 @@ first. Setup installs only its own lazy tools, so for any other one, such as
 `mise install glab`). The same applies to a No-Mistakes pipeline or review
 agent you select that setup does not provision (such as `opencode` or `pi`):
 doctor reads the executable No-Mistakes would run (`agent_path_override`, else
-the agent's command) from your shell's and the daemon's PATH without running
-it. While that executable is a lazy mise tool that is not installed yet, the
+the agent's command; for an ACP alias such as Devin, `acp_registry_overrides`)
+from your shell's and the daemon's PATH without running it. While that executable is a lazy mise tool that is not installed yet, the
 agent is setup pending, never reported ready, and doctor names the
 `mise install` step. Native doctor also runs a Rovo Dev pipeline agent's
-`acli`, so it is not run while that `acli` is a launcher that writes your global
+`acli` (also as a fallback list entry), so it is not run while that `acli` is a launcher that writes your global
 mise configuration; doctor names the installed `acli` to set as
 `agent_path_override.rovodev`. Agents no duty selects are not checked.
 It checks the tools and versions above (including

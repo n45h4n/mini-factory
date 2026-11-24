@@ -683,11 +683,12 @@ def main():
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor could start "
               + ("a launcher that lazy mise tool discovery could not check" if undiscovered or node_undiscovered
                  else "a lazy mise tool that is not installed yet") + "; run make setup")
-    elif "agent" in pending or optional_problem:
+    elif "agent" in pending or optional_problem or (guarded and duty_problem):
         # Native doctor would report it runnable (and for Rovo Dev run it); its setup pending action is above.
         print("NOTE: No-Mistakes pipeline agent readiness not checked: native no-mistakes doctor counts "
               + (pending["agent"] + " as runnable before it is installed" if "agent" in pending else
-                 "an agent_path_override doctor could not read as runnable, which may be a lazy mise tool"))
+                 "an agent_path_override doctor could not read as runnable, which may be a lazy mise tool"
+                 if optional_problem else "an agent doctor could not read as runnable, and may run it"))
     elif configuring and configuring.strip():
         tool = configuring.strip().partition("\t")[2]
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor runs Rovo Dev's " + rovodev
