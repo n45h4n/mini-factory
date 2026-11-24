@@ -5198,6 +5198,14 @@ os.execv(executable, [executable, *args])
         self.assertIn("(mise install grok)", result.stdout)
         self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
         self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
+        # A launcher script's own mise x request is what mise install installs, not the launcher's name.
+        launcher = self.home / ".local/bin/pi"
+        launcher.write_text('#!/bin/sh\nexec mise x "npm:pi-agent@1.2" -- "pi" "$@"\n')
+        launcher.chmod(0o755)
+        result = self.optional_agent_doctor()
+        self.assertIn("FAIL: No-Mistakes review_agents.reviewer pi setup pending: pi is a lazy mise tool",
+                      result.stdout)
+        self.assertIn("(mise install npm:pi-agent@1.2)", result.stdout)
 
     def test_omarchy_doctor_reports_a_selected_installed_optional_agent_ready(self):
         self.omarchy_optional_agents("agent: opencode\nreview_agents:\n  reviewer:\n    agent: pi\n")

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Platform and tool-ownership evidence shared by setup.sh and update.sh (which source this file) and
-# doctor.py (which runs: bash platform.sh detect | lazy COMMAND... | probes DIRECTORY COMMAND...). Everything here
-# only reads local evidence (probes also writes its private directory): nothing installs, updates, or runs the tools
-# it inspects.
+# doctor.py (which runs: bash platform.sh detect | lazy COMMAND... | request COMMAND... | probes DIRECTORY COMMAND...).
+# Everything here only reads local evidence (probes also writes its private directory): nothing installs, updates, or
+# runs the tools it inspects.
 
 # Isolated tests point this at a synthetic system root; it is empty (the real /) otherwise.
 mf_root="${MINI_FACTORY_TEST_ROOT:-}"
@@ -369,13 +369,23 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 		shift
 		mf_configuring_launchers "$@"
 		;;
+	request)
+		# NAME<TAB>REQUEST: what mise install installs for each named mise launcher PATH (or a path) resolves.
+		shift
+		for name in "$@"; do
+			path="$(command -v "$name" 2>/dev/null)" && mf_is_mise_launcher "$path" &&
+				request="$(mf_launcher_install_request "$name" "$path")" && printf '%s\t%s\n' "$name" "$request"
+		done
+		exit 0
+		;;
 	probes)
 		[ "$#" -ge 2 ] && [ -d "$2" ] || exit 2
 		shift
 		mf_link_configuring_launchers "$@"
 		;;
 	*)
-		printf 'usage: platform.sh detect | lazy COMMAND... | configuring COMMAND... | probes DIRECTORY COMMAND...\n' >&2
+		printf 'usage: platform.sh detect | lazy COMMAND... | configuring COMMAND... | request COMMAND... |'\
+' probes DIRECTORY COMMAND...\n' >&2
 		exit 2
 		;;
 	esac

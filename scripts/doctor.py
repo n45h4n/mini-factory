@@ -583,6 +583,11 @@ def main():
     for duty, _, executable in optional:
         if executable in optional_lazy:
             pending.setdefault(duty, []).append(executable)
+    # What mise install installs for each pending launcher (its own mise x request, such as npm:@github/copilot), read
+    # without running it; else the executable's name.
+    text = pending and not optional_undiscovered and output(
+        [BASH, str(PLATFORM_HELPER), "request", *dict.fromkeys(e for found in pending.values() for e in found)])
+    requests = dict(line.split("\t", 1) for line in (text or "").splitlines() if "\t" in line)
     # Native doctor also runs a Rovo Dev pipeline agent's executable (acli, to check its Rovo Dev support), so it is not
     # run while that is a launcher that writes your global mise configuration every run (see probe_path).
     rovodev = next((executable for duty, agent, executable in optional if duty == "agent" and agent == "rovodev"
@@ -646,7 +651,8 @@ def main():
                   + (" was not checked (lazy mise tool discovery failed) and may be" if optional_undiscovered
                      else " is") + " a lazy mise tool that is not installed yet (running it would install it "
                   "first). make setup provisions only Codex, Claude Code, and Cursor: install it with mise yourself "
-                  "(mise install " + " ".join(Path(executable).name for executable in pending[duty])
+                  "(mise install " + " ".join(shlex.quote(requests.get(executable, Path(executable).name))
+                                              for executable in pending[duty])
                   + "), log in through its own CLI, then run make doctor")
         else:
             # Native doctor only proves the resolved agent is runnable, not logged in.
