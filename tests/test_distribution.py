@@ -5277,7 +5277,12 @@ os.execv(executable, [executable, *args])
         self.assertEqual(launcher.read_text(), text)
 
     def test_omarchy_doctor_ignores_unselected_lazy_optional_agents(self):
-        self.omarchy_optional_agents("agent: codex")
+        # A padded name is the harness No-Mistakes trims it to: provisioned Codex, not an optional agent.
+        self.omarchy_optional_agents('agent: " codex "')
+        helper, source = self.installed / "scripts/nm_config.py", self.bundle / "no-mistakes/config.yaml"
+        paths = subprocess.run([sys.executable, "-I", "-B", str(helper), "agent-paths", str(source)],
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual((paths.returncode, paths.stdout), (0, ""))
         result = self.optional_agent_doctor()
         self.assert_success(result)
         self.assertNotIn("opencode", result.stdout)

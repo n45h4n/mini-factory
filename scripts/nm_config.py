@@ -640,11 +640,11 @@ def duties(document):
     elif node.kind == "list":
         found = [("agent", "ordered fallback list " + ", ".join(map(str, node.value)))]
     else:
-        found = [("agent", str(scalar(node, ("agent",))))]
+        found = [("agent", str(scalar(node, ("agent",))).strip())]
     for role in ROLES:
         agent = mapping(document, ("review_agents", role)).get("agent")
         if not is_null(agent):
-            found.append(("review_agents." + role, str(scalar(agent, ("review_agents", role, "agent")))))
+            found.append(("review_agents." + role, str(scalar(agent, ("review_agents", role, "agent"))).strip()))
     aliases = {target: name for name, target in ACP_ALIASES.items()}
     return [(duty, agent, next((kind for kind in (agent, aliases.get(agent)) if kind in mf.HARNESSES), None))
             for duty, agent in found]
@@ -658,10 +658,10 @@ def agent_paths(document):
     No-Mistakes, except a fallback list's rovodev: No-Mistakes checks every entry, and for Rovo Dev runs its acli."""
     found, aliases = [], {target: name for name, target in ACP_ALIASES.items()}
     node = document.get(("agent",))
-    # No-Mistakes trims each agent name, as it does a fallback list's entries.
+    # No-Mistakes trims each agent name (as duties does), and so each fallback list entry.
     listed = ([("agent", "rovodev")] if not is_null(node) and node.kind == "list"
               and "rovodev" in (str(entry).strip() for entry in node.value) else [])
-    for duty, agent in [(duty, agent.strip()) for duty, agent, harness in duties(document) if not harness] + listed:
+    for duty, agent in [(duty, agent) for duty, agent, harness in duties(document) if not harness] + listed:
         # acp:devin is the devin alias's own spelling.
         name = aliases.get(agent, agent)
         if name not in COMMANDS:
