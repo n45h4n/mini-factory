@@ -506,7 +506,8 @@ def main():
                   "it first, or write your global mise configuration); install it with mise yourself (mise install "
                   + name + "), then run make doctor")
     for name in ("git", "gh", "jq", "herdr", "gum", *commands):
-        if name in lazy:
+        # npm runs under node (#!/usr/bin/env node), so even a native npm would run a pending Node.js launcher.
+        if name in lazy or (name == "npm" and "node" in lazy):
             continue
         text = output([name, "--version"], NO_MISTAKES_ENVIRONMENT)
         check(bool(text and text.strip()), name + " version responds", name + " version check failed")

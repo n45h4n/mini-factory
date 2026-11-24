@@ -6320,6 +6320,26 @@ os.execv(executable, [executable, *args])
         self.assert_safe_clone_actions()
         self.assert_no_actions()
 
+    def test_omarchy_doctor_never_runs_your_own_npm_behind_an_uninstalled_lazy_node(self):
+        self.clone_fixture()
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        self.assert_success(self.interactive_setup("y"))
+        # Later your own native npm comes first on PATH, while node stays Omarchy's lazy mise launcher whose Node.js
+        # is no longer installed. npm runs under node (#!/usr/bin/env node), so even npm --version would install it.
+        (self.mock / "mise-installed-node").unlink()
+        npm = self.mock / "npm"
+        npm.write_text("#!/usr/bin/env node\n")
+        npm.chmod(0o755)
+        self.log.write_text("")
+        doctor = self.run_script(self.installed / "scripts/doctor.sh")
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("FAIL: node is a lazy mise tool that is not installed yet (running it would install it first); "
+                      "setup pending: run make setup, which asks before mise install node", doctor.stdout)
+        self.assertNotIn("npm is a lazy mise tool", doctor.stdout)
+        self.assertNotIn("npm version", doctor.stdout)
+        self.assertFalse(self.mise_installs())
+
 
     # nm-config: the No-Mistakes global config editor for the clone file linked from NM_HOME.
 
