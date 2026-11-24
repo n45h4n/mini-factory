@@ -658,9 +658,10 @@ def agent_paths(document):
     No-Mistakes, except a fallback list's rovodev: No-Mistakes checks every entry, and for Rovo Dev runs its acli."""
     found, aliases = [], {target: name for name, target in ACP_ALIASES.items()}
     node = document.get(("agent",))
-    listed = ([("agent", "rovodev")] if not is_null(node) and node.kind == "list" and "rovodev" in map(str, node.value)
-              else [])
-    for duty, agent in [(duty, agent) for duty, agent, harness in duties(document) if not harness] + listed:
+    # No-Mistakes trims each agent name, as it does a fallback list's entries.
+    listed = ([("agent", "rovodev")] if not is_null(node) and node.kind == "list"
+              and "rovodev" in (str(entry).strip() for entry in node.value) else [])
+    for duty, agent in [(duty, agent.strip()) for duty, agent, harness in duties(document) if not harness] + listed:
         # acp:devin is the devin alias's own spelling.
         name = aliases.get(agent, agent)
         if name not in COMMANDS:

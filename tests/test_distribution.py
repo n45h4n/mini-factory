@@ -5215,12 +5215,14 @@ os.execv(executable, [executable, *args])
         self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
         # acp_registry_overrides decides the command an ACP alias runs: a native devin there is ready although the
         # devin on PATH is an uninstalled launcher.
-        devin = self.root / "own devin/devin"
-        devin.parent.mkdir()
-        shutil.copyfile(self.mock / "mock-cli", devin)
-        devin.chmod(0o755)
+        # Its first field is the executable, as No-Mistakes reads it, so this one has no whitespace and PATH finds it.
+        shutil.copyfile(self.mock / "mock-cli", self.mock / "own-devin")
+        (self.mock / "own-devin").chmod(0o755)
         text = source.read_text().replace("    agent: pi\n", "    agent: pi\n  fixer:\n    agent: acp:devin\n", 1)
-        source.write_text(text + "acp_registry_overrides:\n  devin: " + json.dumps(str(devin) + " acp") + "\n")
+        source.write_text(text + "acp_registry_overrides:\n  devin: \" own-devin acp \"\n")
+        paths = subprocess.run([sys.executable, "-I", "-B", str(self.installed / "scripts/nm_config.py"), "agent-paths",
+                                str(source)], capture_output=True, text=True, timeout=30)
+        self.assertIn("review_agents.fixer\tacp:devin\town-devin\n", paths.stdout)
         result = self.optional_agent_doctor()
         self.assert_success(result)
         self.assertNotIn("setup pending: devin", result.stdout)
@@ -5250,13 +5252,13 @@ os.execv(executable, [executable, *args])
         self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
         self.assertEqual(launcher.read_text(), text)
         # No-Mistakes checks every fallback entry, so a listed Rovo Dev is refused as well.
-        source.write_text(source.read_text().replace("agent: rovodev", "agent: [codex, rovodev]", 1))
+        source.write_text(source.read_text().replace("agent: rovodev", "agent: [codex, \" rovodev \"]", 1))
         result = self.optional_agent_doctor()
         self.assertIn("FAIL: No-Mistakes pipeline agent not checked: native no-mistakes doctor runs Rovo Dev's acli",
                       result.stdout)
         self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
         # Unreadable duties may select such an agent too.
-        source.write_text(source.read_text().replace("agent: [codex, rovodev]",
+        source.write_text(source.read_text().replace("agent: [codex, \" rovodev \"]",
                                                      "agent: codex\nreview_agents: {reviewer: {agent: rovodev}}", 1))
         result = self.optional_agent_doctor()
         self.assertIn("FAIL: No-Mistakes agent login pending: cannot read their agents", result.stdout)
