@@ -5187,6 +5187,17 @@ os.execv(executable, [executable, *args])
         self.setup()
         self.assertFalse(self.mise_installs())
         self.assertEqual(self.lazy_triggered(), [])
+        # No-Mistakes resolves each fallback entry from PATH, so an uninstalled lazy grok in the list can be selected.
+        (self.root / "home with spaces/.local/share/mise/shims/grok").symlink_to(self.root / "system root/usr/bin/mise")
+        source = self.bundle / "no-mistakes/config.yaml"
+        source.write_text(source.read_text().replace("agent: opencode", "agent: [grok, codex]", 1))
+        result = self.optional_agent_doctor()
+        self.assertFalse(self.calls("grok"))
+        self.assertIn("FAIL: No-Mistakes agent ordered fallback list grok, codex setup pending: grok is a lazy mise "
+                      "tool that is not installed yet", result.stdout)
+        self.assertIn("(mise install grok)", result.stdout)
+        self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
+        self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
 
     def test_omarchy_doctor_reports_a_selected_installed_optional_agent_ready(self):
         self.omarchy_optional_agents("agent: opencode\nreview_agents:\n  reviewer:\n    agent: pi\n")

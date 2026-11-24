@@ -654,17 +654,17 @@ def agent_paths(document):
     """(duty, agent, executable) for each duty set to a native harness Mini-Factory does not provision, resolved as
     No-Mistakes resolves it: agent_path_override.<harness>, else its default command; an ACP alias runs through acpx
     the command acp_registry_overrides.<target> names, else its own (an executable No-Mistakes does not probe, such as
-    a relative or quoted one, is left to it). auto and fallback lists name no single harness and are left to
-    No-Mistakes, except a fallback list's rovodev: No-Mistakes checks every entry, and for Rovo Dev runs its acli."""
+    a relative or quoted one, is left to it). Each entry of a fallback list is one of the pipeline agent's (No-Mistakes
+    resolves every entry, and for Rovo Dev runs its acli); auto names no single harness and is left to No-Mistakes."""
     found, aliases = [], {target: name for name, target in ACP_ALIASES.items()}
     node = document.get(("agent",))
     # No-Mistakes trims each agent name (as duties does), and so each fallback list entry.
-    listed = ([("agent", "rovodev")] if not is_null(node) and node.kind == "list"
-              and "rovodev" in (str(entry).strip() for entry in node.value) else [])
-    for duty, agent in [(duty, agent) for duty, agent, harness in duties(document) if not harness] + listed:
+    listed = ([("agent", str(entry).strip()) for entry in node.value] if not is_null(node) and node.kind == "list"
+              else [])
+    for duty, agent in dict.fromkeys([(duty, agent) for duty, agent, _ in duties(document)] + listed):
         # acp:devin is the devin alias's own spelling.
         name = aliases.get(agent, agent)
-        if name not in COMMANDS:
+        if name in mf.HARNESSES or name not in COMMANDS:
             continue
         if name in ACP_ALIASES:
             path = ("acp_registry_overrides", ACP_ALIASES[name][len("acp:"):])

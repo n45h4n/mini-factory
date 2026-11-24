@@ -579,7 +579,10 @@ def main():
             found = [lazy_pending(executables), lazy_pending(executables, path)]
             optional_undiscovered = None in found
             optional_lazy = set(executables) if optional_undiscovered else found[0] | found[1]
-    pending = {duty: executable for duty, _, executable in optional if executable in optional_lazy}
+    pending = {}
+    for duty, _, executable in optional:
+        if executable in optional_lazy:
+            pending.setdefault(duty, []).append(executable)
     # Native doctor also runs a Rovo Dev pipeline agent's executable (acli, to check its Rovo Dev support), so it is not
     # run while that is a launcher that writes your global mise configuration every run (see probe_path).
     rovodev = next((executable for duty, agent, executable in optional if duty == "agent" and agent == "rovodev"
@@ -639,11 +642,12 @@ def main():
             print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "
                   "integration needed)")
         elif duty in pending:
-            check(False, "", "No-Mistakes " + duty + " " + agent + " setup pending: " + pending[duty]
+            check(False, "", "No-Mistakes " + duty + " " + agent + " setup pending: " + ", ".join(pending[duty])
                   + (" was not checked (lazy mise tool discovery failed) and may be" if optional_undiscovered
                      else " is") + " a lazy mise tool that is not installed yet (running it would install it "
                   "first). make setup provisions only Codex, Claude Code, and Cursor: install it with mise yourself "
-                  "(mise install " + Path(pending[duty]).name + "), log in through its own CLI, then run make doctor")
+                  "(mise install " + " ".join(Path(executable).name for executable in pending[duty])
+                  + "), log in through its own CLI, then run make doctor")
         else:
             # Native doctor only proves the resolved agent is runnable, not logged in.
             print("NOTE: No-Mistakes " + duty + " " + agent + " login not checked by this doctor; "
@@ -686,7 +690,7 @@ def main():
     elif "agent" in pending or optional_problem or (guarded and duty_problem):
         # Native doctor would report it runnable (and for Rovo Dev run it); its setup pending action is above.
         print("NOTE: No-Mistakes pipeline agent readiness not checked: native no-mistakes doctor counts "
-              + (pending["agent"] + " as runnable before it is installed" if "agent" in pending else
+              + (", ".join(pending["agent"]) + " as runnable before it is installed" if "agent" in pending else
                  "an agent_path_override doctor could not read as runnable, which may be a lazy mise tool"
                  if optional_problem else "an agent doctor could not read as runnable, and may run it"))
     elif configuring and configuring.strip():
