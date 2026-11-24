@@ -654,13 +654,15 @@ def agent_paths(document):
     """(duty, agent, executable) for each duty set to a native harness Mini-Factory does not provision, resolved as
     No-Mistakes resolves it: agent_path_override.<harness>, else its default command (an ACP alias runs its own
     command through acpx). auto and fallback lists name no single harness and are left to No-Mistakes."""
-    found = []
+    found, aliases = [], {target: name for name, target in ACP_ALIASES.items()}
     for duty, agent, harness in duties(document):
-        if harness or agent not in COMMANDS:
+        # acp:devin is the devin alias's own spelling.
+        name = aliases.get(agent, agent)
+        if harness or name not in COMMANDS:
             continue
-        node = None if agent in ACP_ALIASES else mapping(document, ("agent_path_override",)).get(agent)
-        found.append((duty, agent, COMMANDS[agent] if is_null(node) else
-                      str(scalar(node, ("agent_path_override", agent)))))
+        node = None if name in ACP_ALIASES else mapping(document, ("agent_path_override",)).get(name)
+        found.append((duty, agent, COMMANDS[name] if is_null(node) else
+                      str(scalar(node, ("agent_path_override", name)))))
     return found
 
 

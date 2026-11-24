@@ -580,6 +580,13 @@ def main():
             optional_undiscovered = None in found
             optional_lazy = set(executables) if optional_undiscovered else found[0] | found[1]
     pending = {duty: executable for duty, _, executable in optional if executable in optional_lazy}
+    # Native doctor also runs a Rovo Dev pipeline agent's executable (acli, to check its Rovo Dev support), so it is not
+    # run while that is a launcher that writes your global mise configuration every run (see probe_path).
+    rovodev = next((executable for duty, agent, executable in optional if duty == "agent" and agent == "rovodev"
+                    and duty not in pending), None)
+    configuring = rovodev and output([BASH, str(PLATFORM_HELPER), "configuring", rovodev])
+    if rovodev and configuring is None:
+        configuring = rovodev + "\n"
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
     if "no-mistakes" not in lazy:
         help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
@@ -676,10 +683,18 @@ def main():
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor could start "
               + ("a launcher that lazy mise tool discovery could not check" if undiscovered or node_undiscovered
                  else "a lazy mise tool that is not installed yet") + "; run make setup")
-    elif "agent" in pending:
+    elif "agent" in pending or optional_problem:
         # Native doctor would report it runnable (and for Rovo Dev run it); its setup pending action is above.
         print("NOTE: No-Mistakes pipeline agent readiness not checked: native no-mistakes doctor counts "
-              + pending["agent"] + " as runnable before it is installed")
+              + (pending["agent"] + " as runnable before it is installed" if "agent" in pending else
+                 "an agent_path_override doctor could not read as runnable, which may be a lazy mise tool"))
+    elif configuring and configuring.strip():
+        tool = configuring.strip().partition("\t")[2]
+        check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor runs Rovo Dev's " + rovodev
+              + ", a launcher that writes your global mise configuration every run; " + (
+                  "set agent_path_override.rovodev to the acli it runs (" + tool + "), then run make doctor" if tool
+                  else "its tool cannot be resolved, so install it with mise yourself (mise install acli), then "
+                  "run make doctor"))
     else:
         ready, detail = native_pipeline_status()
         action = "run no-mistakes doctor"

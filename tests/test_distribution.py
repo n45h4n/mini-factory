@@ -5151,7 +5151,7 @@ os.execv(executable, [executable, *args])
         provision, and the No-Mistakes config's pipeline agent replaced with the given agents."""
         _, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
         self.assert_success(self.interactive_setup("y"))
-        for name in ("opencode", "pi"):
+        for name in ("opencode", "pi", "devin"):
             (shims / name).symlink_to(self.root / "system root/usr/bin/mise")
         source = self.bundle / "no-mistakes/config.yaml"
         self.assertIn("agent: codex", source.read_text())
@@ -5160,21 +5160,23 @@ os.execv(executable, [executable, *args])
     def optional_agent_doctor(self):
         self.log.write_text("")
         result = self.run_script(self.installed / "scripts/doctor.sh")
-        self.assertFalse(self.calls("opencode") + self.calls("pi"))
+        self.assertFalse(self.calls("opencode") + self.calls("pi") + self.calls("devin") + self.calls("acli"))
         self.assertEqual(self.lazy_triggered(), [])
         self.assertFalse(self.mise_changes())
         self.assertFalse(self.mise_installs())
         return result
 
     def test_omarchy_doctor_reports_a_selected_lazy_optional_agent_as_setup_pending(self):
-        self.omarchy_optional_agents("agent: opencode\nreview_agents:\n  reviewer:\n    agent: pi\n")
+        self.omarchy_optional_agents("agent: opencode\nreview_agents:\n  reviewer:\n    agent: pi\n"
+                                     "  fixer:\n    agent: acp:devin\n")
         result = self.optional_agent_doctor()
         self.assertNotEqual(result.returncode, 0)
-        for duty, agent in (("agent", "opencode"), ("review_agents.reviewer", "pi")):
-            self.assertIn("FAIL: No-Mistakes " + duty + " " + agent + " setup pending: " + agent + " is a lazy mise "
+        for duty, agent, command in (("agent", "opencode", "opencode"), ("review_agents.reviewer", "pi", "pi"),
+                                     ("review_agents.fixer", "acp:devin", "devin")):
+            self.assertIn("FAIL: No-Mistakes " + duty + " " + agent + " setup pending: " + command + " is a lazy mise "
                           "tool that is not installed yet", result.stdout)
             self.assertIn("make setup provisions only Codex, Claude Code, and Cursor: install it with mise yourself "
-                          "(mise install " + agent + ")", result.stdout)
+                          "(mise install " + command + ")", result.stdout)
         # Native doctor would count the uninstalled launcher as runnable, so it never reports the agent ready.
         self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
         self.assertIn("NOTE: No-Mistakes pipeline agent readiness not checked", result.stdout)
@@ -5211,6 +5213,40 @@ os.execv(executable, [executable, *args])
         result = self.optional_agent_doctor()
         self.assert_success(result)
         self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+
+    def test_omarchy_doctor_runs_no_native_doctor_that_could_run_an_unchecked_optional_agent(self):
+        # An agent_path_override doctor cannot read may name a lazy mise tool, so native doctor is not run.
+        self.omarchy_optional_agents("agent: opencode\nagent_path_override: {opencode: /opt/opencode}")
+        result = self.optional_agent_doctor()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: No-Mistakes agents not checked for lazy mise tools: cannot read their executables",
+                      result.stdout)
+        self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
+        self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
+        # Native doctor runs a Rovo Dev agent's acli, so not while it is an installed launcher that writes your global
+        # mise configuration every run; a native acli it is pointed at is checked as usual.
+        launcher = self.home / ".local/bin/acli"
+        text = self.configuring_launcher(launcher, "acli")
+        (self.mock / "mise-installed-acli").write_text("yes")
+        source = self.bundle / "no-mistakes/config.yaml"
+        source.write_text(source.read_text().replace("agent: opencode\nagent_path_override: {opencode: /opt/opencode}",
+                                                     "agent: rovodev", 1))
+        result = self.optional_agent_doctor()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: No-Mistakes pipeline agent not checked: native no-mistakes doctor runs Rovo Dev's acli, a "
+                      "launcher that writes your global mise configuration every run; set agent_path_override.rovodev "
+                      "to the acli it runs (", result.stdout)
+        self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
+        self.assertEqual(launcher.read_text(), text)
+        native = self.root / "native acli/acli"
+        native.parent.mkdir()
+        shutil.copyfile(self.mock / "mock-cli", native)
+        native.chmod(0o755)
+        source.write_text(source.read_text() + "agent_path_override:\n  rovodev: " + json.dumps(str(native)) + "\n")
+        result = self.optional_agent_doctor()
+        self.assert_success(result)
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+        self.assertEqual(launcher.read_text(), text)
 
     def test_omarchy_doctor_ignores_unselected_lazy_optional_agents(self):
         self.omarchy_optional_agents("agent: codex")

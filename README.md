@@ -974,7 +974,10 @@ doctor reads the executable No-Mistakes would run (`agent_path_override`, else
 the agent's command) from your shell's and the daemon's PATH without running
 it. While that executable is a lazy mise tool that is not installed yet, the
 agent is setup pending, never reported ready, and doctor names the
-`mise install` step. Agents no duty selects are not checked.
+`mise install` step. Native doctor also runs a Rovo Dev pipeline agent's
+`acli`, so it is not run while that `acli` is a launcher that writes your global
+mise configuration; doctor names the installed `acli` to set as
+`agent_path_override.rovodev`. Agents no duty selects are not checked.
 It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
