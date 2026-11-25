@@ -177,7 +177,8 @@ packages and tools, and setup reuses them:
   them; it installs no other optional lazy tool, and Omarchy's own mise hook may
   add each agent's Herdr integration as it installs. A launcher that requests an
   exact version (such as `gh@2.88.1`) gets exactly that request installed, and a
-  lazy mise Gum of your own is installed the same way instead of a `gum` package.
+  lazy mise Gum or Git of your own is installed the same way instead of a `gum`
+  or `git` package.
 - Checks, Gum confirmations, and the logins, gh-dash installation, and Herdr
   integrations you approve run the installed tool a mise launcher would run, with
   mise offline, so none of them installs or updates a tool, writes your mise

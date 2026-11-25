@@ -869,7 +869,7 @@ elif name == "mise":
             print("latest")
     elif args[:1] == ["install"] and len(args) > 1:
         # Tool requests setup may install: TOOL (the version selected here) or TOOL@VERSION (exactly that version).
-        if any(arg.startswith("-") or arg.partition("@")[0] not in ("gh", "gum", "codex", "claude", "cursor-agent", "node")
+        if any(arg.startswith("-") or arg.partition("@")[0] not in ("git", "gh", "gum", "codex", "claude", "cursor-agent", "node")
                for arg in args[1:]):
             fail("unexpected mise installation: " + " ".join(args[1:]))
         for request in args[1:]:
@@ -5657,6 +5657,46 @@ os.execv(executable, [executable, *args])
         unchanged()
         self.assertEqual(launcher.read_text(), text)
 
+    def test_arch_family_setup_never_runs_a_lazy_or_configuration_writing_git_before_approval(self):
+        system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        # Your own mise provides Git lazily: its shim installs Git when first run.
+        (self.mock / "git").unlink()
+        (shims / "git").symlink_to(system / "usr/bin/mise")
+
+        def unchanged():
+            self.assertEqual(self.lazy_triggered(), [])
+            self.assertFalse(self.mise_changes())
+            # No competing git package is offered or installed (pacman only reads Omarchy's package).
+            self.assertFalse(self.calls("sudo") + self.calls("omarchy"))
+            self.assertFalse([c for c in self.calls("pacman") if c["args"] != ["-Qq", "omarchy"]])
+
+        # Without a terminal, or declined, nothing runs or installs Git.
+        for run in (self.setup, lambda: self.interactive_setup("n")):
+            self.log.write_text("")
+            result = run()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("lazy mise tools pending: git; rerun make setup in a terminal to install them with mise "
+                          "install git", result.stdout + result.stderr)
+            self.assertFalse(self.calls("git"))
+            self.assertFalse(self.mise_installs())
+            unchanged()
+        # Approved, mise installs only Git, which setup then checks.
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y"))
+        self.assertEqual(self.mise_installs(), [["install", "git"]])
+        self.assertTrue(self.calls("git"))
+        unchanged()
+        # A Git launcher that writes your global mise configuration every run is checked as the installed Git it runs.
+        launcher = self.home / ".local/bin/git"
+        text = self.configuring_launcher(launcher, "git")
+        self.log.write_text("")
+        self.assert_success(self.interactive_setup("y", MOCK_GH_AUTH="pending"))
+        self.assertEqual({c["path"] for c in self.calls("git")},
+                         {str(self.home / ".local/share/mise/installs/git/latest/bin/git")})
+        self.assertFalse(self.mise_installs())
+        unchanged()
+        self.assertEqual(launcher.read_text(), text)
+
     def test_omarchy_update_asks_only_with_an_installed_gum_and_never_through_its_mise_launcher(self):
         self.clone_fixture()
         system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node", "gum"))
@@ -5751,7 +5791,8 @@ os.execv(executable, [executable, *args])
         # moment) is unavailable: its login and extension stay pending, and nothing runs or replaces it.
         setup = self.bundle / "scripts/setup.sh"
         original = setup.read_text()
-        patched = original.replace('"$probe_directory/shell" "$PATH" gh codex', '"$probe_directory/shell" "$PATH" codex', 1)
+        patched = original.replace('"$probe_directory/shell" "$PATH" git gh codex',
+                                   '"$probe_directory/shell" "$PATH" git codex', 1)
         self.assertNotEqual(patched, original)
         setup.write_text(patched)
         for marker in ("gh-authenticated", "extension-installed"):

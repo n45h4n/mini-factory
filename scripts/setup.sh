@@ -289,9 +289,21 @@ python_is_suitable() {
 		python3 -I -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1
 }
 
+# On Arch and Omarchy, as for Gum below, a mise launcher whose Git is not installed yet never runs (it would install Git
+# first), and one that runs mise use is checked as the installed Git it would run.
 git_is_suitable() {
+	local probe=git
 	command -v git >/dev/null 2>&1 || return 1
-	git --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
+	case "$platform" in
+	arch | omarchy)
+		[ -z "$(mf_lazy_pending git)" ] || return 1
+		probe="$(mf_configuring_launcher_tool git)" || {
+			[ "$?" -ne 2 ] || return 1
+			probe=git
+		}
+		;;
+	esac
+	MISE_OFFLINE=1 "$probe" --version | awk 'NR == 1 {split($3,v,"."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 29))}'
 }
 
 # The Gum setup runs. On Arch and Omarchy, a mise launcher whose Gum is not installed yet never runs (it would install
@@ -430,11 +442,15 @@ install_dependencies() {
 # transaction. Arch does not support partial upgrades, so on ordinary Arch that transaction is a full
 # sudo pacman -Syu --needed; Omarchy's own route, omarchy pkg add, installs from its current package databases.
 install_arch_dependencies() {
-	local name gh_path gum_path
+	local name gh_path gum_path git_path
 	local packages=()
 	for name in "$@"; do
 		case "$name" in
 		python3) packages+=(python) ;;
+		git)
+			# A mise-managed Git, like Gum below, is installed through mise, not replaced by a competing git package.
+			git_path="$(command -v git 2>/dev/null)" && mf_is_mise_launcher "$git_path" || packages+=(git)
+			;;
 		*) packages+=("$name") ;;
 		esac
 	done
@@ -485,7 +501,7 @@ install_arch_dependencies() {
 	hash -r
 }
 
-# gh, Gum, the agent CLIs, and Node.js may be lazy mise tools (Omarchy's, or your own mise's on Arch) whose launchers
+# Git, gh, Gum, the agent CLIs, and Node.js may be lazy mise tools (Omarchy's, or your own mise's on Arch) whose launchers
 # install them on first run. Setup asks first, installs only these through mise, each as its launcher requests it (in
 # this directory as the later probes select them, or the exact version a launcher names), and runs none of them before
 # that; other lazy tools are left alone.
@@ -526,7 +542,7 @@ lazy_requests() {
 
 # The required lazy tools from your shell's PATH, and Node.js as the No-Mistakes daemon's PATH resolves it.
 lazy_tools_pending() {
-	lazy_requests "$PATH" gh gum codex claude cursor-agent node npm
+	lazy_requests "$PATH" git gh gum codex claude cursor-agent node npm
 	lazy_requests "$daemon_path" node
 }
 
@@ -1113,7 +1129,7 @@ explain_git_transport() {
 	local doctor helper
 	printf -v doctor '%q' "$runtime/scripts/doctor.sh"
 	notice "Git transport: GitHub CLI login covers API access only; it does not by itself prove Git can fetch your target repository (the i preparer and PRs I reviewer fetch its GitHub sshUrl, which Git's insteadOf rules can route over HTTPS). Before the first i or I, run $doctor from the target checkout's Herdr pane, staying in that checkout; it checks the effective fetch URL and authentication (README: Git transport)."
-	helper="$(cd / && git config --get-urlmatch credential.helper https://github.com 2>/dev/null)" || helper=''
+	helper="$(cd / && MISE_OFFLINE=1 PATH="$shell_probes$PATH" git config --get-urlmatch credential.helper https://github.com 2>/dev/null)" || helper=''
 	[ -z "$helper" ] || return 0
 	notice "No Git credential helper is configured for https://github.com. SSH needs none. To choose HTTPS instead, run gh auth setup-git --hostname github.com yourself (it sets GitHub CLI as the github.com credential helper in your global Git config and can replace a helper previously configured for that host), then add the README's target-repository-local insteadOf rewrite."
 }
@@ -1125,7 +1141,7 @@ configure_native_tools() {
 	# approve run your commands as before (npm as shell_npm runs it).
 	if [ "$platform" = arch ] || [ "$platform" = omarchy ]; then
 		probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/mini-factory-setup.XXXXXX")"
-		link_configuring_launchers "$probe_directory/shell" "$PATH" gh codex claude cursor-agent node npm herdr
+		link_configuring_launchers "$probe_directory/shell" "$PATH" git gh codex claude cursor-agent node npm herdr
 		shell_probes="$probe_directory/shell:"
 	fi
 	if shell_tool_unavailable gh; then
