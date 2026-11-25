@@ -125,8 +125,8 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
-# A launcher script that runs mise use (as omarchy-mise-install's do) writes your global mise configuration every
-# run, even offline once its tool is installed. As in doctor, gh, Gum, npm, and the node acpx starts run behind a
+# A launcher script that runs mise use or mise x (as omarchy-mise-install's do) writes your global mise configuration
+# or prepares a project's automatic [deps] every run, even offline once its tool is installed. As in doctor, gh, Gum, npm, and the node acpx starts run behind a
 # private directory with a probe for each such launcher of these tools: the installed tool it would run, with the
 # environment mise gives it (see mf_link_configuring_launchers); it is removed on exit. Such a launcher whose tool
 # cannot be resolved (as while it is not installed) gets no probe, so it stays in probe_unsafe for the whole run, even

@@ -139,7 +139,9 @@ def acpx_executable(config):
 
 def optional_agents(config):
     """[(duty, agent, executable)] for each duty set to a native harness setup does not provision, with the executable
-    No-Mistakes runs for it (agent_path_override, else its command), read by the bundled nm-config."""
+    No-Mistakes runs for it (agent_path_override, else its command), and for each duty set to Codex, Claude Code, or
+    Cursor whose override (agent_path_override, or acp_registry_overrides for Cursor) names another executable than
+    the baseline command, read by the bundled nm-config."""
     helper = Path(__file__).resolve().parent / "nm_config.py"
     try:
         result = subprocess.run([sys.executable, "-I", "-B", str(helper), "agent-paths", str(config)],
@@ -196,7 +198,8 @@ def lazy_pending(names, path=None):
 
 def probe_path(path, names=PROBED_TOOLS):
     """(PATH, tools, unsafe) for doctor's probes of the named commands, or None when the helper fails or times out.
-    Each named launcher script that runs mise use (and so writes your global mise configuration every run) is in tools,
+    Each named launcher script that runs mise use or mise x (and so writes your global mise configuration or prepares a
+    project's automatic [deps] every run) is in tools,
     mapped to the installed tool it would run, which PATH (the given one behind a private directory, removed on exit)
     finds first for a command name, run with the environment mise gives it (such as GH_CONFIG_DIR from mise's [env]), as
     the bundled helper's probes present it; unsafe names such a launcher whose tool cannot be resolved, which no probe
@@ -481,7 +484,7 @@ def main():
                   "of them could install a lazy mise tool or write your global mise configuration; run make setup")
         else:
             # Probes, including native no-mistakes doctor, run an installed tool directly rather than through a
-            # launcher that writes mise configuration (as omarchy-mise-install does); such a launcher whose tool
+            # launcher that writes mise configuration or prepares [deps] (as omarchy-mise-install's do); one whose tool
             # cannot be resolved runs no more than one whose tool is not installed yet.
             os.environ["PATH"] = NO_MISTAKES_ENVIRONMENT["PATH"] = probes[0]
             lazy |= probes[2]
@@ -566,9 +569,10 @@ def main():
                   else "acpx" + configured + " or its Node.js does not run from the No-Mistakes daemon's PATH ("
                   + path + "); run make setup for the exact action")
     # Native no-mistakes doctor counts an agent as runnable once PATH finds it, so a lazy mise tool counts before it is
-    # installed. Each duty's agent that setup does not provision is checked, without running it, as No-Mistakes
-    # resolves it (agent_path_override, else its command) from your shell's PATH (native doctor's) and the daemon's
-    # (which runs it); agents no duty selects are not.
+    # installed. Each duty's agent that setup does not provision, and each executable override of one it does (its
+    # baseline command is checked above), is checked, without running it, as No-Mistakes resolves it
+    # (agent_path_override, else its command) from your shell's PATH (native doctor's) and the daemon's (which runs
+    # it); agents no duty selects are not.
     optional, optional_problem, optional_lazy, optional_undiscovered = [], None, set(), False
     if guarded and no_mistakes_config.exists() and duty_problem is None:
         try:
@@ -597,7 +601,8 @@ def main():
             if request and request not in requests.setdefault(name, []):
                 requests[name].append(request)
     # Native doctor also runs a Rovo Dev pipeline agent's executable (acli, to check its Rovo Dev support), so it is not
-    # run while that is a launcher that writes your global mise configuration every run (see probe_path).
+    # run while that is a launcher that writes your global mise configuration or prepares [deps] every run (see
+    # probe_path).
     rovodev = next((executable for duty, agent, executable in optional if duty == "agent" and agent == "rovodev"
                     and duty not in pending), None)
     configuring = rovodev and output([BASH, str(PLATFORM_HELPER), "configuring", rovodev])
@@ -651,17 +656,20 @@ def main():
             kind, source = roles[role]
             print("OK: " + label + ": " + AGENTS[kind][1] + " (" + sources.get(source, source) + ")")
     for duty, agent, kind in duties:
-        if kind:
-            print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "
-                  "integration needed)")
-        elif duty in pending:
+        if duty in pending:
+            # Setup installs only the baseline commands of the agents it provisions, never an override of one.
             check(False, "", "No-Mistakes " + duty + " " + agent + " setup pending: " + ", ".join(pending[duty])
                   + (" was not checked (lazy mise tool discovery failed) and may be" if optional_undiscovered
                      else " is") + " a lazy mise tool that is not installed yet (running it would install it "
-                  "first). make setup provisions only Codex, Claude Code, and Cursor: install it with mise yourself "
+                  "first). " + ("make setup does not install an executable override" if kind else
+                                "make setup provisions only Codex, Claude Code, and Cursor")
+                  + ": install it with mise yourself "
                   "(mise install " + " ".join(shlex.quote(request) for executable in pending[duty]
                                               for request in requests.get(executable) or [Path(executable).name])
                   + "), log in through its own CLI, then run make doctor")
+        elif kind:
+            print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "
+                  "integration needed)")
         else:
             # Native doctor only proves the resolved agent is runnable, not logged in.
             print("NOTE: No-Mistakes " + duty + " " + agent + " login not checked by this doctor; "
@@ -710,10 +718,10 @@ def main():
     elif configuring and configuring.strip():
         tool = configuring.strip().partition("\t")[2]
         check(False, "", "No-Mistakes pipeline agent not checked: native no-mistakes doctor runs Rovo Dev's " + rovodev
-              + ", a launcher that writes your global mise configuration every run; " + (
-                  "set agent_path_override.rovodev to the acli it runs (" + tool + "), then run make doctor" if tool
-                  else "its tool cannot be resolved, so install it with mise yourself (mise install acli), then "
-                  "run make doctor"))
+              + ", a launcher that writes your global mise configuration or prepares project dependencies every run; "
+              + ("set agent_path_override.rovodev to the acli it runs (" + tool + "), then run make doctor" if tool
+                 else "its tool cannot be resolved, so install it with mise yourself (mise install acli), then "
+                 "run make doctor"))
     else:
         ready, detail = native_pipeline_status()
         action = "run no-mistakes doctor"

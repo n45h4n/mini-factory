@@ -40,7 +40,8 @@ USAGE = """usage: nm-config [show | --help]
 #                           Mini-Factory-provisioned codex, claude, or cursor it needs, else "-"
 #   nm-config agent-paths FILE
 #                           print DUTY<TAB>AGENT<TAB>EXECUTABLE per duty set to a native harness setup does not
-#                           provision (agent_path_override, else its command), as No-Mistakes resolves it
+#                           provision (agent_path_override, else its command), or to Codex, Claude Code, or Cursor
+#                           with an executable override, as No-Mistakes resolves it
 #   nm-config acpx-path FILE
 #                           print the acpx executable No-Mistakes runs for ACP agents: acpx_path, else acpx
 #   nm-config daemon-path   print the PATH the No-Mistakes daemon resolves at startup (see daemon_path)
@@ -654,8 +655,10 @@ def agent_paths(document):
     """(duty, agent, executable) for each duty set to a native harness Mini-Factory does not provision, resolved as
     No-Mistakes resolves it: agent_path_override.<harness>, else its default command; an ACP alias runs through acpx
     the command acp_registry_overrides.<target> names, else its own (an executable No-Mistakes does not probe, such as
-    a relative or quoted one, is left to it). Each entry of a fallback list is one of the pipeline agent's (No-Mistakes
-    resolves every entry, and for Rovo Dev runs its acli); auto names no single harness and is left to No-Mistakes."""
+    a relative or quoted one, is left to it). Codex, Claude Code, and Cursor are listed only while that override names
+    an executable other than the command setup provisions (and doctor checks as a baseline tool). Each entry of a
+    fallback list is one of the pipeline agent's (No-Mistakes resolves every entry, and for Rovo Dev runs its acli);
+    auto names no single harness and is left to No-Mistakes."""
     found, aliases = [], {target: name for name, target in ACP_ALIASES.items()}
     node = document.get(("agent",))
     # No-Mistakes trims each agent name (as duties does), and so each fallback list entry.
@@ -664,7 +667,7 @@ def agent_paths(document):
     for duty, agent in dict.fromkeys([(duty, agent) for duty, agent, _ in duties(document)] + listed):
         # acp:devin is the devin alias's own spelling.
         name = aliases.get(agent, agent)
-        if name in mf.HARNESSES or name not in COMMANDS:
+        if name not in COMMANDS:
             continue
         if name in ACP_ALIASES:
             path = ("acp_registry_overrides", ACP_ALIASES[name][len("acp:"):])
@@ -676,6 +679,8 @@ def agent_paths(document):
         else:
             node = mapping(document, ("agent_path_override",)).get(name)
             executable = COMMANDS[name] if is_null(node) else str(scalar(node, ("agent_path_override", name)))
+        if name in mf.HARNESSES and executable == COMMANDS[name]:
+            continue
         found.append((duty, agent, executable))
     return found
 

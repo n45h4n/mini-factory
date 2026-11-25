@@ -256,11 +256,12 @@ mf_wrapper_provider() {
 	return 1
 }
 
-# The installed tool behind a launcher script that runs mise use (as omarchy-mise-install does), also through your
-# own link to that script, read without running it. Such a script writes your global mise configuration (mise use -g)
-# every time it runs, even once its tool is installed and offline, so read-only checks run the tool it would run
-# instead. Fails (1) for any other command (such as mise's shims, links to mise that only run their tool), and (2)
-# for such a launcher whose tool cannot be resolved, as while it is not installed yet: running it is never safe.
+# The installed tool behind a launcher script that runs mise use or mise x (as omarchy-mise-install's do), also through
+# your own link to that script, read without running it. Such a script writes your global mise configuration (mise use
+# -g) or prepares a project's automatic [deps] (mise x, installing dependencies) every time it runs, even once its tool
+# is installed and offline, so read-only checks run the tool it would run instead. Fails (1) for any other command
+# (such as mise's shims, links to mise that only run their tool), and (2) for such a launcher whose tool cannot be
+# resolved, as while it is not installed yet: running it is never safe.
 mf_configuring_launcher_tool() {
 	local path
 	path="$(command -v "$1" 2>/dev/null)" || return 1
@@ -269,21 +270,21 @@ mf_configuring_launcher_tool() {
 		path="$(mf_link_target "$path")" || return 1
 		[ "$(basename "$path")" != mise ] || return 1
 	fi
-	[ -f "$path" ] && mf_runs_mise "$path" use || return 1
+	[ -f "$path" ] && mf_runs_mise "$path" 'use|x' || return 1
 	mf_launcher_installed "$1" "$path" || return 2
 }
 
-# REQUEST<TAB>BIN of the mise x statement in the launcher that writes mise configuration (see above) a command runs,
-# once its tool is installed, so the approved npm actions can run that statement without the launcher's mise use;
-# fails for any other command. Only read, never run.
+# REQUEST<TAB>BIN of the mise x statement in the launcher that writes mise configuration or prepares [deps] (see above)
+# a command runs, once its tool is installed, so the approved npm actions can run that statement without the launcher's
+# mise use or [deps]; fails for any other command. Only read, never run.
 mf_configuring_launcher_request() {
 	local path
 	mf_configuring_launcher_tool "$1" >/dev/null && path="$(command -v "$1")" && path="$(mf_link_target "$path")" &&
 		mf_launcher_request "$path"
 }
 
-# Prints NAME<TAB>TOOL for each named command whose launcher writes mise configuration (see above), and NAME alone
-# for such a launcher whose tool cannot be resolved, which no check may run.
+# Prints NAME<TAB>TOOL for each named command whose launcher writes mise configuration or prepares [deps] (see above),
+# and NAME alone for such a launcher whose tool cannot be resolved, which no check may run.
 mf_configuring_launchers() {
 	local name tool
 	for name in "$@"; do

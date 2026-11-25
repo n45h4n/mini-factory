@@ -5257,6 +5257,52 @@ os.execv(executable, [executable, *args])
         self.assert_success(result)
         self.assertNotIn("setup pending: devin", result.stdout)
 
+    def test_omarchy_doctor_reports_a_lazy_override_of_a_provisioned_agent_as_setup_pending(self):
+        # The default codex is installed and healthy, but the selected pipeline agent runs agent_path_override.codex,
+        # a launcher pinned to a Codex that is not installed yet, which native doctor would count as runnable.
+        self.omarchy_optional_agents("agent: codex")
+        self.assertIn("OK: No-Mistakes pipeline agent ready", self.optional_agent_doctor().stdout)
+        override = self.root / "own codex/codex"
+        override.parent.mkdir()
+        text = '#!/bin/sh\nexec mise x "codex@0.99.0" -- "codex" "$@"\n'
+        override.write_text(text)
+        override.chmod(0o755)
+        source = self.bundle / "no-mistakes/config.yaml"
+        source.write_text(source.read_text() + "agent_path_override:\n  codex: " + json.dumps(str(override)) + "\n")
+        result = self.optional_agent_doctor()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OK: codex version responds", result.stdout.splitlines())
+        self.assertIn("FAIL: No-Mistakes agent codex setup pending: " + str(override) + " is a lazy mise tool that is "
+                      "not installed yet", result.stdout)
+        self.assertIn("make setup does not install an executable override: install it with mise yourself "
+                      "(mise install codex@0.99.0)", result.stdout)
+        self.assertNotIn("OK: No-Mistakes agent: codex", result.stdout)
+        self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
+        self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
+        self.assertIn("Authentication/setup: pending", result.stdout)
+        # So is a Cursor reviewer whose acp_registry_overrides command is such a launcher; setup installs neither.
+        (self.mock / "own-cursor").symlink_to(self.root / "system root/usr/bin/mise")
+        source.write_text(source.read_text().replace("agent: codex", "agent: codex\nreview_agents:\n  reviewer:\n"
+                                                     "    agent: acp:cursor", 1)
+                          + "acp_registry_overrides:\n  cursor: own-cursor acp\n")
+        result = self.optional_agent_doctor()
+        self.assertFalse(self.calls("own-cursor"))
+        self.assertIn("FAIL: No-Mistakes review_agents.reviewer acp:cursor setup pending: own-cursor is a lazy mise "
+                      "tool that is not installed yet", result.stdout)
+        self.assertNotIn("No-Mistakes pipeline agent ready", result.stdout)
+        self.log.write_text("")
+        self.setup()
+        self.assertFalse(self.mise_installs())
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertEqual(override.read_text(), text)
+        # An override naming the baseline command is that baseline tool, already checked: ready again.
+        source.write_text(source.read_text().replace(json.dumps(str(override)), "codex", 1)
+                          .replace("  cursor: own-cursor acp\n", "  cursor: cursor-agent acp\n", 1))
+        result = self.optional_agent_doctor()
+        self.assert_success(result)
+        self.assertNotIn("setup pending", result.stdout)
+        self.assertIn("OK: No-Mistakes pipeline agent ready", result.stdout)
+
     def test_omarchy_doctor_runs_no_native_doctor_that_could_run_an_unchecked_optional_agent(self):
         # An agent_path_override doctor cannot read may name a lazy mise tool, so native doctor is not run.
         self.omarchy_optional_agents("agent: opencode\nagent_path_override: {opencode: /opt/opencode}")
@@ -5277,7 +5323,8 @@ os.execv(executable, [executable, *args])
         result = self.optional_agent_doctor()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FAIL: No-Mistakes pipeline agent not checked: native no-mistakes doctor runs Rovo Dev's acli, a "
-                      "launcher that writes your global mise configuration every run; set agent_path_override.rovodev "
+                      "launcher that writes your global mise configuration or prepares project dependencies every run; "
+                      "set agent_path_override.rovodev "
                       "to the acli it runs (", result.stdout)
         self.assertNotIn(["doctor"], [c["args"] for c in self.calls("no-mistakes")])
         self.assertEqual(launcher.read_text(), text)
@@ -5902,6 +5949,38 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.lazy_triggered(), [])
         self.assertFalse(self.mise_changes())
         self.assertEqual(launcher.read_text(), text)
+
+    def test_omarchy_doctor_and_update_discovery_never_prepare_deps_through_an_installed_mise_x_launcher(self):
+        self.clone_fixture()
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        # Your gh launcher runs only mise x (no mise use), and its tool is installed, so it is not lazy. Run as it is,
+        # its mise x would first prepare the checked directory's automatic [deps] provider (installing dependencies).
+        launcher = self.home / ".local/bin/gh"
+        launcher.write_text('#!/bin/sh\nexec mise x "gh" -- "gh" "$@"\n')
+        launcher.chmod(0o755)
+        self.assert_success(self.interactive_setup("y"))
+        # Doctor and update discovery run it as their probe instead: its own mise x request, offline, with --no-deps.
+        self.log.write_text("")
+        result = self.run_script(self.installed / "scripts/doctor.sh", env={"MOCK_MISE_DEPS": "1"})
+        self.assert_success(result)
+        self.assertIn("OK: gh version responds", result.stdout.splitlines())
+        self.assertIn("OK: GitHub authenticated", result.stdout.splitlines())
+        self.assertFalse((self.mock / "mise-deps-prepared").exists())
+        probes = [c["args"] for c in self.calls("mise") if c["args"][:1] == ["x"] and c["args"] != ["x", "--help"]]
+        self.assertTrue(probes)
+        self.assertTrue(all(args[1] == "--no-deps" for args in probes), probes)
+        # Only make update's discovery runs here: without make, its later setup phase cannot start.
+        (self.mock / "make").unlink()
+        self.log.write_text("")
+        result = self.update(MOCK_MISE_DEPS="1")
+        self.assertIn("Runtime: make setup did not pass", result.stdout)
+        self.assertTrue([c for c in self.calls("gh") if c["args"][:2] == ["extension", "list"]])
+        self.assertFalse((self.mock / "mise-deps-prepared").exists())
+        self.assertTrue(all(c["args"][1] == "--no-deps" for c in self.calls("mise")
+                            if c["args"][:1] == ["x"] and c["args"] != ["x", "--help"]))
+        self.assertEqual(self.lazy_triggered(), [])
+        self.assertFalse(self.mise_changes())
+        self.assertFalse(self.mise_installs())
 
     def test_omarchy_setup_installs_the_exact_version_a_lazy_launcher_requests(self):
         system, shims = self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))

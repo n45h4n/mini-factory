@@ -180,8 +180,9 @@ packages and tools, and setup reuses them:
   lazy mise Gum of your own is installed the same way instead of a `gum` package.
 - Checks, Gum confirmations, and the logins, gh-dash installation, and Herdr
   integrations you approve run the installed tool a mise launcher would run, with
-  mise offline, so none of them installs or updates a tool or writes your mise
-  configuration. Checks and approved actions keep the environment the launcher's
+  mise offline, so none of them installs or updates a tool, writes your mise
+  configuration, or prepares a project's automatic `[deps]` (a launcher's own
+  `mise x` runs with `--no-deps`). Checks and approved actions keep the environment the launcher's
   own `mise x` gives its tool (such as `GH_CONFIG_DIR` from mise's `[env]`), as
   `ghd` runs it. Where the temporary directory cannot run scripts (such as a
   `noexec` `TMPDIR`), checks run that installed tool without this environment,
@@ -970,14 +971,16 @@ first. Setup installs only its own lazy tools, so for any other one, such as
 `no-mistakes doctor` run it, doctor names the step to run yourself (for example
 `mise install glab`). The same applies to a No-Mistakes pipeline or review
 agent you select that setup does not provision (such as `opencode` or `pi`,
-including each entry of a fallback `agent` list):
+including each entry of a fallback `agent` list), and to an executable
+override of Codex, Claude Code, or Cursor (`agent_path_override`, or
+`acp_registry_overrides.cursor`) other than the command setup installs:
 doctor reads the executable No-Mistakes would run (`agent_path_override`, else
 the agent's command; for an ACP alias such as Devin, `acp_registry_overrides`)
 from your shell's and the daemon's PATH without running it. While that executable is a lazy mise tool that is not installed yet, the
 agent is setup pending, never reported ready, and doctor names the
 `mise install` step. Native doctor also runs a Rovo Dev pipeline agent's
 `acli`, so it is not run while that `acli` is a launcher that writes your global
-mise configuration; doctor names the installed `acli` to set as
+mise configuration or prepares project dependencies; doctor names the installed `acli` to set as
 `agent_path_override.rovodev`. Agents no duty selects are not checked.
 It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
