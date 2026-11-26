@@ -523,7 +523,19 @@ contacting GitHub; the prompt shows its current SHA. When it creates the
 branch, the helper captures the issue title and body into a private file outside
 the worktree; a retained branch reuses that file as it stands (with any
 decisions the agent appended), so later issue edits never change its scope, and
-a missing file is reported without sending a prompt. The prompt asks the agent to implement and commit the change, run
+a missing file is reported without sending a prompt.
+
+Within that captured scope, the agent makes routine technical decisions itself
+(required edge cases, the same defect elsewhere, minimal regression coverage)
+and keeps to the smallest coherent change. Optional follow-ups and nonblocking
+limitations are reported as notes and do not stop the handoff. It stops and
+reports a specific blocker only when the task lacks an essential product
+decision or would need unauthorized scope expansion, an externally visible
+change beyond its scope, a destructive operation, or another approval;
+No-Mistakes gates are never bypassed. This is prompt guidance, so a dispatch
+is not guaranteed to produce a PR.
+
+The prompt asks the agent to implement and commit the change, run
 `no-mistakes init` if the repository is not initialized, check the target's
 real PR-check expectations (see the
 [CI prerequisite](#ci-prerequisite-for-each-target-repository)), and start:

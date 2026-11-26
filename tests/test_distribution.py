@@ -1817,6 +1817,9 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                 for unsupported in ("--intent-file", "--closes"):
                     self.assertNotIn(unsupported, implement)
                 self.assertIn("starts from feature/friend at " + captured, implement)
+                # Every implementer gets the same in-scope autonomy guidance; the preparer does not.
+                self.assertIn("make ordinary engineering decisions yourself", implement)
+                self.assertNotIn("make ordinary engineering decisions yourself", prepare)
                 self.assertTrue(prepare.startswith("Prepare issue friend/target#8 for dispatch; do not implement it."))
                 self.assertIn("at commit " + captured, prepare)
                 self.assertNotIn(main, prepare)
@@ -2481,6 +2484,27 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertEqual(subprocess.run([REAL_GIT, "-C", str(worktree), "status", "--porcelain"],
                                         capture_output=True, text=True, check=True).stdout, "")
         self.assertFalse([c for c in self.calls("gh") if c["args"][:2] in (["pr", "checks"], ["workflow", "run"])])
+
+    def test_implementation_decides_routine_choices_and_stops_only_on_real_blockers(self):
+        repo, git = self.source_repo()
+        self.assert_success(self.issue_helper(**self.issue_environment(repo, git, cwd=repo)))
+        prompt = self.herdr_calls("agent", "prompt")[0][3]
+        # Autonomy is bounded by the captured scope and comes before the unchanged No-Mistakes handoff.
+        start = prompt.index("Within that captured scope, make ordinary engineering decisions yourself")
+        handoff = prompt.index("deliver it through No-Mistakes unattended:")
+        self.assertLess(prompt.index("keep to the issue's intended scope"), start)
+        self.assertLess(start, handoff)
+        self.assertLess(handoff, prompt.index("Start the run with exactly:"))
+        guidance = prompt[start:handoff]
+        for requirement in ("minimal regression coverage", "smallest coherent solution", "manufacture findings",
+                            # Optional notes never stop delivery, and unfinished work is not claimed as done.
+                            "not reasons to stop", "incomplete requirement",
+                            # Genuine blockers still stop, and native gates keep their meaning.
+                            "specific blocker", "policy decision", "unauthorized scope expansion",
+                            "externally visible behavior change", "destructive operation",
+                            "bypass a native No-Mistakes gate"):
+            self.assertIn(requirement, guidance)
+        self.assertIn("only nonblocking notes remain", guidance.rsplit("\n", 1)[-1])
 
     def test_setting_change_keeps_retained_agent_without_duplicate_prompts(self):
         repo, git = self.source_repo()
