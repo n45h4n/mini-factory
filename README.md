@@ -260,7 +260,12 @@ repair/update through their own installer; setup does not silently upgrade
 unrelated software.
 
 Every package install, privileged operation, login, and configuration change
-requires explicit consent, asked with a Gum confirmation (`gum confirm`, with No
+requires explicit consent, with one exception: on Omarchy, the ordinary
+user-level installation that mise performs when setup first runs a lazy tool
+needs no separate consent (see
+[Arch Linux and Omarchy](#bootstrap-on-arch-linux-and-omarchy)). Every system
+package transaction (`pacman`, `omarchy pkg add`, or `apt-get`) still requires
+explicit consent. Consent is asked with a Gum confirmation (`gum confirm`, with No
 as the default; ctrl+c stops setup). Confirmations require stdin, stdout, and
 stderr to be terminals and disable inherited Gum timeouts. Gum 0.15+ is required
 to distinguish ctrl+c from a decline. Installing or repairing missing, broken,
@@ -1126,8 +1131,12 @@ checks (or an owner-declared `no_ci: true`) and a small, real issue.
    ends with setup's doctor report. `ghd update` from another directory does
    the same for the recorded clone.
 
-On a native Arch Linux or Omarchy x86_64 test host (a disposable account, with
-its system otherwise up to date), also check:
+On a native Arch Linux or Omarchy x86_64 test host (with its system otherwise
+up to date), also run the checks below. They observe the state before setup
+(setup's first package offer and, on Omarchy, its pending lazy tools), so they
+need a fresh, disposable account that has never run `make setup`, and they run
+separately from step 1 above. An account that has already completed step 1
+cannot show that state; use another fresh account for these checks.
 
 1. `make setup` names the platform: ordinary Arch offers one
    `sudo pacman -Syu --needed ...` with the upgrade warning, and Omarchy offers
