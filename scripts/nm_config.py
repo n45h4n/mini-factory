@@ -38,16 +38,9 @@ USAGE = """usage: nm-config [show | --help]
 # Internal, used by setup and doctor:
 #   nm-config duties FILE   print DUTY<TAB>AGENT<TAB>HARNESS per No-Mistakes duty; HARNESS is the
 #                           Mini-Factory-provisioned codex, claude, or cursor it needs, else "-"
-#   nm-config agent-paths FILE
-#                           print DUTY<TAB>AGENT<TAB>EXECUTABLE per duty set to a native harness setup does not
-#                           provision (agent_path_override, else its command), or to Codex, Claude Code, or Cursor
-#                           with an executable override, as No-Mistakes resolves it
 #   nm-config acpx-path FILE
 #                           print the acpx executable No-Mistakes runs for ACP agents: acpx_path, else acpx
 #   nm-config daemon-path   print the PATH the No-Mistakes daemon resolves at startup (see daemon_path)
-#   nm-config gh-profiles FILE | glab-profiles FILE
-#                           print each forge_profiles host with a gh_config_dir (or glab_config_dir), for
-#                           which native no-mistakes doctor runs gh (or glab) auth status
 
 # Native No-Mistakes harnesses (v1.84.0 global config reference), independent of mf-config's issue agents.
 HARNESSES = {"codex": "Codex", "claude": "Claude Code", "grok": "Grok", "opencode": "OpenCode", "pi": "Pi",
@@ -641,48 +634,14 @@ def duties(document):
     elif node.kind == "list":
         found = [("agent", "ordered fallback list " + ", ".join(map(str, node.value)))]
     else:
-        found = [("agent", str(scalar(node, ("agent",))).strip())]
+        found = [("agent", str(scalar(node, ("agent",))))]
     for role in ROLES:
         agent = mapping(document, ("review_agents", role)).get("agent")
         if not is_null(agent):
-            found.append(("review_agents." + role, str(scalar(agent, ("review_agents", role, "agent"))).strip()))
+            found.append(("review_agents." + role, str(scalar(agent, ("review_agents", role, "agent")))))
     aliases = {target: name for name, target in ACP_ALIASES.items()}
     return [(duty, agent, next((kind for kind in (agent, aliases.get(agent)) if kind in mf.HARNESSES), None))
             for duty, agent in found]
-
-
-def agent_paths(document):
-    """(duty, agent, executable) for each duty set to a native harness Mini-Factory does not provision, resolved as
-    No-Mistakes resolves it: agent_path_override.<harness>, else its default command; an ACP alias runs through acpx
-    the command acp_registry_overrides.<target> names, else its own (an executable No-Mistakes does not probe, such as
-    a relative or quoted one, is left to it). Codex, Claude Code, and Cursor are listed only while that override names
-    an executable other than the command setup provisions (and doctor checks as a baseline tool). Each entry of a
-    fallback list is one of the pipeline agent's (No-Mistakes resolves every entry, and for Rovo Dev runs its acli);
-    auto names no single harness and is left to No-Mistakes."""
-    found, aliases = [], {target: name for name, target in ACP_ALIASES.items()}
-    node = document.get(("agent",))
-    # No-Mistakes trims each agent name (as duties does), and so each fallback list entry.
-    listed = ([("agent", str(entry).strip()) for entry in node.value] if not is_null(node) and node.kind == "list"
-              else [])
-    for duty, agent in dict.fromkeys([(duty, agent) for duty, agent, _ in duties(document)] + listed):
-        # acp:devin is the devin alias's own spelling.
-        name = aliases.get(agent, agent)
-        if name not in COMMANDS:
-            continue
-        if name in ACP_ALIASES:
-            path = ("acp_registry_overrides", ACP_ALIASES[name][len("acp:"):])
-            node = mapping(document, path[:1]).get(path[1])
-            command = "" if is_null(node) else str(scalar(node, path)).strip()
-            executable = command.split()[0] if command else COMMANDS[name]
-            if re.search(r"[\"'\\]", command) or ("/" in executable and not executable.startswith("/")):
-                continue
-        else:
-            node = mapping(document, ("agent_path_override",)).get(name)
-            executable = COMMANDS[name] if is_null(node) else str(scalar(node, ("agent_path_override", name)))
-        if name in mf.HARNESSES and executable == COMMANDS[name]:
-            continue
-        found.append((duty, agent, executable))
-    return found
 
 
 def show(link, target, document):
@@ -1135,15 +1094,6 @@ def main(argv):
         for duty, agent, harness in found:
             print(duty + "\t" + " ".join(agent.split()) + "\t" + (harness or "-"))
         return 0
-    if len(argv) == 2 and argv[0] == "agent-paths":
-        target = Path(argv[1])
-        try:
-            found = agent_paths(load(read(target)[1], target))
-        except Unsafe as error:
-            raise ConfigError("cannot safely read the No-Mistakes agents in " + str(target) + ": " + str(error))
-        for fields in found:
-            print("\t".join(fields))
-        return 0
     if len(argv) == 2 and argv[0] == "acpx-path":
         target = Path(argv[1])
         try:
@@ -1156,18 +1106,6 @@ def main(argv):
         return 0
     if argv == ["daemon-path"]:
         print(daemon_path())
-        return 0
-    if len(argv) == 2 and argv[0] in ("gh-profiles", "glab-profiles"):
-        target = Path(argv[1])
-        try:
-            document = load(read(target)[1], target)
-            for host in mapping(document, ("forge_profiles",)):
-                path = ("forge_profiles", host, argv[0].split("-")[0] + "_config_dir")
-                node = mapping(document, path[:2]).get(path[2])
-                if not is_null(node) and scalar(node, path) != "":
-                    print(host)
-        except Unsafe as error:
-            raise ConfigError("cannot safely read forge_profiles in " + str(target) + ": " + str(error))
         return 0
     if argv:
         print(USAGE, end="", file=sys.stderr)

@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Platform and tool-ownership evidence shared by setup.sh and update.sh (which source this file) and
-# doctor.py (which runs: bash platform.sh detect | lazy COMMAND... | request COMMAND... | probes DIRECTORY COMMAND...).
-# Everything here only reads local evidence (probes also writes its private directory): nothing installs, updates, or
-# runs the tools it inspects.
+# Platform and tool-ownership evidence shared by setup.sh and update.sh (which source this file) and doctor.py
+# (which runs: bash platform.sh detect). Everything here only reads local evidence: nothing installs, updates, or runs
+# the tools it inspects.
 
 # Isolated tests point this at a synthetic system root; it is empty (the real /) otherwise.
 mf_root="${MINI_FACTORY_TEST_ROOT:-}"
 # OS, package, and Omarchy runtime evidence come from these system paths, not from PATH, which a user can shadow.
 mf_os_release="$mf_root/etc/os-release"
 mf_pacman="$mf_root/usr/bin/pacman"
-mf_mise="$mf_root/usr/bin/mise"
 mf_omarchy="$mf_root/usr/share/omarchy/bin/omarchy"
 
 # Prints macos, ubuntu, arch, or omarchy and succeeds; otherwise prints why the platform is unsupported and
@@ -83,7 +81,14 @@ mf_detect_platform() (
 		fi
 		case "$package$runtime" in
 		11) printf 'omarchy\n' ;;
-		00) printf 'arch\n' ;;
+		00)
+			# Omarchy before 4.0 ran from a git checkout in your home directory, before it was packaged.
+			if [ -f "$HOME/.local/share/omarchy/bin/omarchy" ]; then
+				printf 'legacy Omarchy installation: %s predates the packaged Omarchy that setup supports; update Omarchy to its current release (omarchy update), then rerun make setup\n' "$HOME/.local/share/omarchy"
+				exit 1
+			fi
+			printf 'arch\n'
+			;;
 		10)
 			printf 'incomplete Omarchy installation: the omarchy package is installed but its runtime %s is missing; repair Omarchy itself (for example reinstall its package with sudo pacman -S omarchy), then rerun make setup\n' "$mf_omarchy"
 			exit 1
@@ -111,283 +116,64 @@ mf_pacman_owner() {
 	printf '%s\n' "$owner"
 }
 
-# Omarchy's own mise (its mise-bin package) when present; elsewhere whichever mise PATH finds.
-mf_mise_command() {
-	if [ -f "$mf_mise" ] && [ -x "$mf_mise" ]; then
-		printf '%s\n' "$mf_mise"
-	else
-		command -v mise
-	fi
+# mise's data directory: its shims (how mise, and so Omarchy, provides lazy tools that install on first run), its
+# installs, and the command wrappers Omarchy uses for agent account switching.
+mf_mise_data() {
+	printf '%s\n' "${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
 }
 
-# The mise data directories whose shims and command wrappers are mise launchers.
-mf_mise_data_directories() {
-	printf '%s\n' "${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}" "$HOME/.local/share/mise"
-}
-
-# A mise command wrapper, such as Omarchy's agent-account wrappers for Claude and Codex.
-mf_is_mise_wrapper() {
-	local data
-	while IFS= read -r data; do
-		case "$1" in "$data/command-wrappers/"*) return 0 ;; esac
-	done < <(mf_mise_data_directories)
-	return 1
-}
-
-# The file a path ends at once its symbolic links are followed (portably: no readlink -f). Only read, never run.
-mf_link_target() {
-	local path="$1" target count=0
-	while [ -L "$path" ] && [ "$count" -lt 40 ]; do
-		target="$(readlink "$path")" || return 1
-		case "$target" in
-		/*) path="$target" ;;
-		*) path="$(dirname "$path")/$target" ;;
-		esac
-		count=$((count + 1))
-	done
-	printf '%s\n' "$path"
-}
-
-# Whether a script runs mise with one of the given subcommands (an extended regular expression, such as use|x) as
-# a statement, as omarchy-mise-install's launchers do (mise use -g ..., exec mise x ...); a comment or text that only
-# mentions one does not count. Only read, never run.
-mf_runs_mise() {
-	# Process substitution, not a pipe: grep -q may stop reading early, which pipefail would report as failure.
-	LC_ALL=C grep -aqE "^[[:space:]]*(exec[[:space:]]+)?mise[[:space:]]+($2)[[:space:]]" < <(head -c 4096 -- "$1" 2>/dev/null)
-}
-
-# A mise launcher installs its tool first whenever it runs (Omarchy's lazy tools): a mise shim (a link to mise),
-# a mise command wrapper, or an omarchy-mise-install script that runs mise use or mise x, also through your own link
-# to that script. Only read, never run.
-mf_is_mise_launcher() {
-	local path="$1" data
-	mf_is_mise_wrapper "$path" && return 0
-	while IFS= read -r data; do
-		case "$path" in "$data/shims/"*) return 0 ;; esac
-	done < <(mf_mise_data_directories)
-	if [ -L "$path" ]; then
-		# A link that ends at mise itself is a shim; any other is read as the file it ends at, so a link to a native
-		# executable stays your own command.
-		path="$(mf_link_target "$path")" || return 1
-		[ "$(basename "$path")" != mise ] || return 0
-	fi
-	[ -f "$path" ] && mf_runs_mise "$path" 'use|x'
-}
-
-# The tool request and executable of a launcher script's mise x statement as omarchy-mise-install writes it,
-# exec mise x "PACKAGE" -- "BIN" "$@" (PACKAGE may pin a version, such as gh@2.46.0), printed as REQUEST<TAB>BIN;
-# fails for a script without one. Only read, never run.
-mf_launcher_request() {
-	local line pattern='^[[:space:]]*(exec[[:space:]]+)?mise[[:space:]]+x[[:space:]]+"?([^"[:space:]]+)"?[[:space:]]+--[[:space:]]+"?([^"[:space:]]+)"?([[:space:]]|$)'
-	mf_runs_mise "$1" x || return 1
-	while IFS= read -r line || [ -n "$line" ]; do
-		[[ "$line" =~ $pattern ]] || continue
-		printf '%s\t%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+# The named command PATH finds past Omarchy's agent account wrappers, which lead PATH and run the command found past
+# them (Omarchy's own resolution): the installation whose owner decides its updates.
+mf_past_wrappers() {
+	local entry wrappers
+	local entries=()
+	wrappers="$(mf_mise_data)/command-wrappers/bin"
+	IFS=: read -r -a entries <<<"$PATH"
+	for entry in "${entries[@]+"${entries[@]}"}"; do
+		case "$entry" in "$wrappers" | "$HOME/.local/share/omarchy/agent-accounts/bin") continue ;; esac
+		[ -f "${entry:-.}/$1" ] && [ -x "${entry:-.}/$1" ] || continue
+		printf '%s\n' "${entry:-.}/$1"
 		return 0
-	done < <(head -c 4096 -- "$1" 2>/dev/null)
+	done
 	return 1
 }
 
-# The installed executable that the mise launcher at the second argument's path runs for the named command, resolved
-# as mf_mise_installed resolves it. A launcher script's own mise x statement decides it (its explicit gh@2.46.0 runs
-# that version, whichever one mise selects here); any other launcher runs the version mise selects for the command.
-mf_launcher_installed() {
-	local path request
-	path="$(mf_link_target "$2")" || return 1
-	if ! mf_is_mise_wrapper "$2" && [ "$(basename "$path")" != mise ] && [ -f "$path" ] &&
-		request="$(mf_launcher_request "$path")"; then
-		mf_mise_installed "${request#*$'\t'}" "${request%%$'\t'*}"
-	else
-		mf_mise_installed "${1##*/}"
-	fi
-}
-
-# The mise tool request that mise install installs for the launcher at the second argument's path, as
-# mf_launcher_installed resolves it: a launcher script's own mise x request (its explicit gh@2.88.1 is exactly that
-# version), any other launcher's command tool (npm's is node), the version mise selects here. Only read, never run.
-mf_launcher_install_request() {
-	local path request
-	path="$(mf_link_target "$2")" || return 1
-	if ! mf_is_mise_wrapper "$2" && [ "$(basename "$path")" != mise ] && [ -f "$path" ] &&
-		request="$(mf_launcher_request "$path")"; then
-		printf '%s\n' "${request%%$'\t'*}"
-	elif [ "${1##*/}" = npm ]; then
-		printf 'node\n'
-	else
-		printf '%s\n' "${1##*/}"
-	fi
-}
-
-# The installed executable behind a mise launcher, resolved offline in the current directory and environment, as
-# a launcher run from here selects its version: mise which prints only an already installed binary, so this
-# fails while the selected version is not installed (even if another directory's version is). An optional tool
-# request (the second argument, such as gh@2.46.0) selects that version instead, as mise x runs it.
-mf_mise_installed() {
-	local mise resolved
-	mise="$(mf_mise_command)" || return 1
-	resolved="$(MISE_OFFLINE=1 "$mise" which ${2:+"--tool=$2"} "$1" 2>/dev/null)" || return 1
-	case "$resolved" in
-	/*) ;;
-	*) return 1 ;;
+# The manager of an installed command, judged from its path and the file that path ends at (never by running it):
+# mise for its shims (also Omarchy's system_shims_dir, ~/.local/share/mise/shims) and installs, or pacman:PACKAGE for a
+# packaged file. Fails for any other installation.
+mf_tool_manager() {
+	local path="$1" real="$2" owner
+	case "$path" in "$(mf_mise_data)/shims/"* | "$HOME/.local/share/mise/shims/"*)
+		printf 'mise\n'
+		return 0
+		;;
 	esac
-	case "$resolved" in *$'\n'*) return 1 ;; esac
-	[ -f "$resolved" ] && [ -x "$resolved" ] && ! mf_is_mise_launcher "$resolved" || return 1
-	printf '%s\n' "$resolved"
-}
-
-# The native installation a mise command wrapper runs, read without running it. A wrapper runs the tool mise
-# selects here (installing it first if needed); when mise selects none (you disabled its tool), it runs the next
-# command of that name on PATH, such as your own native installation, a compatible override this prints. Fails
-# when mise selects the tool, or no such installation exists.
-mf_wrapper_provider() {
-	local name="$1" mise selected directory candidate
-	local directories=()
-	mise="$(mf_mise_command)" || return 1
-	selected="$(MISE_OFFLINE=1 "$mise" current "$name" 2>/dev/null)" || return 1
-	[ -z "$selected" ] || return 1
-	IFS=: read -r -a directories <<<"$PATH"
-	for directory in "${directories[@]}"; do
-		candidate="${directory:-.}/$name"
-		[ -f "$candidate" ] && [ -x "$candidate" ] || continue
-		mf_is_mise_launcher "$candidate" && continue
-		printf '%s\n' "$candidate"
+	case "$real" in "$(mf_mise_data)/installs/"* | */mise/installs/*)
+		printf 'mise\n'
 		return 0
-	done
-	return 1
+		;;
+	esac
+	owner="$(mf_pacman_owner "$real")" || owner="$(mf_pacman_owner "$path")" || return 1
+	printf 'pacman:%s\n' "$owner"
 }
 
-# The installed tool behind a launcher script that runs mise use or mise x (as omarchy-mise-install's do), also through
-# your own link to that script, read without running it. Such a script writes your global mise configuration (mise use
-# -g) or prepares a project's automatic [deps] (mise x, installing dependencies) every time it runs, even once its tool
-# is installed and offline, so read-only checks run the tool it would run instead. Fails (1) for any other command
-# (such as mise's shims, links to mise that only run their tool), and (2) for such a launcher whose tool cannot be
-# resolved, as while it is not installed yet: running it is never safe.
-mf_configuring_launcher_tool() {
-	local path
-	path="$(command -v "$1" 2>/dev/null)" || return 1
-	! mf_is_mise_wrapper "$path" || return 1
-	if [ -L "$path" ]; then
-		path="$(mf_link_target "$path")" || return 1
-		[ "$(basename "$path")" != mise ] || return 1
-	fi
-	[ -f "$path" ] && mf_runs_mise "$path" 'use|x' || return 1
-	mf_launcher_installed "$1" "$path" || return 2
-}
-
-# REQUEST<TAB>BIN of the mise x statement in the launcher that writes mise configuration or prepares [deps] (see above)
-# a command runs, once its tool is installed, so the approved npm actions can run that statement without the launcher's
-# mise use or [deps]; fails for any other command. Only read, never run.
-mf_configuring_launcher_request() {
-	local path
-	mf_configuring_launcher_tool "$1" >/dev/null && path="$(command -v "$1")" && path="$(mf_link_target "$path")" &&
-		mf_launcher_request "$path"
-}
-
-# Prints NAME<TAB>TOOL for each named command whose launcher writes mise configuration or prepares [deps] (see above),
-# and NAME alone for such a launcher whose tool cannot be resolved, which no check may run.
-mf_configuring_launchers() {
-	local name tool
-	for name in "$@"; do
-		if tool="$(mf_configuring_launcher_tool "$name")"; then
-			printf '%s\t%s\n' "$name" "$tool"
-		elif [ "$?" -eq 2 ]; then
-			printf '%s\n' "$name"
-		fi
-	done
-	return 0
-}
-
-# Prints what mf_configuring_launchers prints and places in the directory (the first argument) a probe for each such
-# command name whose tool resolves, so checks and approved actions run that tool behind the directory on PATH. A probe
-# runs the launcher's own mise x statement, offline and without its mise use, on the installed tool: the version the
-# launcher selects, with the environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]), as the
-# launcher (and so ghd) runs it, while mise installs, updates, and configures nothing. A mise x of your own records
-# trust for the project configurations it loads, so where mise env (which records none) finds one you have not
-# trusted, the probe runs in mise's safe mode, which records no trust and ignores project configuration. A launcher
-# without such a statement, or a directory where scripts cannot run (such as a noexec TMPDIR, where command lookup
-# would skip the probe), gets a link to the installed tool (see mf_probe_lacks_environment). A configured path (such as
-# an absolute acpx_path) gets no probe. Fails when a probe cannot be placed, so no caller runs that launcher instead.
-mf_link_configuring_launchers() {
-	local directory="$1" name tool request mise deps
-	shift
-	while IFS=$'\t' read -r name tool; do
-		printf '%s\n' "$name${tool:+$'\t'$tool}"
-		[ -n "$tool" ] || continue
-		case "$name" in */*) continue ;; esac
-		if request="$(mf_configuring_launcher_request "$name")" && mise="$(mf_mise_command)"; then
-			# mise x first prepares a project's automatic [deps] (installing dependencies) unless told not to; a mise
-			# without that option has no [deps] to prepare. Its help runs nothing.
-			deps=''
-			case "$(MISE_OFFLINE=1 "$mise" x --help 2>/dev/null)" in *--no-deps*) deps=' --no-deps' ;; esac
-			printf '#!/bin/sh\nMISE_OFFLINE=1 %q env </dev/null >/dev/null 2>&1 || { MISE_SAFE=1; export MISE_SAFE; }\nMISE_OFFLINE=1 exec %q x%s %q -- %q "$@"\n' \
-				"$mise" "$mise" "$deps" "${request%%$'\t'*}" "$tool" >"$directory/$name" && chmod 755 "$directory/$name" || return 1
-			[ -x "$directory/$name" ] && continue
-			rm -f -- "$directory/$name" || return 1
-		fi
-		ln -s -- "$tool" "$directory/$name" || return 1
-	done < <(mf_configuring_launchers "$@")
-	return 0
-}
-
-# Whether the directory's (the first argument's) probe for a command name (the second) is the link that stands in for
-# a launcher's mise x statement where scripts cannot run (see above): through it the installed tool runs without the
-# environment mise gives it (such as GH_CONFIG_DIR or a registry from mise's [env]). Checks still read through it, but
-# no action you approve runs through it, as it could store a login or install a package outside the account or registry
-# your mise environment selects. npm also lacks it through node's link: npm starts the node PATH finds (its
-# #!/usr/bin/env node), unless its own probe's mise x puts mise's node first. Only read, never run.
-mf_probe_lacks_environment() {
-	if [ -L "$1/$2" ] && mf_configuring_launcher_request "$2" >/dev/null; then
-		return 0
-	fi
-	[ "$2" = npm ] && [ -L "$1/node" ] && mf_configuring_launcher_request node >/dev/null
-}
-
-# Prints each named command that PATH resolves to a mise launcher whose tool is not installed yet, so running
-# it, even for --version or --help, would install it first.
-mf_lazy_pending() {
-	local name path
-	for name in "$@"; do
-		path="$(command -v "$name" 2>/dev/null)" || continue
-		mf_is_mise_launcher "$path" || continue
-		mf_launcher_installed "$name" "$path" >/dev/null && continue
-		mf_is_mise_wrapper "$path" && mf_wrapper_provider "$name" >/dev/null && continue
-		printf '%s\n' "$name"
-	done
-	return 0
+# How make update reports a command its manager owns (on the named platform); fails for any other installation. Their
+# native updaters would install a copy the manager does not track, and make update never upgrades system packages.
+mf_update_hint() {
+	local path="$1" real="$2" platform="$3" manager
+	manager="$(mf_tool_manager "$path" "$real")" || return 1
+	case "$platform:$manager" in
+	omarchy:mise) printf '%s is managed by mise for Omarchy: omarchy update updates it' "$path" ;;
+	*:mise) printf '%s is managed by mise: update it with mise (for example mise upgrade)' "$path" ;;
+	omarchy:pacman:*) printf '%s belongs to pacman package %s, which omarchy update updates' "$real" "${manager#pacman:}" ;;
+	*) printf '%s belongs to pacman package %s: update it with a full system upgrade (sudo pacman -Syu), or for an AUR package the way you installed it' "$real" "${manager#pacman:}" ;;
+	esac
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-	case "${1-}" in
-	detect)
-		[ "$#" -eq 1 ] || exit 2
-		mf_detect_platform
-		;;
-	lazy)
-		shift
-		mf_lazy_pending "$@"
-		;;
-	configuring)
-		shift
-		mf_configuring_launchers "$@"
-		;;
-	request)
-		# NAME<TAB>REQUEST: what mise install installs for each named mise launcher PATH (or a path) resolves.
-		shift
-		for name in "$@"; do
-			path="$(command -v "$name" 2>/dev/null)" && mf_is_mise_launcher "$path" &&
-				request="$(mf_launcher_install_request "$name" "$path")" && printf '%s\t%s\n' "$name" "$request"
-		done
-		exit 0
-		;;
-	probes)
-		[ "$#" -ge 2 ] && [ -d "$2" ] || exit 2
-		shift
-		mf_link_configuring_launchers "$@"
-		;;
-	*)
-		printf 'usage: platform.sh detect | lazy COMMAND... | configuring COMMAND... | request COMMAND... |'\
-' probes DIRECTORY COMMAND...\n' >&2
+	if [ "$*" != detect ]; then
+		printf 'usage: platform.sh detect\n' >&2
 		exit 2
-		;;
-	esac
+	fi
+	mf_detect_platform
 fi
