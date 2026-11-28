@@ -2,6 +2,8 @@
 set -euo pipefail
 
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/platform.sh
+. "$bundle/scripts/platform.sh"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
 launcher="$bin_directory/ghd"
@@ -94,32 +96,9 @@ trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 
 detect_platform() {
-	local kernel architecture
-	kernel="$(uname -s)"
-	architecture="$(uname -m)"
-	case "$architecture" in
-	x86_64 | amd64 | arm64 | aarch64) ;;
-	*) die "unsupported architecture: $architecture (supported: x86_64 and arm64)" ;;
-	esac
-	case "$kernel" in
-	Darwin) platform=macos ;;
-	Linux)
-		[ -r /etc/os-release ] || die 'cannot identify Linux distribution; native Ubuntu Server 22.04+ is supported'
-		# This file is host-owned OS metadata, not a user-provided configuration.
-		# shellcheck disable=SC1091
-		. /etc/os-release
-		[ "${ID:-}" = ubuntu ] || die 'unsupported Linux distribution; native Ubuntu Server 22.04+ is supported'
-		case "${VERSION_ID:-}" in
-		[2-9][0-9].*) [ "${VERSION_ID%%.*}" -ge 22 ] || die 'Ubuntu 22.04 or later is required' ;;
-		*) die 'Ubuntu 22.04 or later is required' ;;
-		esac
-		if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
-			die 'WSL is outside this distribution; use native Ubuntu Server or macOS'
-		fi
-		platform=ubuntu
-		;;
-	*) die "unsupported operating system: $kernel (supported: macOS and native Ubuntu Server)" ;;
-	esac
+	platform="$(mf_detect_platform)" || die "$platform"
+	[ "$platform" != omarchy ] ||
+		notice "Omarchy detected: setup reuses Omarchy's packages, mise tools, and Herdr, and changes no Omarchy defaults, shell, or desktop settings. mise installs any of Omarchy's lazy tools (such as gh, the agent CLIs, and Node.js) the first time setup runs it."
 }
 
 check_destinations() {
@@ -276,7 +255,7 @@ read_duty_agents() {
 	fi
 	while IFS=$'\t' read -r duty agent kind; do
 		if [ "$kind" = - ]; then
-			notice "No-Mistakes $duty: $agent (not provisioned by setup; log in through its native CLI, doctor relies on native no-mistakes doctor for it)."
+			notice "No-Mistakes $duty: $agent (not provisioned by setup; log in through its native CLI. Native no-mistakes doctor's readiness does not guarantee that it is installed or logged in; a lazy mise agent installs itself on first use)."
 		elif [ -n "$kind" ]; then
 			contains "$kind" "${duty_agents[@]+"${duty_agents[@]}"}" || duty_agents+=("$kind")
 		fi
@@ -320,7 +299,7 @@ gh_is_suitable() {
 }
 
 install_dependencies() {
-	local command_name package proposal
+	local command_name package proposal hint
 	local packages=()
 	local installs=() upgrades=() reinstalls=()
 	for command_name in bash awk sed grep tr mkdir rmdir rm date chmod sleep nohup stat env mktemp cp mv cat dirname uname id; do
@@ -366,7 +345,7 @@ install_dependencies() {
 				die "dependencies pending: ${packages[*]}"
 			fi
 		fi
-	else
+	elif [ "$platform" = ubuntu ]; then
 		[ -r /etc/ssl/certs/ca-certificates.crt ] || packages[${#packages[@]}]=ca-certificates
 		if [ "${#packages[@]}" -gt 0 ]; then
 			command -v sudo >/dev/null 2>&1 || die 'sudo is required to install missing Ubuntu packages; ask the host administrator'
@@ -387,6 +366,8 @@ install_dependencies() {
 				die 'GitHub CLI installation pending'
 			fi
 		fi
+	else
+		install_arch_dependencies "${packages[@]+"${packages[@]}"}"
 	fi
 	python_is_suitable || die 'python3 still resolves to a version below 3.9; fix PATH to use the installed Python and rerun'
 	git_is_suitable || die 'git must be version 2.29 or later; fix PATH to the suitable installation and rerun'
@@ -398,6 +379,9 @@ install_dependencies() {
 	install_tools codex claude cursor-agent herdr no-mistakes
 	# Any installed release with the stable interface is reused, including a newer prerelease; only an older one is updated.
 	if ! no_mistakes_is_suitable; then
+		if hint="$(managed_update_hint no-mistakes)"; then
+			die "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--base-branch/--yes interface used by issue I, and its native updater would compete with its manager: $hint; then rerun make setup"
+		fi
 		if consent "The installed No-Mistakes lacks the stable no-mistakes axi run --intent/--base-branch/--yes interface used by issue I. Run its native updater, no-mistakes update, to install the latest stable release? It restarts the daemon and refuses while pipeline runs are active."; then
 			no-mistakes update || die 'no-mistakes update did not complete; resolve its reported blocker (for example wait for active runs to finish) and rerun make setup'
 		else
@@ -407,10 +391,127 @@ install_dependencies() {
 	fi
 }
 
+# Arch and Omarchy: official packages only (python provides python3, github-cli provides gh), batched into one
+# transaction (see pacman_transaction).
+install_arch_dependencies() {
+	local name path floor
+	local packages=()
+	for name in "$@"; do
+		case "$name" in
+		python3)
+			# As for Git below: an installed python3 that cannot run is its owner's to repair, which --needed cannot do.
+			if path="$(command -v python3 2>/dev/null)"; then
+				die "$path cannot run or is older than Python 3.9; $(repair_hint python3 python), then rerun make setup"
+			fi
+			packages+=(python)
+			;;
+		git) ;;
+		*) packages+=("$name") ;;
+		esac
+	done
+	# The native installers unpack with gzip, part of Arch's base like their other tools.
+	command -v gzip >/dev/null 2>&1 || packages+=(gzip)
+	[ -r /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
+	# A missing Git, GitHub CLI, or Gum gets its official package. An installed one that cannot run or is too old, such
+	# as one mise manages or a pacman package (pacman -S --needed skips installed packages), is its owner's to repair;
+	# no competing package is added.
+	for name in git gh gum; do
+		"${name}_is_suitable" && continue
+		if path="$(command -v "$name" 2>/dev/null)"; then
+			case "$name" in
+			git) floor='Git 2.29' ;;
+			gh) floor='GitHub CLI 2.47' ;;
+			*) floor='Gum 0.15' ;;
+			esac
+			die "$path cannot run or is older than $floor; $(repair_hint "$name"), then rerun make setup"
+		fi
+		case "$name" in
+		gh) packages+=(github-cli) ;;
+		*) packages+=("$name") ;;
+		esac
+	done
+	# Omarchy ships Herdr as its herdr package; ordinary Arch keeps Herdr's native installer.
+	[ "$platform" != omarchy ] || command -v herdr >/dev/null 2>&1 || packages+=(herdr)
+	# A missing Node.js (or the npm a pacman Node.js lacks) joins a transaction that is needed anyway; install_node
+	# offers it on its own otherwise.
+	if [ "${#packages[@]}" -gt 0 ]; then
+		if ! command -v node >/dev/null 2>&1; then
+			packages+=(nodejs npm)
+		elif arch_npm_missing; then
+			packages+=(npm)
+		fi
+	fi
+	[ "${#packages[@]}" -gt 0 ] || return 0
+	pacman_transaction "${packages[@]}" || die "dependencies pending: ${packages[*]}"
+}
+
+# Whether pacman owns the file a command path ends at.
+pacman_owned() {
+	local manager
+	manager="$(mf_tool_manager "$1" "$(readlink -f -- "$1" 2>/dev/null || printf '%s' "$1")")" &&
+		[ "${manager#pacman:}" != "$manager" ]
+}
+
+# Installs official packages in one transaction you approve: on Omarchy through its own package route, omarchy pkg add;
+# on Arch, which does not support partial upgrades, as a full sudo pacman -Syu --needed. Fails when declined or when
+# the transaction fails (with guidance).
+pacman_transaction() {
+	command -v sudo >/dev/null 2>&1 ||
+		die "sudo is required to install missing Arch packages ($*); as root, install sudo and allow your user to use it, then rerun make setup"
+	if [ "$platform" = omarchy ]; then
+		consent "Install missing packages with Omarchy's package route, omarchy pkg add $*? It runs sudo pacman -S --noconfirm --needed from Omarchy's current package databases, so pacman asks for no further confirmation; no system upgrade, Omarchy update, or other change." ||
+			return 1
+		if ! "$mf_omarchy" pkg add "$@"; then
+			notice "omarchy pkg add $* did not complete; resolve the problem it reported (if a package could not be retrieved, update the system with omarchy update first), then rerun make setup"
+			return 1
+		fi
+	else
+		consent "Run sudo pacman -Syu --needed $*? WARNING: this also upgrades every installed package (a full system upgrade), because Arch does not support partial upgrades; review pacman's transaction before confirming it." ||
+			return 1
+		if ! sudo pacman -Syu --needed "$@"; then
+			notice "sudo pacman -Syu --needed $* did not complete; resolve the problem pacman reported (for example its keyring, a mirror, or a file conflict; never force it with --overwrite or refresh with -Sy alone), then rerun make setup"
+			return 1
+		fi
+	fi
+	hash -r
+}
+
+# How to repair an installed command that cannot run, by its owner (an optional second argument names its mise tool
+# when that differs from the command); setup never replaces a managed installation.
+repair_hint() {
+	local path manager
+	path="$(mf_past_wrappers "$1")" || path="$1"
+	manager="$(mf_tool_manager "$path" "$(readlink -f -- "$path" 2>/dev/null || printf '%s' "$path")")" || manager=''
+	case "$platform:$manager" in
+	omarchy:mise) printf 'Omarchy manages it with mise: repair it with mise install %s or omarchy update' "${2:-$1}" ;;
+	*:mise) printf 'mise manages it: repair it with mise install %s' "${2:-$1}" ;;
+	omarchy:pacman:*) printf 'it belongs to pacman package %s: update Omarchy (omarchy update), then reinstall it with sudo pacman -S %s' "${manager#pacman:}" "${manager#pacman:}" ;;
+	*:pacman:*) printf 'it belongs to pacman package %s: reinstall it within a full upgrade, sudo pacman -Syu %s' "${manager#pacman:}" "${manager#pacman:}" ;;
+	*) printf 'repair it using its native installer' ;;
+	esac
+}
+
+# How make update reports a command its manager (mise or pacman) owns; fails for any other installation. Setup never
+# runs a native updater over a managed installation.
+managed_update_hint() {
+	local path
+	path="$(mf_past_wrappers "$1")" || return 1
+	mf_update_hint "$path" "$(readlink -f -- "$path" 2>/dev/null || printf '%s' "$path")" "$platform"
+}
+
 install_tools() {
 	local command_name installer directory
 	for command_name in "$@"; do
 		if ! command -v "$command_name" >/dev/null 2>&1; then
+			# Omarchy provides Herdr (its herdr package, offered above) and the agent CLIs.
+			if [ "$platform" = omarchy ]; then
+				case "$command_name" in
+				herdr) die 'herdr is missing; Omarchy ships it as its herdr package: run omarchy pkg add herdr, then rerun make setup' ;;
+				codex | claude | cursor-agent)
+					die "$command_name is missing, but Omarchy provides it and setup never installs a competing copy. Restore Omarchy's default tools (Restore Preinstalls in the Omarchy menu, or mise reshim), or install your own copy; then rerun make setup"
+					;;
+				esac
+			fi
 			case "$command_name" in
 			codex) installer='https://chatgpt.com/codex/install.sh'; directory="${CODEX_HOME:-$HOME/.codex}" ;;
 			herdr) installer='https://herdr.dev/install.sh'; directory="$bin_directory" ;;
@@ -424,7 +525,7 @@ install_tools() {
 				die "$command_name installation pending"
 			fi
 		fi
-		"$command_name" --version >/dev/null 2>&1 || die "$command_name is installed but cannot run; repair it using its native installer"
+		"$command_name" --version >/dev/null 2>&1 || die "$command_name is installed but cannot run; $(repair_hint "$command_name")"
 	done
 }
 
@@ -534,6 +635,7 @@ install_bundle() {
 	local input source relative quoted
 	local inputs=(Makefile README.md .gitignore bin/ghd bin/mf-config bin/nm-config gh-dash/config.yml no-mistakes/config.yaml
 		scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/doctor.py scripts/mf_config.py scripts/nm_config.py
+		scripts/platform.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue-dispatch.sh
 		scripts/integrations/gh-dash/gh-dash-codex-issue.sh
 		scripts/integrations/gh-dash/gh-dash-codex-pr-review.sh
@@ -558,7 +660,7 @@ install_bundle() {
 			;;
 		esac
 	done
-	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/integrations/gh-dash/"*.sh
+	chmod 755 "$stage/bin/ghd" "$stage/bin/mf-config" "$stage/bin/nm-config" "$stage/scripts/setup.sh" "$stage/scripts/update.sh" "$stage/scripts/doctor.sh" "$stage/scripts/platform.sh" "$stage/scripts/integrations/gh-dash/"*.sh
 	printf '%s\n' "$install_marker" >"$stage/.mini-factory-install"
 	# ghd update reads this clone path as data; it is published (or rolled back) with the runtime.
 	printf '%s\n' "$bundle" >"$stage/.mini-factory-clone"
@@ -676,21 +778,45 @@ node_in_apt_sources() {
 	} END { exit !found }'
 }
 
-# Only a missing Node.js is installed; an existing one (system, Homebrew, fnm, nvm, ...) is never replaced.
+# Arch packages npm apart from nodejs: a pacman Node.js without npm gets Arch's npm package. Any other Node.js (nvm, fnm,
+# mise, ...) gets guidance only, as Arch's npm would add a competing system Node.js.
+arch_npm_missing() {
+	local path
+	case "$platform" in arch | omarchy) ;; *) return 1 ;; esac
+	! command -v npm >/dev/null 2>&1 || return 1
+	path="$(command -v node 2>/dev/null)" || return 1
+	pacman_owned "$path"
+}
+
+# Only a missing Node.js (or a pacman Node.js's missing npm) is installed; an existing one (system, Homebrew, fnm, nvm,
+# mise, ...) is never replaced.
 install_node() {
-	if [ "$platform" = macos ]; then
+	case "$platform" in
+	macos)
 		command -v brew >/dev/null 2>&1 || return 1
 		consent 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+. Install it with brew install node? No general brew update/upgrade or shell edits.' ||
 			return 1
 		HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install node || return 1
-	else
+		;;
+	ubuntu)
 		command -v sudo >/dev/null 2>&1 && node_in_apt_sources || return 1
 		consent 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+, which your configured apt sources offer. Run sudo apt-get install --no-install-recommends nodejs, then the same for npm only if nodejs does not provide it? This changes system packages.' ||
 			return 1
 		sudo apt-get install -y --no-install-recommends nodejs || return 1
 		hash -r
 		command -v npm >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends npm || return 1
-	fi
+		;;
+	*)
+		if command -v node >/dev/null 2>&1; then
+			arch_npm_missing || return 1
+			notice 'npm is missing beside your pacman Node.js; acpx, the ACP runner No-Mistakes uses for Cursor, is installed with npm.'
+			pacman_transaction npm || return 1
+		else
+			notice 'Node.js with npm is missing; acpx, the ACP runner No-Mistakes uses for Cursor, needs Node.js 22.13+.'
+			pacman_transaction nodejs npm || return 1
+		fi
+		;;
+	esac
 	hash -r
 }
 
@@ -707,14 +833,16 @@ ensure_node_and_acpx() {
 	local npm_arguments=(install -g acpx@latest)
 	daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path 2>/dev/null)" || daemon_path="$service_path"
 	[ -n "$daemon_path" ] || daemon_path="$service_path"
-	command -v node >/dev/null 2>&1 || install_node || true
+	if ! command -v node >/dev/null 2>&1 || arch_npm_missing; then
+		install_node || true
+	fi
 	if ! node_is_suitable || ! command -v npm >/dev/null 2>&1; then
 		found='Node.js is missing'
 		if command -v node >/dev/null 2>&1; then
 			found="$(command -v node) is Node.js $(node --version 2>/dev/null || printf 'of unknown version')"
 			command -v npm >/dev/null 2>&1 || found="$found without npm"
 		fi
-		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
+		notice "Remaining action: $found; acpx needs Node.js 22.13+ with npm. Setup never replaces an existing Node.js or version manager: upgrade or install it yourself (for example brew install node, a configured apt source such as NodeSource, sudo pacman -Syu --needed nodejs npm on Arch, or https://nodejs.org) so node and npm are first on PATH, including your login shell's PATH that the No-Mistakes daemon adopts (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or /usr/bin); then rerun make setup, restart the No-Mistakes daemon (a running daemon keeps the PATH it started with), and rerun make doctor."
 		pending=1
 		return 0
 	fi
