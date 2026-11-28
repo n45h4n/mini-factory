@@ -2920,7 +2920,9 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         source.write_text(original.replace("agent: codex", "agent: auto", 1))
         result = self.run_script(doctor)
         self.assert_success(result)
-        self.assertIn("NOTE: No-Mistakes agent auto login not checked", result.stdout)
+        self.assertIn("NOTE: No-Mistakes agent auto login not checked by this doctor; native no-mistakes doctor's "
+                      "readiness does not guarantee that the agent No-Mistakes runs for it is installed yet",
+                      result.stdout)
         self.assertIn("Authentication/setup: complete", result.stdout)
         result = self.run_script(doctor, env={"MOCK_NM_DOCTOR": "fail"})
         self.assertNotEqual(result.returncode, 0)
@@ -4556,6 +4558,8 @@ os.execv(executable, [executable, *args])
         for label, name in (("GitHub CLI", "gh"), ("Codex", "codex"), ("Cursor CLI", "cursor-agent")):
             self.assertIn(label + ": manual update only: " + str(shims / name) + " is managed by mise for Omarchy: "
                           "omarchy update updates it", result.stdout)
+        # Discovery runs gh offline, so the gh-dash extension is left to the setup run, which installs gh first.
+        self.assertIn("gh-dash extension: manual update only: GitHub CLI did not list its extensions", result.stdout)
         self.assertEqual(sorted(set(self.lazy_installed())), ["codex", "cursor-agent", "gh", "node"])
         for tool in ("gh", "codex", "cursor-agent"):
             self.assertFalse(self.native_updates(tool), tool)
@@ -4645,7 +4649,8 @@ os.execv(executable, [executable, *args])
         self.assert_success(self.interactive_setup("y"))
         self.assertTrue((self.home / ".local/bin/claude").is_symlink())
         self.log.write_text("")
-        result = self.interactive_update(["y"] * 8)
+        # Omarchy's gh updates itself when it runs online with an update check due.
+        result = self.interactive_update(["y"] * 8, MOCK_MISE_AUTO_UPDATE="gh")
         self.assert_success(result)
         for label, name in (("GitHub CLI", "gh"), ("Codex", "codex"), ("Cursor CLI", "cursor-agent"),
                             ("Node.js and npm", "node")):
@@ -4658,6 +4663,13 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.native_updates("claude"), [["update"]])
         self.assertEqual(self.native_updates("no-mistakes"), [["update"]])
         self.assertIn(["extension", "upgrade", "dash"], [c["args"] for c in self.calls("gh")])
+        # Discovery runs gh with mise offline; only the upgrade you approve, and the setup run after it, run it online.
+        calls = self.calls("gh")
+        approved = [c["args"] for c in calls].index(["extension", "upgrade", "dash"])
+        self.assertTrue(calls[:approved])
+        self.assertEqual({c["env"].get("MISE_OFFLINE") for c in calls[:approved]}, {"1"})
+        self.assertIsNone(calls[approved]["env"].get("MISE_OFFLINE"))
+        self.assertEqual((self.mock / "auto-updated-gh").read_text().splitlines()[0], "extension upgrade dash")
         for tool in ("gh", "codex", "cursor-agent", "herdr"):
             self.assertFalse(self.native_updates(tool), tool)
         # No system, Omarchy, or mise upgrade stage runs.
@@ -4821,6 +4833,21 @@ os.execv(executable, [executable, *args])
         self.assertFalse(self.calls("omarchy") + self.calls("sudo"))
         self.assertEqual((self.mock / "gh").read_text(), (self.mock / "mock-cli").read_text())
         self.assert_no_apt()
+
+    def test_mocked_omarchy_gives_reinstall_guidance_for_a_broken_or_old_package_instead_of_omarchy_pkg_add(self):
+        self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))
+        # omarchy pkg add (sudo pacman -S --needed) skips an installed package, so it cannot repair Omarchy's Gum.
+        for label, env in (("broken", {"MOCK_GUM": "broken"}), ("old", {"MOCK_GUM_VERSION": "0.14.0"})):
+            with self.subTest(label):
+                self.log.write_text("")
+                result = self.interactive_setup("y", **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(str(self.mock / "gum") + " cannot run or is older than Gum 0.15; it belongs to pacman "
+                              "package gum: update Omarchy (omarchy update), then reinstall it with sudo pacman -S "
+                              "gum, then rerun make setup", " ".join(result.stdout.split()))
+                self.assertFalse(self.calls("omarchy") + self.calls("sudo"))
+                self.assertFalse(self.installed.exists())
+                self.assert_no_apt()
 
     def test_omarchy_doctor_never_runs_your_own_npm_behind_an_uninstalled_lazy_node(self):
         self.omarchy_system(installed=("gh", "codex", "claude", "cursor-agent", "node"))

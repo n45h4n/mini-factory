@@ -176,7 +176,9 @@ packages and tools, and setup reuses them:
   a tool's mise shim installs it. Setup runs the tools it needs as it would on
   any platform, so mise installs each one then, as an ordinary user-level
   installation that needs no separate consent; setup never runs (and so never
-  installs) any other optional lazy tool. Setup also runs Node.js and `acpx`
+  installs) any other optional lazy tool. An optional agent you select for
+  No-Mistakes (for example OpenCode) installs itself the same way the first
+  time No-Mistakes runs it. Setup also runs Node.js and `acpx`
   from the No-Mistakes daemon's PATH, so they are installed there before the
   first pipeline run. mise and Omarchy's agent account wrappers keep handling
   their own versions, environment, trust, and updates.
@@ -185,16 +187,22 @@ packages and tools, and setup reuses them:
   mise's copy is disabled) is reused. Setup never installs a competing copy,
   overwrites a managed shim, or reorders PATH. A missing agent CLI or a broken
   Omarchy-managed tool gets guidance (for example restoring Omarchy's
-  preinstalls, `mise install codex`, or `omarchy update`), not a replacement. A
-  missing `gh` gets the official `github-cli` package through
-  `omarchy pkg add`, with your consent.
+  preinstalls, `mise install codex`, or `omarchy update`), not a replacement.
+  A broken or too-old Omarchy package (such as Gum) gets reinstall guidance
+  (`omarchy update`, then `sudo pacman -S <package>`), because
+  `omarchy pkg add` skips installed packages. A missing `gh` gets the official
+  `github-cli` package through `omarchy pkg add`, with your consent.
 - No-Mistakes and `acpx`, which only Mini-Factory needs, keep their user-level
   installs in `~/.local/bin` (acpx through Omarchy's mise npm).
-- Your shell files, desktop configuration, mise configuration, Omarchy's
-  default agent, credentials, and sessions are left alone.
+- Mini-Factory leaves your shell files, desktop configuration, mise
+  configuration, Omarchy's default agent, credentials, and sessions alone
+  (except for the older wrappers below).
 - Older Omarchy releases wrote `~/.local/bin` wrappers that run `mise use -g`
-  whenever they start; Mini-Factory runs them like any other command. Run
-  `omarchy update`, whose migration replaces them with mise's lazy shims.
+  whenever they start, which changes your global mise configuration.
+  Mini-Factory does not detect them and runs them like any other command, so
+  setup, doctor, or `make update` can start that change. If you still have
+  them, run `omarchy update` before setup; its migration replaces them with
+  mise's lazy shims.
 
 ## Installation and authentication
 
@@ -315,8 +323,10 @@ cursor-agent login        # when Cursor is used; set NO_OPEN_BROWSER=1 when head
 ```
 
 For `agent: auto` or a fallback list, No-Mistakes picks the agent itself;
-doctor notes that and relies on native `no-mistakes doctor`, so log in to those
-agents yourself.
+doctor notes that and relies on native `no-mistakes doctor`. Native readiness
+does not guarantee that those agents are installed yet (a lazy mise agent
+installs itself, user-level, on first use) or logged in, so log in to them
+yourself.
 
 Enable device-code login in your ChatGPT security settings or workspace
 permissions first, then open its URL and enter its one-time code in your own
@@ -895,12 +905,17 @@ checks.
   Omarchy's lazy `gh`, agent CLIs, and Node.js, also gets guidance only
   (`omarchy update`, or `mise upgrade`): its own updater would install a copy
   mise does not track. Behind Omarchy's agent account wrappers, the installation
-  the wrapper runs decides. `make update` has no system or Omarchy upgrade
-  stage; its setup run offers only genuinely missing dependencies, under setup's
-  consent rules. Independent user-level installations (for example your own
-  native Claude Code), setup's `acpx`, No-Mistakes, and the gh-dash extension
-  keep their consented updates; the `acpx` upgrade runs the npm whose global
-  prefix it checked.
+  the wrapper runs decides. Discovery probes (versions, help, the extension
+  list, npm's prefix, and Gum) run with `MISE_OFFLINE=1`, so they never install
+  or update a lazy mise tool before you approve anything. A tool that cannot
+  run offline (such as a lazy `gh` that is not installed yet) is left to the
+  setup run; rerun `make update` afterwards to update it. Approved updates and
+  the setup run stay online. `make update` has no system or Omarchy upgrade
+  stage; its setup run offers only genuinely missing dependencies, under
+  setup's consent rules. Independent user-level installations (for example your
+  own native Claude Code), setup's `acpx`, No-Mistakes, and the gh-dash
+  extension keep their consented updates; the `acpx` upgrade runs the npm whose
+  global prefix it checked.
 
 - **Stable only.** No-Mistakes is updated with plain `no-mistakes update`, never
   `--beta`, `--force`, or `--yes`. Its updater reports a newer prerelease you
@@ -985,8 +1000,10 @@ No-Mistakes configuration link, and the pipeline agent's readiness via native
 `no-mistakes doctor` (run without update checks or telemetry). Unused agents may
 stay logged out. Doctor checks No-Mistakes login only for duties set to
 `claude`, `codex`, `cursor`, or `acp:cursor`; for other native selections such
-as `auto` or agent lists it prints a note and relies on native doctor, which
-proves only that the agent runs, so log in to that agent through its own CLI.
+as `auto` or agent lists it prints a note and relies on native doctor, whose
+readiness does not guarantee that the agent is installed yet (a lazy mise agent
+installs itself, user-level, on first use) or logged in, so log in to that agent
+through its own CLI. The baseline agent checks above still apply.
 Outside Herdr it skips runtime-context and Git transport checks and explains how to enter a pane.
 Inside Herdr it checks the inherited route, active compatible server, the
 gh-dash roles' detection manifests, target repository, and Git transport. To

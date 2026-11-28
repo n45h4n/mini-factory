@@ -255,7 +255,7 @@ read_duty_agents() {
 	fi
 	while IFS=$'\t' read -r duty agent kind; do
 		if [ "$kind" = - ]; then
-			notice "No-Mistakes $duty: $agent (not provisioned by setup; log in through its native CLI, doctor relies on native no-mistakes doctor for it)."
+			notice "No-Mistakes $duty: $agent (not provisioned by setup; log in through its native CLI. Native no-mistakes doctor's readiness does not guarantee that it is installed or logged in; a lazy mise agent installs itself on first use)."
 		elif [ -n "$kind" ]; then
 			contains "$kind" "${duty_agents[@]+"${duty_agents[@]}"}" || duty_agents+=("$kind")
 		fi
@@ -406,11 +406,12 @@ install_arch_dependencies() {
 	# The native installers unpack with gzip, part of Arch's base like their other tools.
 	command -v gzip >/dev/null 2>&1 || packages+=(gzip)
 	[ -r /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
-	# A missing or pacman-owned Git, GitHub CLI, or Gum gets its official package (a full upgrade also upgrades an old
-	# one). Any other installation, such as one mise manages, is its owner's to repair; no competing package is added.
+	# A missing Git, GitHub CLI, or Gum gets its official package, as does a pacman-owned one on Arch (its full upgrade
+	# also upgrades an old one). Any other installation, such as one mise manages or an Omarchy package (omarchy pkg add
+	# skips installed packages), is its owner's to repair; no competing package is added.
 	for name in git gh gum; do
 		"${name}_is_suitable" && continue
-		if path="$(command -v "$name" 2>/dev/null)" && ! pacman_owned "$path"; then
+		if path="$(command -v "$name" 2>/dev/null)" && { [ "$platform" = omarchy ] || ! pacman_owned "$path"; }; then
 			case "$name" in
 			git) floor='Git 2.29' ;;
 			gh) floor='GitHub CLI 2.47' ;;

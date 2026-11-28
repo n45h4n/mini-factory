@@ -520,9 +520,11 @@ def main():
             print("OK: No-Mistakes " + duty + ": " + agent + " (" + AGENTS[kind][1] + " login checked; no Herdr "
                   "integration needed)")
         else:
-            # Native doctor only proves the resolved agent is runnable, not logged in.
-            print("NOTE: No-Mistakes " + duty + " " + agent + " login not checked by this doctor; "
-                  "readiness relies on native no-mistakes doctor")
+            # Native doctor resolves the agent from the daemon's PATH; that does not prove it is installed or logged in.
+            print("NOTE: No-Mistakes " + duty + " " + agent + " login not checked by this doctor; native no-mistakes "
+                  "doctor's readiness does not guarantee that the agent No-Mistakes runs for it is installed yet (a "
+                  "lazy mise agent installs itself, user-level, on first use) or logged in, so log in through that "
+                  "agent's own CLI")
     # An unreadable file may select a logged-out agent, so its login cannot be reported complete.
     check(duty_problem is None, "No-Mistakes agents read",
           "No-Mistakes agent login pending: cannot read their agents (" + str(duty_problem) + "); write "

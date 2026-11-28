@@ -123,14 +123,17 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
+# Discovery probes (versions, help, extension lists, npm's prefix, Gum) run with MISE_OFFLINE=1, so a mise shim neither
+# installs a lazy tool nor updates one before you approve anything; a tool that cannot run offline is left to setup.
+# Approved updates and the setup run stay online.
 tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
-		text="$(gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
+		text="$(MISE_OFFLINE=1 gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
 	elif [ "$1" = acpx ] || [ "$1" = node ]; then
-		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$plan_path" --version 2>/dev/null)" || true
+		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 MISE_OFFLINE=1 "$plan_path" --version 2>/dev/null)" || true
 	else
-		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$1" --version 2>/dev/null)" || true
+		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 MISE_OFFLINE=1 "$1" --version 2>/dev/null)" || true
 	fi
 	printf '%s\n' "${text%%$'\n'*}"
 }
@@ -188,7 +191,7 @@ plan_acpx() {
 		plan_targets=(install -g --prefix "$HOME/.local" acpx@latest)
 		;;
 	*)
-		prefix="$(npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
+		prefix="$(MISE_OFFLINE=1 npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
 		case "$real" in
 		"$prefix/lib/node_modules/acpx/"*)
 			if [ ! -w "$prefix/lib/node_modules" ]; then
@@ -215,12 +218,15 @@ plan_gh_dash() {
 		plan_manual='GitHub CLI is missing; make setup installs it and then offers the extension'
 		return 0
 	fi
-	list="$(gh extension list 2>/dev/null)" || true
+	if ! list="$(MISE_OFFLINE=1 gh extension list 2>/dev/null)"; then
+		plan_manual='GitHub CLI did not list its extensions (for example it is not logged in yet, or is a lazy mise tool that is not installed yet, which this check never installs); make setup checks it and offers the extension if missing; rerun make update afterwards to update an installed one'
+		return 0
+	fi
 	if grep -Eq "[[:space:]]dlvhdr/gh-dash([[:space:]]|\$)" <<<"$list"; then
 		plan_kind=extension
 		plan_text='gh extension upgrade dash'
 		plan_detail='the dlvhdr/gh-dash GitHub CLI extension; never --force'
-	elif gh dash --version >/dev/null 2>&1; then
+	elif MISE_OFFLINE=1 gh dash --version >/dev/null 2>&1; then
 		plan_manual='gh dash is not the dlvhdr/gh-dash extension; update it the way you installed it'
 	else
 		plan_manual='not installed; make setup offers gh extension install dlvhdr/gh-dash'
@@ -334,7 +340,7 @@ plan_upgrade() {
 		plan_manual="$real is not the native installation that '$tool update' manages; update it with the tool that installed it"
 		return 0
 	fi
-	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$path" --help 2>&1)" || true
+	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 MISE_OFFLINE=1 "$path" --help 2>&1)" || true
 	if ! grep -Eq "^[[:space:]]*(${tool}[[:space:]]+)?update([[:space:]|]|\$)" <<<"$help"; then
 		plan_detail=''
 		plan_manual="the installed $tool does not list an update command; update it with its native installer"
@@ -367,7 +373,7 @@ run_plan() {
 # Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
 gum_is_suitable() {
 	command -v gum >/dev/null 2>&1 || return 1
-	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+	MISE_OFFLINE=1 gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 offer_upgrade() {
