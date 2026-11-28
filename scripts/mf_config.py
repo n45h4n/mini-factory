@@ -343,8 +343,8 @@ def show(profiles, shared, path, saved):
     print("hands the published PR to the fixer in a new tab of the issue's workspace. Its settings are captured once,")
     print("when Issues I first creates an issue branch: later edits apply to future issue branches and never enable,")
     print("change, or reset the fixer of a branch that already exists.")
-    print("Profiles apply only when a fresh Herdr agent starts. A working, blocked, or idle agent keeps its original")
-    print("harness and options; close it (exit the agent in its pane), then press the key again to relaunch.")
+    print("Other profiles apply only when a fresh Herdr agent starts. A working, blocked, or idle agent keeps its")
+    print("original harness and options; close it (exit the agent in its pane), then press the key again to relaunch.")
     print("mf-config never changes the No-Mistakes pipeline agent (no-mistakes/config.yaml in your clone).")
 
 
@@ -535,14 +535,17 @@ def edit_fixer(current):
     bots = next(key for key, name in FIXER_BOTS.items() if name == bots_label)
     rounds = gum("input", label + ": maximum fix rounds (1-" + str(FIXER_ROUND_LIMIT)
                  + "; one round is one fix-and-push cycle)", current=str(settings["max_rounds"])).strip()
-    if not (rounds.isascii() and rounds.isdigit() and valid_rounds(int(rounds))):
+    # Leading zeroes are accepted; converting only a short value keeps int() within its digit limit for any paste.
+    digits = rounds.lstrip("0") or "0"
+    if not (rounds.isascii() and rounds.isdigit() and len(digits) <= len(str(FIXER_ROUND_LIMIT))
+            and valid_rounds(int(digits))):
         raise ConfigError("invalid maximum fix rounds " + repr(rounds) + ": use a whole number from 1 to "
                           + str(FIXER_ROUND_LIMIT))
     choice = gum("choose", label + ": harness (independent of every other profile; Codex is the default)",
                  list(HARNESSES.values()), HARNESSES[saved.get("agent", "codex")])
     agent = next(kind for kind, name in HARNESSES.items() if name == choice)
     profile = PICKERS[agent](label, harness_profile(saved) if saved.get("agent") == agent else {})
-    profile.update(enabled=True, bots=bots, max_rounds=int(rounds))
+    profile.update(enabled=True, bots=bots, max_rounds=int(digits))
     return profile
 
 

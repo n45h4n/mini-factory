@@ -5665,14 +5665,19 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
                          "--config\ncheck_for_update_on_startup=false\n--config\nmodel_reasoning_effort=\"low\"\n")
         # Invalid budgets, cancellation, and a declined save leave the saved file intact.
         saved = path.read_bytes()
+        # A pasted budget longer than Python's 4300-digit int() conversion limit is reported, not a traceback.
         for answers, status in (((fixer, "On", "Both", "0"), 1), ((fixer, "On", "Both", "100"), 1),
-                                ((fixer, "On", "Both", "five"), 1), ((fixer, "<cancel>"), 130),
+                                ((fixer, "On", "Both", "five"), 1), ((fixer, "On", "Both", "1" * 4301), 1),
+                                ((fixer, "<cancel>"), 130),
                                 ((fixer, "On", "CodeRabbit", "2", "<cancel>"), 130),
                                 ((fixer, "On", "CodeRabbit", "2", "Cursor", "Native default (no override)", "no"), 130)):
-            with self.subTest(answers=answers):
+            with self.subTest(answers=tuple(answer[:20] for answer in answers)):
                 result, _ = self.edit_profiles(*answers, MOCK_CODEX_VERSION="0.166.0")
-                self.assertEqual(result.returncode, status, result.stdout)
+                self.assertEqual(result.returncode, status, result.stdout[:2000])
                 self.assertEqual(path.read_bytes(), saved)
+                if status == 1:
+                    self.assertIn("mf-config: invalid maximum fix rounds", result.stdout)
+                    self.assertNotIn("Traceback", result.stdout)
         # Invalid saved fixer settings are reported without repair, and fixer fields belong to the fixer only.
         for profile in ({"agent": "codex", "enabled": "yes"}, {"agent": "codex", "bots": "all"},
                         {"agent": "codex", "max_rounds": 0}, {"agent": "codex", "max_rounds": 2.5},

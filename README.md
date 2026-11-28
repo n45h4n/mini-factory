@@ -1426,15 +1426,17 @@ and review pull requests, with registered CI checks.
    harness/model different from the Issues `I` implementer (for example Claude
    Code for the fixer, Codex for the implementer). `mf-config show` and
    `make doctor` report it enabled; doctor checks that harness's login and Herdr
-   integration and the fixer's No-Mistakes/Herdr interfaces.
+   integration and the fixer's No-Mistakes/Herdr interfaces. If doctor reports
+   that login or integration pending, rerun `make setup`, which offers them, and
+   continue only once `make doctor` reports ready.
 2. Press `I` on a small issue. The prompt runs
-   `no-mistakes axi run --yes --skip ci ...`; the run finishes after Push and PR
-   with CI reported as skipped, and no fixer tab exists yet.
+   `no-mistakes axi run --yes --skip ci ...`, and no fixer tab exists yet.
 3. Before the run is terminal, have the handoff command from the prompt run in
    the implementer's own recorded pane (ask the implementer to run it, or use
    its harness's shell escape there): it refuses because the run is still
    active, and changes nothing. From any other pane or shell it is refused for
-   that reason instead, before the run is checked. Once the implementer runs it
+   that reason instead, before the run is checked. The run then finishes after
+   Push and PR with CI reported as skipped. Once the implementer runs it
    after publication, one **PR Fixer** tab appears in the same workspace
    (without taking focus), at the same worktree, running the fixer's
    harness/model; the implementer's tab stays open and stops writing.
