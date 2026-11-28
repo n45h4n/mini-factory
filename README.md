@@ -269,9 +269,9 @@ repair/update through their own installer; setup does not silently upgrade
 unrelated software.
 
 Every package install, privileged operation, login, and configuration change
-requires explicit consent, with one exception: on Omarchy, the ordinary
-user-level installation that mise performs when setup first runs a lazy tool
-needs no separate consent (see
+requires explicit consent, with one exception: on both Arch and Omarchy, the
+ordinary user-level installation that mise performs when setup first runs a
+lazy tool needs no separate consent (see
 [Arch Linux and Omarchy](#bootstrap-on-arch-linux-and-omarchy)). Every system
 package transaction (`pacman`, `omarchy pkg add`, or `apt-get`) still requires
 explicit consent. Consent is asked with a Gum confirmation (`gum confirm`, with No
