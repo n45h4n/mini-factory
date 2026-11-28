@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mini-Factory agent profiles for the gh-dash issue i/I and PR I keys.
+"""Mini-Factory agent profiles for the gh-dash issue i/I and PR I keys and the optional PR Fixer.
 
 Saved choices apply only when a fresh Herdr agent starts. This tool never
 starts, stops, or changes an agent and never edits the No-Mistakes pipeline
@@ -26,6 +26,8 @@ USAGE = """usage: mf-config [show | --help]
 #   mf-config agent ROLE             print the effective harness and its source
 #   mf-config launch-args ROLE KIND  print native launch options, one per line
 #   mf-config set-agent pr-review KIND  save setup's PR_REVIEW_AGENT choice
+#   mf-config fixer [--launch]       print the effective PR Fixer settings as one JSON object (--launch adds
+#                                    an enabled fixer's checked launch options from the same read)
 
 HARNESSES = {"codex": "Codex", "claude": "Claude Code", "cursor": "Cursor"}
 COMMANDS = {"codex": "codex", "claude": "claude", "cursor": "cursor-agent"}
@@ -33,7 +35,15 @@ ROLES = {
     "issue-prepare": "Issues i - preparer",
     "issue-implement": "Issues I - implementer",
     "pr-review": "PRs I - reviewer",
+    "pr-fixer": "PR Fixer - after Issues I",
 }
+# These profiles never fall back to the shared issue agent (make setup ISSUE_AGENT).
+INDEPENDENT = ("pr-review", "pr-fixer")
+# The PR Fixer keeps its own switch, review bots, and round budget beside its harness knobs.
+FIXER_BOTS = {"both": "Both", "coderabbit": "CodeRabbit", "greptile": "Greptile"}
+FIXER_FIELDS = ("enabled", "bots", "max_rounds")
+FIXER_DEFAULT_ROUNDS = 5
+FIXER_ROUND_LIMIT = 99
 KNOBS = {"codex": ("model", "effort", "fast"), "claude": ("model", "effort"), "cursor": ("model",)}
 SOURCES = {
     "override": "mf-config per-role selection",
@@ -116,7 +126,7 @@ def validate_profile(role, profile, where):
     agent = profile.get("agent")
     if agent not in HARNESSES:
         raise ConfigError(location + ": agent must be codex, claude, or cursor")
-    unknown = sorted(set(profile) - {"agent", *KNOBS[agent]})
+    unknown = sorted(set(profile) - {"agent", *KNOBS[agent], *(FIXER_FIELDS if role == "pr-fixer" else ())})
     if unknown:
         raise ConfigError(location + ": unsupported field(s) for " + HARNESSES[agent] + ": " + ", ".join(unknown))
     for key in ("model", "effort"):
@@ -124,7 +134,28 @@ def validate_profile(role, profile, where):
             raise ConfigError(location + ": " + key + " must be a native value without spaces or a leading dash")
     if "fast" in profile and type(profile["fast"]) is not bool:
         raise ConfigError(location + ": fast must be true or false")
+    if "enabled" in profile and type(profile["enabled"]) is not bool:
+        raise ConfigError(location + ": enabled must be true or false")
+    if "bots" in profile and not (isinstance(profile["bots"], str) and profile["bots"] in FIXER_BOTS):
+        raise ConfigError(location + ": bots must be coderabbit, greptile, or both")
+    if "max_rounds" in profile and not valid_rounds(profile["max_rounds"]):
+        raise ConfigError(location + ": max_rounds must be a whole number from 1 to " + str(FIXER_ROUND_LIMIT))
     return dict(profile)
+
+
+def valid_rounds(value):
+    return type(value) is int and 1 <= value <= FIXER_ROUND_LIMIT
+
+
+def fixer_settings(profile):
+    """The fixer's own switch, bots, and budget; off, Both, and 5 rounds until saved otherwise."""
+    return {"enabled": profile.get("enabled", False), "bots": profile.get("bots", "both"),
+            "max_rounds": profile.get("max_rounds", FIXER_DEFAULT_ROUNDS)}
+
+
+def harness_profile(profile):
+    """Only the harness and its native knobs, without the fixer's own fields."""
+    return {key: value for key, value in profile.items() if key not in FIXER_FIELDS}
 
 
 def load_profiles(path):
@@ -152,10 +183,13 @@ def load_profiles(path):
 
 
 def effective(role, profiles, shared):
-    """Precedence: per-role mf-config selection, then shared issue agent, then Codex."""
+    """Precedence: per-role mf-config selection, then shared issue agent, then Codex.
+
+    The PR reviewer and the PR Fixer are independent: they never use the shared issue agent.
+    """
     if role in profiles:
         return dict(profiles[role]), "override"
-    if role != "pr-review" and shared:
+    if role not in INDEPENDENT and shared:
         return {"agent": shared}, "shared"
     return {"agent": "codex"}, "default"
 
@@ -276,6 +310,13 @@ def describe(profile):
     return "model: " + value("model") + " (Cursor's model ID owns its variant/effort)"
 
 
+def describe_fixer(profile):
+    settings = fixer_settings(profile)
+    bots = "CodeRabbit and Greptile (both must complete)" if settings["bots"] == "both" else FIXER_BOTS[settings["bots"]]
+    return ("PR Fixer: " + ("enabled" if settings["enabled"] else "disabled") + "; review bots: " + bots
+            + "; maximum fix rounds: " + str(settings["max_rounds"]))
+
+
 def show(profiles, shared, path, saved):
     print("Mini-Factory agent profiles: " + str(path) + ("" if saved else " (none saved yet)"))
     print("Shared issue agent: " + (HARNESSES[shared] if shared else "not set (Codex default)")
@@ -287,13 +328,23 @@ def show(profiles, shared, path, saved):
             detail = ("mf-config selection" if source == "override" else "default (no saved selection)")
             detail += ("; interactive, read-only (" + REVIEW_MODE_NAMES[profile["agent"]]
                        + "); findings stay in its terminal")
+        elif role == "pr-fixer":
+            detail = (("enabled" if fixer_settings(profile)["enabled"] else "disabled") + "; "
+                      + ("mf-config selection" if source == "override" else "default (no saved selection)"))
         print("\n" + label + ": " + HARNESSES[profile["agent"]] + " - " + detail)
         print("  " + describe(profile))
+        if role == "pr-fixer":
+            print("  " + describe_fixer(profile))
     print("\nPrecedence for each issue key: its mf-config selection, then the shared issue agent, then Codex.")
     print("The PR reviewer uses its mf-config selection, else Codex. It starts in that native read-only mode and is")
     print("asked to report findings only in its terminal: no file edits, PR comments, reviews, or other GitHub writes.")
-    print("Profiles apply only when a fresh Herdr agent starts. A working, blocked, or idle agent keeps its original")
-    print("harness and options; close it (exit the agent in its pane), then press the key again to relaunch.")
+    print("The PR Fixer uses only its own mf-config selection, else Codex: never the implementer profile, the shared")
+    print("issue agent, or the No-Mistakes pipeline agent. When enabled, Issues I skips the No-Mistakes CI stage and")
+    print("hands the published PR to the fixer in a new tab of the issue's workspace. Its settings are captured once,")
+    print("when Issues I first creates an issue branch: later edits apply to future issue branches and never enable,")
+    print("change, or reset the fixer of a branch that already exists.")
+    print("Other profiles apply only when a fresh Herdr agent starts. A working, blocked, or idle agent keeps its")
+    print("original harness and options; close it (exit the agent in its pane), then press the key again to relaunch.")
     print("mf-config never changes the No-Mistakes pipeline agent (no-mistakes/config.yaml in your clone).")
 
 
@@ -471,9 +522,38 @@ def choose_claude(label, saved):
 PICKERS = {"codex": choose_codex, "claude": choose_claude, "cursor": choose_cursor}
 
 
+def edit_fixer(current):
+    """On/off first: turning the fixer off keeps its saved bots, budget, and harness preferences."""
+    label, saved = "PR Fixer", current or {}
+    settings = fixer_settings(saved)
+    print("PR Fixer settings are captured when Issues I first creates an issue branch. Later edits apply to future")
+    print("issue branches only: they never enable, change the model of, or reset the budget of an existing one.")
+    if gum("choose", label + ": enabled (off by default)", ["Off", "On"], "On" if settings["enabled"] else "Off") == "Off":
+        return dict(saved, enabled=False) if settings["enabled"] else current
+    bots_label = gum("choose", label + ": review bots to follow (Both means both must complete)",
+                     list(FIXER_BOTS.values()), FIXER_BOTS[settings["bots"]])
+    bots = next(key for key, name in FIXER_BOTS.items() if name == bots_label)
+    rounds = gum("input", label + ": maximum fix rounds (1-" + str(FIXER_ROUND_LIMIT)
+                 + "; one round is one fix-and-push cycle)", current=str(settings["max_rounds"])).strip()
+    # Leading zeroes are accepted; converting only a short value keeps int() within its digit limit for any paste.
+    digits = rounds.lstrip("0") or "0"
+    if not (rounds.isascii() and rounds.isdigit() and len(digits) <= len(str(FIXER_ROUND_LIMIT))
+            and valid_rounds(int(digits))):
+        raise ConfigError("invalid maximum fix rounds " + repr(rounds) + ": use a whole number from 1 to "
+                          + str(FIXER_ROUND_LIMIT))
+    choice = gum("choose", label + ": harness (independent of every other profile; Codex is the default)",
+                 list(HARNESSES.values()), HARNESSES[saved.get("agent", "codex")])
+    agent = next(kind for kind, name in HARNESSES.items() if name == choice)
+    profile = PICKERS[agent](label, harness_profile(saved) if saved.get("agent") == agent else {})
+    profile.update(enabled=True, bots=bots, max_rounds=int(digits))
+    return profile
+
+
 def edit_role(role, profiles, shared):
     current = profiles.get(role)
     label = ROLES[role].split(" (", 1)[0]
+    if role == "pr-fixer":
+        return edit_fixer(current)
     if role == "pr-review":
         # Codex with only native defaults is the default reviewer, so it saves no override.
         choice = gum("choose", label + ": harness (Codex is the default; each starts read-only)",
@@ -558,6 +638,8 @@ def edit():
     new, source = effective(role, candidate, shared)
     print("\nPreview - " + label + ": " + HARNESSES[new["agent"]] + " (" + SOURCES[source] + ")")
     print("  " + describe(new))
+    if role == "pr-fixer":
+        print("  " + describe_fixer(new))
     if candidate == profiles:
         print("No change; nothing was saved.")
         return 0
@@ -571,8 +653,13 @@ def edit():
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
     print("Saved: " + str(path))
-    print("Existing Herdr agents keep their original harness and options. Close one (exit the agent in its pane),")
-    print("then press its key again to start a fresh agent with this profile.")
+    if role == "pr-fixer":
+        # Captured per branch at enrollment: restarting an existing fixer would not apply them.
+        print("Issue branches that already exist keep the PR Fixer settings captured when they were created;")
+        print("these settings apply to issue branches that Issues I creates from now on.")
+    else:
+        print("Existing Herdr agents keep their original harness and options. Close one (exit the agent in its pane),")
+        print("then press its key again to start a fresh agent with this profile.")
     return 0
 
 
@@ -585,14 +672,30 @@ def main(argv):
         profiles, raw = load_profiles(path)
         show(profiles, shared_agent(), path, raw is not None)
         return 0
+    if argv in (["fixer"], ["fixer", "--launch"]):
+        # One JSON object for enrollment, setup, and doctor, from a single read of the saved profiles. Enrollment
+        # passes --launch: an enabled fixer's native launch options then come from that same read, checked against
+        # the installed harness, so a concurrent save can never mix two profile versions in one enrollment.
+        profile, _ = effective("pr-fixer", load_profiles(profiles_path())[0], None)
+        settings = fixer_settings(profile)
+        captured = {"enabled": settings["enabled"], "agent": profile["agent"],
+                    "bots": ["coderabbit", "greptile"] if settings["bots"] == "both" else [settings["bots"]],
+                    "max_rounds": settings["max_rounds"]}
+        if argv[1:] and settings["enabled"]:
+            harness = harness_profile(profile)
+            require_support(harness, "pr-fixer")
+            captured["arguments"] = native_arguments(harness)
+        print(json.dumps(captured))
+        return 0
     if len(argv) == 2 and argv[0] == "agent" and argv[1] in ROLES:
-        shared = None if argv[1] == "pr-review" else shared_agent()
+        shared = None if argv[1] in INDEPENDENT else shared_agent()
         profile, source = effective(argv[1], load_profiles(profiles_path())[0], shared)
         print(profile["agent"] + "\n" + source)
         return 0
     if len(argv) == 3 and argv[0] == "launch-args" and argv[1] in ROLES and argv[2] in HARNESSES:
-        shared = None if argv[1] == "pr-review" else shared_agent()
+        shared = None if argv[1] in INDEPENDENT else shared_agent()
         profile, _ = effective(argv[1], load_profiles(profiles_path())[0], shared)
+        profile = harness_profile(profile)
         if profile["agent"] != argv[2]:
             raise ConfigError("the " + ROLES[argv[1]] + " harness changed to " + HARNESSES[profile["agent"]]
                               + " during this launch; press the key again")

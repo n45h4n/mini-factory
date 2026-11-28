@@ -14,7 +14,8 @@ first setup saves `codex` and later runs keep the saved choice; rerun with a new
 value to change it. `PR_REVIEW_AGENT` saves the PRs `I` reviewer in the
 `mf-config` profile (Codex is the default; without it, setup keeps the saved
 reviewer). To choose the `i` and `I` agents separately, or a model and
-effort per key, use [`mf-config`](#agent-profiles-mf-config). Setup installs
+effort per key, or to turn on the optional [PR Fixer](#optional-pr-fixer-issues-i)
+(off by default), use [`mf-config`](#agent-profiles-mf-config). Setup installs
 Codex, Claude Code, and Cursor regardless, so changing a role later needs no
 new install. **Keep this clone**: No-Mistakes reads its configuration
 from the tracked `no-mistakes/config.yaml` here (see
@@ -311,8 +312,8 @@ gh extension install dlvhdr/gh-dash
 ```
 
 Agent authentication stays in each agent's CLI. Setup and doctor require login
-only for agents that are actually used: by a gh-dash role (`i`, `I`, or PRs
-`I`), or by a No-Mistakes duty (the pipeline `agent` and any
+only for agents that are actually used: by a gh-dash role (`i`, `I`, PRs
+`I`, or the PR Fixer while it is enabled), or by a No-Mistakes duty (the pipeline `agent` and any
 `review_agents` reviewer/fixer/later-round role, with `acp:cursor` counting as
 Cursor). Setup offers only the missing logins; installed but unused agents may
 stay logged out. With the defaults, that is Codex only.
@@ -365,15 +366,24 @@ the agent's own trust and permission settings, or answer its prompts while it
 works; setup does not change them. A run waiting on such a prompt shows as
 blocked in Herdr.
 
+With the [PR Fixer](#optional-pr-fixer-issues-i) enabled, the implementer also
+runs the bundled handoff helper, which reads and writes its private checkpoint
+under that state directory and talks to Herdr, GitHub, and No-Mistakes. The
+fixer agent needs the same kind of access to edit, run checks, commit, and run
+that helper, which pushes its commits and posts review requests. Neither agent
+gets extra permission overrides, and No-Mistakes' `--yes` never applies to them.
+
 ## Agent profiles (mf-config)
 
-`mf-config` configures the three interactive gh-dash agents independently:
+`mf-config` configures the three interactive gh-dash agents and the optional
+PR Fixer independently:
 
 | Profile | Harness | Knobs |
 | ------- | ------- | ----- |
 | Issues `i` preparer | Codex, Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
 | Issues `I` implementer | Codex, Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
 | PRs `I` reviewer | Codex (default), Claude Code, or Cursor | model, effort (Codex/Claude Code), Codex Fast |
+| PR Fixer (after Issues `I`) | Codex (default), Claude Code, or Cursor | **Enabled** (off by default), **review bots** (CodeRabbit, Greptile, or Both; Both by default), **maximum fix rounds** (1-99; 5 by default), model, effort (Codex/Claude Code), Codex Fast |
 
 ```sh
 mf-config          # Gum editor: pick one profile, choose, preview, confirm
@@ -394,6 +404,21 @@ ISSUE_AGENT=...` changes only the shared choice and never rewrites a per-key
 selection; choose **Shared issue agent** in `mf-config` to remove one.
 `mf-config` never changes the No-Mistakes pipeline agent; use
 [`nm-config`](#no-mistakes-global-defaults-nm-config) for that.
+
+The PR Fixer, like the PR reviewer, uses only its own selection, else Codex: it
+never inherits the implementer profile, the shared `ISSUE_AGENT`, or the
+No-Mistakes pipeline agent, so changing those never changes it. Its editor asks
+**Off/On** first; turning it off keeps its saved bots, round budget, and
+harness/model/effort, and turning it on again starts from them. An existing
+`agent-profiles.json` without a fixer entry keeps its meaning (fixer off).
+`mf-config show` prints the effective fixer settings, including whether it is
+enabled. **Its settings are captured once, when Issues `I` first creates an
+`agent/issue-N` branch**: that branch keeps its enabled state, bots, budget, and
+launch options through handoff and recovery, all read from one version of the
+saved profiles, even while another `mf-config` saves. Later edits apply only to future
+issue branches; they never enable a fixer for a branch that already exists,
+change its model, or reset its budget. A branch started while the fixer was off,
+or before this feature, stays on the original workflow.
 
 Every knob offers **Native default (no override)**, which passes nothing, and a
 custom/unverified value; saved custom values are kept. Pickers read only local
@@ -574,6 +599,207 @@ The agent then drives that run with the installed No-Mistakes skill and reports
 the actual outcome and PR URL. A dispatch notification only means the prompt was
 delivered; see [No-Mistakes](#no-mistakes-configuration-and-unattended-runs) for
 outcomes and blockers.
+
+### Optional PR Fixer (Issues I)
+
+When the PR Fixer is **off** (the default), everything above is unchanged:
+Issues `I` creates no fixer state or tab, makes no bot API calls, and needs no
+fixer login. Issues `i` and PRs `I` never use it. When it is **on** while
+Issues `I` creates a new issue branch, that branch is enrolled (see
+[mf-config](#agent-profiles-mf-config)); Issues `I` first checks the installed
+interfaces it needs (`no-mistakes axi run --skip`, `axi status`,
+`axi sync --check`, and Herdr `tab create --workspace --cwd --label --no-focus`,
+`tab list`) and refuses to create the branch, naming the missing
+one, rather than reconfiguring anything. The implementation prompt then
+delegates only the CI stage:
+
+```sh
+no-mistakes axi run --yes --skip ci --base-branch <captured-branch> --intent "$(cat -- "$intent_file")"
+```
+
+Every other stage and native gate (protected paths, questions, approvals,
+failures) still runs; shared No-Mistakes defaults and the target's
+`.no-mistakes.yaml` are untouched, and an already active run is reattached as it
+is, never aborted or restarted. Only a run whose CI stage was actually skipped
+is driven without waiting for checks; a reattached run that kept its CI stage
+gets the same bounded check-registration wait and mergeability and
+workflow-trigger diagnostics as the original workflow. The skip is reported as
+a skip: it neither waives GitHub's checks nor means the PR is ready.
+
+**Handoff.** When its run is terminal with Push and PR completed, the
+implementer runs the bundled
+`scripts/integrations/gh-dash/gh-dash-pr-fixer.sh handoff OWNER/REPO N` from
+the issue worktree (the prompt gives the exact command). Only the recorded
+implementer's own pane, in the recorded workspace and Herdr session, may run it;
+any other pane or shell is refused. It transfers ownership
+only after verifying that the branch's own No-Mistakes run was created after
+this enrollment (its run ID's creation time; a run, PR, and remote branch left
+by an earlier branch of the same name are never handed over), is terminal,
+published, and no longer owns or monitors the branch; that the open PR belongs
+to this repository and branch and targets the captured base; and that the
+worktree holds the published head, including No-Mistakes fix commits. Only
+after the live PR and its publication are verified does it apply the guarded
+`no-mistakes axi sync` that No-Mistakes itself offers for that run;
+otherwise (uncommitted work, divergence, a closed, retargeted, or missing PR, an
+active run) it changes nothing and explains why. Dispatch startup, a green
+check, a successful CLI exit, or an idle implementer is never a handoff.
+
+It then opens one **PR Fixer** tab in the issue's existing Herdr workspace,
+without taking focus, in the same worktree and branch (no second worktree,
+branch, or workspace), and starts the captured harness there with the captured
+native options. The fixer's prompt carries the captured scope and base, PR,
+published head, No-Mistakes step results (including the CI step's actual result
+and any overrides), bots, remaining budget, and checkpoint location. From then on the
+implementer's tab stays open for context but stops writing; the fixer is the
+branch's only automated writer. Repeating the handoff or pressing `I` again
+focuses the recorded fixer (offline too, whichever tab is active) or safely resumes it; it never resends
+implementation, starts a second fixer, or resets the budget. Once the fixer has
+recorded a result with `finish`, its run is over: pressing `I` or repeating the
+handoff only focuses it while it is open, or reports the result once it has
+exited, and never restarts or prompts it. Only the fixer's own tab and agent
+are reused: the tab Herdr confirmed creating for it, and an agent only in the
+fixer's recorded pane. Herdr gives a tab nothing that proves who created it, so
+a tab whose creation response was lost is never adopted, whatever its label,
+workspace, or worktree, and even though every tab that existed before the
+request is checkpointed first: while a tab labelled PR Fixer has appeared since
+that request, nothing is created, started, or prompted, and the fixer names
+that tab so you can close it (or rename it if it is yours) before retrying. A
+tab labelled PR Fixer that it did not create, or an agent with its name in any
+other tab, is never adopted, and an ambiguous match stops without touching any
+tab or agent. A fixer is started, restarted after exiting, or prompted to write only
+after GitHub confirms the same open PR and published head and the worktree holds
+exactly that head (or the fixer's own interrupted publication); other local
+commits or tracked changes are preserved and reported, never published.
+
+**Review loop.** Coding judgment is the fixer agent's (prompt guidance); the
+same helper enforces ownership, evidence, budget, and the verdict through
+`status`, `evidence`, `wait`, `request-review`, `keep-open`, `push`, and
+`finish` (run it with `--help`); `request-review`, `keep-open`, and `finish`, like
+`push`, run only in the fixer's own pane. For each selected bot, only a completed review
+that covers the current published head counts: a review bound to that commit
+(for Greptile, which submits a formal review only with inline findings, one that
+carries them),
+the provider's own review check on that commit with its completed result
+(CodeRabbit's `CodeRabbit` check titled Finished, or Review completed/approved
+as a commit status; Greptile's review status check passing), or a bot summary
+whose provider footer names it as the reviewed commit (Greptile's legacy "Last
+reviewed commit", CodeRabbit's "between … and …"); an incremental review is
+enough. A Greptile summary in its current footer-less format proves no head by
+itself, so it needs a review or check bound to the head. Other bot checks or
+statuses (such as CodeRabbit's pre-merge checks, or a green CodeRabbit check
+that reports a skipped or rate-limited review), older reviews, a mere mention of the head, resolved threads,
+green checks, empty results, rate-limit/paused/skipped/failed notices and
+billing or quota refusals such as Greptile's trial-expiry review (a
+provider message or check that opens with that status, including a submitted
+review that only reports one; a finding that merely mentions a rate limit stays
+a finding), and same-named user accounts never
+do, and a review still running for the head (a pending bot check, a summary in
+progress, or Greptile's analyzing reaction) or a newer failed attempt outweighs
+earlier completion. Summaries and every unresolved inline thread, with its whole
+discussion across reply pages, reach the fixer unabridged; findings from
+earlier reviews are carried forward. The fixer judges each finding against the
+code and the captured scope, fixes real problems with the smallest change,
+explains non-actionable ones on their threads, and resolves only selected-bot
+threads it addressed or explained; an unresolved selected-bot thread keeps the
+PR from being ready. When a human's reply still awaits an answer, the fixer
+leaves the thread open and records with `keep-open` that its bot finding is
+settled; a later, reposted, or edited bot comment there makes it actionable again (a
+human-only reply does not). It requests a
+re-review (`@coderabbitai review`, `@coderabbitai full review` after a failed,
+cancelled, or configuration-skipped CodeRabbit review, or `@greptileai`) at most
+once per head (a plain CodeRabbit request it then skipped is retried once as a
+full review),
+counting requests anyone posted since that exact head was published (even before
+the handoff, including Greptile's `@greptileai review this at apex` and its app
+mention `@greptile-apps`), and never
+while one is running or inside a cooldown the provider's rate-limit notice
+states; a request the provider answered with a later rate limit was dropped, so
+it may be repeated after that cooldown within the bounded attempts, and a request
+whose outcome was uncertain is repeated only when GitHub shows none. Immediately
+before posting, it reads GitHub again (the same open PR, base, and head, and the
+bot's state for that head) and never asks about a head that the fixer's own
+unconfirmed publication is replacing. Publication is dated by
+GitHub's own push record of the head (repository activity), not by the commit's
+date, or by the start of the fixer's push attempt that published it, kept across
+an interrupted push. When GitHub shows no record for the handed-over head, its
+publication time is unverified: every request seen counts, so none is repeated,
+and `evidence` reports `publication_time_verified: false`. Because
+the CI stage was
+delegated, it also owns the latest head's required hosted checks: it fixes
+regressions this PR caused within the same budget and reports unrelated
+failures, missing CI, merge conflicts, and permission problems as blockers.
+An empty check list is not success, a required check (a bot's included) counts as
+CI, a result GitHub's test merge commit of that head reports for a check takes
+precedence over the head commit's result for the same check, the same name
+reported by the same app or account (a check run and a commit status sharing a
+name are separate, and both are required, and so are same-named checks that
+different apps report), a check the base branch's protection or
+rulesets require stays pending until it registers, a workflow its rulesets
+require (which names a file at a ref or commit, not its checks) keeps CI
+pending until GitHub reports the PR's merge state as clean for that head or that
+file's own run for this PR (a `pull_request` or `pull_request_target` run whose
+check suite GitHub matches to exactly this PR, and whose workflow file GitHub
+links at the rule's pinned SHA, or at a commit GitHub's repository activity
+shows its ref naming, now or before it moved on; a commit merely merged into
+the ref's history is not one) has completed successfully on the head, as a
+whole workflow run, not just one of its jobs.
+Rules for the same file at different refs are separate requirements; a run of
+the same file that GitHub does not tie to that commit (such as the PR's own
+version of the file), or a push run with the same check names, never counts. A trusted default-branch
+`no_ci: true` never waives a selected bot.
+
+**Round budget.** One round is one fix-and-push cycle, whatever mix of bot and
+CI fixes it contains; inspecting, requesting reviews, and waiting use none, so a
+PR clean on first inspection uses zero. `push` runs only in the recorded
+fixer's own pane, never while a No-Mistakes run owns or monitors the branch
+again or still holds its custody (a failed or cancelled run whose branch sync
+reports `pipeline_owned` or offers `recover_custody`), and publishes only when the commits between the published head
+and HEAD are exactly the ones the fixer names as its own; other work is kept and
+reported. The helper counts a round in its checkpoint before it pushes a commit
+that extends the published head with a lease pinned to that verified head, so
+the push can only fast-forward it and fails if anyone moved the branch
+meanwhile (a rewind included); the count survives restarts. A push interrupted after GitHub
+accepted it is reconciled without another round; retrying the same commit uses
+none. Once the budget is spent nothing more is pushed, but the last head's
+reviews and checks are still observed. If HEAD no longer matches a commit whose
+publication was interrupted, nothing is pushed until a human decides. Each
+`wait` call returns within about 90 seconds (every command it runs, and any
+wait for the issue lock, is cut off at that deadline), and the total wait per head is bounded: each attempt is counted
+before GitHub is contacted, so failed polls use it too. A head changed by someone else,
+a closed or retargeted PR, or ambiguous state stops the fixer without adopting
+or overwriting anything.
+
+**Outcomes.** `finish` records exactly one result, once: repeating it reports
+the recorded result unchanged, a different result is refused, and `push` refuses
+to publish after it. The result is **ready for human review**
+(every selected bot completed for the latest published head, no unresolved bot
+thread other than one kept open for a human discussion, required checks passing or the owner's `no_ci: true`, the local
+worktree on the PR's branch exactly at that head, no No-Mistakes run owning
+the branch or holding its custody, no publication since that head was
+checked, and no selected-bot feedback posted or edited since `evidence` or
+`wait` last showed it), **review/CI pending or unverifiable**, **round
+limit reached** (only after the final head's reviews and hosted CI were
+verified, including any required check or workflow run still running beside a
+failure; CI still pending, with no registered check, or a pull request with a
+merge conflict is reported as pending or blocked instead), or **blocked**.
+Ready and round limit are recorded only if, read again just before recording,
+the head, its hosted CI, and the selected bots' reviews and feedback are
+unchanged from what was checked. The
+fixer's final report gives the PR URL, latest published and verified head, bots
+and their completion, rounds used/allowed, fixes, remaining findings, CI
+results, and No-Mistakes skips or overrides. It never merges, enables
+auto-merge, retargets or closes the PR, force-pushes, resets, deletes a
+worktree, or edits CI, provider, or No-Mistakes configuration.
+
+The checkpoint is a private JSON file beside the captured intent,
+`${XDG_STATE_HOME:-$HOME/.local/state}/gh-dash-codex-issue/intents/<issue identity>.<clone identity>.pr-fixer.json`,
+written atomically under the issue's existing lock; `gh-dash-pr-fixer.sh status
+OWNER/REPO N` prints it without contacting GitHub. Only the dispatcher enrolls,
+just before it creates a new issue branch, so a retained branch keeps its
+checkpoint, owner, and spent rounds. If it becomes unreadable, nothing is
+started or prompted; inspect and repair it rather than deleting it, because it
+is the only record of whether ownership moved to the fixer and of the rounds
+used.
 
 The distribution contains only these issue and PR review integrations. It does
 not include Pepper/Factory workflows, queues, Supervisors, or Docker sandbox
@@ -841,6 +1067,12 @@ adding CI only when missing CI is independently established. After resolving
 the blocker, continue with `no-mistakes axi status` from the worktree. This bundle
 never bypasses CI or marks checks passed.
 
+For a branch enrolled in the [PR Fixer](#optional-pr-fixer-issues-i), the same
+prerequisite applies, but the fixer (not No-Mistakes' CI stage) checks the
+latest published head's required checks, with the same distinction between
+registered checks, registration still pending, a trigger blocker such as a
+merge conflict, and the owner's `no_ci: true`.
+
 ## Updating
 
 ```sh
@@ -998,7 +1230,8 @@ It checks the tools and versions above (including
 Gum, all three agent CLIs, Node.js 22.13+ and npm in your shell, and Node.js
 22.13+ and `acpx` running from the No-Mistakes daemon's PATH), the shared issue agent and each gh-dash role's
 effective agent, authentication for the agents a gh-dash role or No-Mistakes
-duty uses, Herdr integrations for the gh-dash roles' agents only, the
+duty uses, Herdr integrations for the gh-dash roles' agents only (an enabled
+PR Fixer counts as a role, and doctor also checks the interfaces it needs), the
 No-Mistakes configuration link, and the pipeline agent's readiness via native
 `no-mistakes doctor` (run without update checks or telemetry). Unused agents may
 stay logged out. Doctor checks No-Mistakes login only for duties set to
@@ -1108,7 +1341,12 @@ project hooks; and, against the Codex CLI 0.166.0 source and an isolated local
 `codex mcp list` check on 2026-11-03, that a linked worktree of a trusted main
 checkout loads that worktree's `.codex/config.toml` MCP servers and
 `.codex/rules`, while hook declarations come from the main checkout and run
-only with persisted hook trust; and Arch Linux and Omarchy support against the
+only with persisted hook trust; and the PR Fixer's handoff against the
+No-Mistakes v1.106.1 source and native help (`axi run --skip`, `axi status` run
+statuses and steps, `axi sync --check` branch-sync safety and next actions,
+with `--skip` and `sync --check` also present in v1.84.0) and Herdr 0.9.5 help
+(`tab create --workspace --cwd --label --no-focus`, `tab list`, `pane list`) on
+2026-11-18; and Arch Linux and Omarchy support against the
 Arch partial-upgrade policy, the Omarchy manual (AI, Development Tools, and
 Other Packages), and the official Omarchy 4.5.0 source (`omarchy pkg add`, the
 lazy mise tools in `/etc/mise/conf.d/omarchy-tools.toml`, its agent account
@@ -1178,3 +1416,47 @@ exercised.
    installation during dispatch.
 4. On Omarchy, `make update` reports Omarchy- and mise-managed tools as manual
    updates (`omarchy update`) and runs no system, Omarchy, or mise upgrade.
+
+PR Fixer smoke test (the automated suite covers it only with inert Herdr, agent,
+No-Mistakes, and GitHub fixtures; live bot and Herdr behavior is verified only
+here). Use a disposable repository where CodeRabbit and Greptile are installed
+and review pull requests, with registered CI checks.
+
+1. `mf-config`: enable **PR Fixer** with **Both** bots, **2** rounds, and a
+   harness/model different from the Issues `I` implementer (for example Claude
+   Code for the fixer, Codex for the implementer). `mf-config show` and
+   `make doctor` report it enabled; doctor checks that harness's login and Herdr
+   integration and the fixer's No-Mistakes/Herdr interfaces. If doctor reports
+   that login or integration pending, rerun `make setup`, which offers them, and
+   continue only once `make doctor` reports ready.
+2. Press `I` on a small issue. The prompt runs
+   `no-mistakes axi run --yes --skip ci ...`, and no fixer tab exists yet.
+3. Before the run is terminal, have the handoff command from the prompt run in
+   the implementer's own recorded pane (ask the implementer to run it, or use
+   its harness's shell escape there): it refuses because the run is still
+   active, and changes nothing. From any other pane or shell it is refused for
+   that reason instead, before the run is checked. The run then finishes after
+   Push and PR with CI reported as skipped. Once the implementer runs it
+   after publication, one **PR Fixer** tab appears in the same workspace
+   (without taking focus), at the same worktree, running the fixer's
+   harness/model; the implementer's tab stays open and stops writing.
+4. Watch the fixer: it waits for both bots' reviews of the published head,
+   fixes or answers their findings and failing required checks, pushes through
+   the helper, and stops after at most two fix-and-push rounds with one result
+   (ready, pending, round limit, or blocked) and a full report. `status` shows
+   the rounds used. The PR stays open and unmerged. Before it records a result,
+   while it is waiting on the published head with no tracked edits and no
+   commits it has not yet published with `push` (in the worktree, `git status`
+   shows no tracked changes and `git rev-parse HEAD` is the `published_head`
+   that `status` reports, with no `pending_push`), exit it in its pane and press
+   `I`: it restarts in the same tab with the same budget. Exiting during
+   unpublished work instead keeps and reports that work, and nothing is
+   restarted until a human decides whose it is.
+5. After it records its result, press `I` again (also with the network down):
+   it only focuses the fixer. Exit the fixer in its pane and press `I` again:
+   nothing is restarted or prompted, and the notification and `status` report
+   the recorded result. Run the handoff command again in the implementer's
+   pane: no second fixer.
+6. Disable the fixer in `mf-config`, then press `I` on another issue: the
+   original native-CI workflow runs, with no fixer tab, while the first issue's
+   branch keeps its fixer.
