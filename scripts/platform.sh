@@ -72,10 +72,13 @@ mf_detect_platform() (
 		esac
 		package=0
 		runtime=0
-		if [ -x "$mf_pacman" ] && { [ "$("$mf_pacman" -Qq omarchy 2>/dev/null)" = omarchy ] ||
-			[ "$("$mf_pacman" -Qq omarchy-dev 2>/dev/null)" = omarchy-dev ]; }; then
-			package=1
-		fi
+		# name keeps the installed package, which a repair reinstalls.
+		for name in omarchy omarchy-dev; do
+			if [ -x "$mf_pacman" ] && [ "$("$mf_pacman" -Qq "$name" 2>/dev/null)" = "$name" ]; then
+				package=1
+				break
+			fi
+		done
 		if [ -f "$mf_omarchy" ] && [ -x "$mf_omarchy" ]; then
 			runtime=1
 		fi
@@ -90,7 +93,7 @@ mf_detect_platform() (
 			printf 'arch\n'
 			;;
 		10)
-			printf 'incomplete Omarchy installation: the omarchy package is installed but its runtime %s is missing; repair Omarchy itself (for example reinstall its package with sudo pacman -S omarchy), then rerun make setup\n' "$mf_omarchy"
+			printf 'incomplete Omarchy installation: the %s package is installed but its runtime %s is missing; repair Omarchy itself (for example reinstall its package with sudo pacman -S %s), then rerun make setup\n' "$name" "$mf_omarchy" "$name"
 			exit 1
 			;;
 		*)

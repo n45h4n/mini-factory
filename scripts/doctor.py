@@ -443,7 +443,9 @@ def main():
         acpx, acpx_problem = None, str(error)
     path = daemon_path()
     configured = "" if acpx in (None, "acpx") else " (acpx_path: " + acpx + ")"
-    # acpx runs node, so neither runs while the daemon's PATH would install a lazy mise Node.js first.
+    # acpx runs node, so neither runs while the daemon's PATH would install a lazy mise Node.js first. Any failure here
+    # leaves the pipeline agent below unchecked.
+    daemon_failures = len(failures)
     if lazy_pending("node", path):
         check(False, "", "Node.js and acpx not checked from the No-Mistakes daemon's PATH (" + path + "): its node is "
               "a lazy mise tool that is not installed yet, and running node or acpx would install it; run make setup")
@@ -468,6 +470,7 @@ def main():
                   "cannot read acpx_path (" + str(acpx_problem) + "); write it as one plain value" if acpx_problem
                   else "acpx" + configured + " or its Node.js does not run from the No-Mistakes daemon's PATH ("
                   + path + "); run make setup for the exact action")
+    daemon_ready = len(failures) == daemon_failures
     # Stable releases provide the unattended interface; any newer release that keeps it is accepted.
     if "no-mistakes" not in lazy:
         help_text = output(["no-mistakes", "axi", "run", "--help"], NO_MISTAKES_ENVIRONMENT) or ""
@@ -550,6 +553,10 @@ def main():
         # Native doctor could start one of them (such as gh for a forge profile); its result would not count anyway.
         check(False, "", "No-Mistakes pipeline agent not checked: lazy mise tools above are not installed yet; run "
               "make setup")
+    elif not daemon_ready:
+        # acpx and its Node.js are baseline for the daemon, so "ready" would contradict the failure above.
+        check(False, "", "No-Mistakes pipeline agent not checked: the No-Mistakes daemon's Node.js or acpx check "
+              "above failed; fix it as reported, then rerun make doctor")
     else:
         ready, detail = native_pipeline_status(path)
         action = "run no-mistakes doctor"

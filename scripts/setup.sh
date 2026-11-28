@@ -398,7 +398,13 @@ install_arch_dependencies() {
 	local packages=()
 	for name in "$@"; do
 		case "$name" in
-		python3) packages+=(python) ;;
+		python3)
+			# As for Git below: an installed python3 that cannot run is its owner's to repair, which --needed cannot do.
+			if path="$(command -v python3 2>/dev/null)"; then
+				die "$path cannot run or is older than Python 3.9; $(repair_hint python3 python), then rerun make setup"
+			fi
+			packages+=(python)
+			;;
 		git) ;;
 		*) packages+=("$name") ;;
 		esac
@@ -453,7 +459,7 @@ pacman_transaction() {
 	command -v sudo >/dev/null 2>&1 ||
 		die "sudo is required to install missing Arch packages ($*); as root, install sudo and allow your user to use it, then rerun make setup"
 	if [ "$platform" = omarchy ]; then
-		consent "Install missing packages with Omarchy's package route, omarchy pkg add $*? It runs sudo pacman -S --needed from Omarchy's current package databases; no system upgrade, Omarchy update, or other change." ||
+		consent "Install missing packages with Omarchy's package route, omarchy pkg add $*? It runs sudo pacman -S --noconfirm --needed from Omarchy's current package databases, so pacman asks for no further confirmation; no system upgrade, Omarchy update, or other change." ||
 			return 1
 		if ! "$mf_omarchy" pkg add "$@"; then
 			notice "omarchy pkg add $* did not complete; resolve the problem it reported (if a package could not be retrieved, update the system with omarchy update first), then rerun make setup"
@@ -470,14 +476,15 @@ pacman_transaction() {
 	hash -r
 }
 
-# How to repair an installed command that cannot run, by its owner; setup never replaces a managed installation.
+# How to repair an installed command that cannot run, by its owner (an optional second argument names its mise tool
+# when that differs from the command); setup never replaces a managed installation.
 repair_hint() {
 	local path manager
 	path="$(mf_past_wrappers "$1")" || path="$1"
 	manager="$(mf_tool_manager "$path" "$(readlink -f -- "$path" 2>/dev/null || printf '%s' "$path")")" || manager=''
 	case "$platform:$manager" in
-	omarchy:mise) printf 'Omarchy manages it with mise: repair it with mise install %s or omarchy update' "$1" ;;
-	*:mise) printf 'mise manages it: repair it with mise install %s' "$1" ;;
+	omarchy:mise) printf 'Omarchy manages it with mise: repair it with mise install %s or omarchy update' "${2:-$1}" ;;
+	*:mise) printf 'mise manages it: repair it with mise install %s' "${2:-$1}" ;;
 	omarchy:pacman:*) printf 'it belongs to pacman package %s: update Omarchy (omarchy update), then reinstall it with sudo pacman -S %s' "${manager#pacman:}" "${manager#pacman:}" ;;
 	*:pacman:*) printf 'it belongs to pacman package %s: reinstall it within a full upgrade, sudo pacman -Syu %s' "${manager#pacman:}" "${manager#pacman:}" ;;
 	*) printf 'repair it using its native installer' ;;

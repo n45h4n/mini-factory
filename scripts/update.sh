@@ -123,9 +123,9 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
-# Discovery probes (versions, help, extension lists, npm's prefix, Gum) run with MISE_OFFLINE=1, so a mise shim neither
-# installs a lazy tool nor updates one before you approve anything; a tool that cannot run offline is left to setup.
-# Approved updates and the setup run stay online.
+# Discovery probes (versions, help, extension lists, npm's prefix, the daemon's PATH, Gum) run with MISE_OFFLINE=1, so
+# a mise shim neither installs a lazy tool nor updates one before you approve anything; a tool that cannot run offline
+# is left to setup. Approved updates and the setup run stay online (the gh-dash upgrade keeps only mise offline).
 tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
@@ -269,7 +269,7 @@ plan_upgrade() {
 	# acpx and the node it starts run from the No-Mistakes daemon's PATH, as setup and doctor check them.
 	if [ "$tool" = acpx ] || [ "$tool" = node ]; then
 		[ "$tool" = acpx ] || acpx=node
-		daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
+		daemon_path="$(MISE_OFFLINE=1 python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
 		# shellcheck disable=SC2016 # Resolve the executable using the daemon's PATH, not this shell's.
 		if ! path="$(env PATH="$daemon_path" /bin/sh -c 'command -v "$1"' sh "$acpx" 2>/dev/null)"; then
 			if [ "$tool" = node ]; then
@@ -364,7 +364,8 @@ run_plan() {
 		;;
 	# The npm whose global prefix plan_acpx checked.
 	npm) npm "${plan_targets[@]}" ;;
-	extension) gh extension upgrade dash ;;
+	# You approved the extension, not gh: mise stays offline so a mise gh does not update itself; gh still downloads.
+	extension) MISE_OFFLINE=1 gh extension upgrade dash ;;
 	# Keeping the bin directory on PATH avoids the native installers' profile-editing branches, as in setup.
 	native) PATH="$bin_directory:$PATH" "$plan_path" update ;;
 	esac

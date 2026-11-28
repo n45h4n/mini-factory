@@ -1036,7 +1036,9 @@ def daemon_path():
         except (ImportError, KeyError, OSError):
             shell = ""
     shell = shell or "bash"
-    environment = {key: os.environ[key] for key in ("USER", "LOGNAME") if key in os.environ}
+    # A caller's MISE_OFFLINE (doctor's and update discovery's) reaches rc files that activate mise, so the probe
+    # updates or installs no mise tool; setup's probe stays online.
+    environment = {key: os.environ[key] for key in ("USER", "LOGNAME", "MISE_OFFLINE") if key in os.environ}
     environment.update(HOME=home, PATH=os.pathsep.join(known), SHELL=shell)
     interactive = ["-i"] if os.path.basename(shell) in ("bash", "zsh") else []
     entries = []

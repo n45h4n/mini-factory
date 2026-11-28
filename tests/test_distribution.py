@@ -420,8 +420,10 @@ elif name == "no-mistakes":
                   + ")\n\n  some checks failed")
         elif os.environ.get("MOCK_NM_DOCTOR") == "fail":
             print("  \u2717 gate validation  unavailable: agent cursor needs acpx\n\n  some checks failed")
-        elif os.environ.get("MOCK_NM_DOCTOR") == "lookpath" and not shutil.which("codex"):
-            # Like native doctor, the pipeline agent resolves from this process's PATH.
+        elif os.environ.get("MOCK_NM_DOCTOR") == "lookpath" and not shutil.which("codex", path=os.pathsep.join(
+                entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry.startswith(str(home) + "/"))):
+            # Like native doctor, the pipeline agent resolves from this process's PATH (its test-home entries, so a
+            # host Codex in a system directory cannot decide the result).
             print("  \u2717 gate validation  agent codex not found\n\n  some checks failed")
         else:
             print("  \u2713 gate validation  codex is runnable")
@@ -2709,6 +2711,10 @@ exec '""" + shutil.which("chmod", path=REAL_PATH) + """' "$@"
         self.assertIn("which finds " + str(self.daemon_node) + " v18.19.1; your shell's Node.js does not count",
                       doctor.stdout)
         self.assertIn("restart the No-Mistakes daemon, which keeps the PATH it started with", doctor.stdout)
+        # Native doctor's readiness would contradict that failure, so the pipeline agent is not checked.
+        self.assertIn("FAIL: No-Mistakes pipeline agent not checked: the No-Mistakes daemon's Node.js or acpx check "
+                      "above failed", doctor.stdout)
+        self.assertNotIn("OK: No-Mistakes pipeline agent ready", doctor.stdout)
         self.assertEqual(self.daemon_node.read_text(), old_node)
         self.assertFalse(self.npm_changes() + self.calls("sudo")
                          + [c for c in self.calls("brew") if c["args"][:1] in (["install"], ["upgrade"])])
@@ -4366,7 +4372,10 @@ os.execv(executable, [executable, *args])
             ("arm64 Arch", "ID=arch\n", {"MOCK_ARCH": "aarch64"}, "Arch Linux and Omarchy are supported on x86_64 only"),
             ("EndeavourOS", "ID=endeavouros\nID_LIKE=arch\n", {}, derivative.format("endeavouros")),
             ("Manjaro", "ID=manjaro\nID_LIKE=arch\n", {}, derivative.format("manjaro")),
-            ("Omarchy package without its runtime", "ID=arch\n", {"package": True}, "incomplete Omarchy installation"),
+            ("Omarchy package without its runtime", "ID=arch\n", {"package": True},
+             "reinstall its package with sudo pacman -S omarchy)"),
+            ("Omarchy development package without its runtime", "ID=arch\n", {"MOCK_PACMAN_INSTALLED": "omarchy-dev"},
+             "reinstall its package with sudo pacman -S omarchy-dev)"),
             ("Omarchy runtime without its package", "ID=arch\n", {"runtime": True}, "incomplete Omarchy installation"),
             ("Omarchy before 4.0 (a git checkout, not a package)", "ID=arch\n", {"legacy": True},
              "legacy Omarchy installation"),
@@ -4416,12 +4425,8 @@ os.execv(executable, [executable, *args])
 
     def test_mocked_arch_installs_missing_prerequisites_in_one_consented_full_upgrade(self):
         self.arch_system()
-        for name in ("gh", "gum", "jq", "node", "npm"):
+        for name in ("gh", "gum", "jq", "node", "npm", "python3"):
             (self.mock / name).unlink()
-        python = self.mock / "python3"
-        python.unlink()
-        python.write_text("#!/bin/sh\nexit 1\n")
-        python.chmod(0o755)
         # Official Arch package names: python provides python3 and github-cli provides gh.
         expected = {"python", "jq", "gum", "github-cli", "nodejs", "npm"}
         transactions = lambda: [c["args"] for c in self.calls("sudo")]
@@ -4496,8 +4501,9 @@ os.execv(executable, [executable, *args])
 
     def test_mocked_arch_gives_reinstall_guidance_for_a_broken_or_old_pacman_package_instead_of_needed(self):
         self.arch_system()
-        self.env["MOCK_PACMAN_OWNERS"] = json.dumps({str(self.mock / "gum"): "gum"})
-        # pacman -Syu --needed skips an installed, up-to-date package, so it cannot repair Arch's Gum.
+        python = self.mock / "python3"
+        self.env["MOCK_PACMAN_OWNERS"] = json.dumps({str(self.mock / "gum"): "gum", str(python): "python"})
+        # pacman -Syu --needed skips an installed, up-to-date package, so it cannot repair Arch's Gum or Python.
         for label, env in (("broken", {"MOCK_GUM": "broken"}), ("old", {"MOCK_GUM_VERSION": "0.14.0"})):
             with self.subTest(label):
                 self.log.write_text("")
@@ -4509,6 +4515,17 @@ os.execv(executable, [executable, *args])
                 self.assertFalse(self.calls("sudo") + self.calls("omarchy"))
                 self.assertFalse(self.installed.exists())
                 self.assert_no_apt()
+        python.unlink()
+        python.write_text("#!/bin/sh\nexit 1\n")
+        python.chmod(0o755)
+        self.log.write_text("")
+        result = self.interactive_setup("y")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(str(python) + " cannot run or is older than Python 3.9; it belongs to pacman package python: "
+                      "reinstall it within a full upgrade, sudo pacman -Syu python, then rerun make setup",
+                      " ".join(result.stdout.split()))
+        self.assertFalse(self.calls("sudo") + self.calls("omarchy"))
+        self.assertFalse(self.installed.exists())
 
     def test_mocked_omarchy_setup_lets_mise_install_only_its_required_lazy_tools_and_keeps_its_settings(self):
         system, shims = self.omarchy_system()
@@ -4553,9 +4570,15 @@ os.execv(executable, [executable, *args])
         # Later these are not installed for this user any more: running one, even for --version, would install it.
         for tool in ("gh", "codex", "cursor-agent", "node"):
             (self.mock / ("mise-installed-" + tool)).unlink()
+        # Omarchy's login shell activates mise, which can update a due tool unless mise is offline: doctor's and update
+        # discovery's probes of the daemon's PATH keep it offline, and setup's probe stays online.
+        probe = self.root / "login-shell-mise"
+        with (self.home / ".bash_profile").open("a") as profile:
+            profile.write('echo "${MISE_OFFLINE:-online}" >>"' + str(probe) + '"\n')
         self.log.write_text("")
         doctor = self.run_script(self.installed / "scripts/doctor.sh")
         self.assertNotEqual(doctor.returncode, 0)
+        self.assertEqual(probe.read_text().split(), ["1"])
         for name in ("gh", "codex", "cursor-agent", "node", "npm"):
             self.assertIn("FAIL: " + name + " is a lazy mise tool that is not installed yet (running it would install "
                           "it first), so doctor did not run it; setup pending: run make setup", doctor.stdout)
@@ -4569,8 +4592,12 @@ os.execv(executable, [executable, *args])
         # make update leaves mise's tools to Omarchy without running their updaters; its setup phase runs them as
         # usual, so mise installs them on first use.
         self.log.write_text("")
+        probe.write_text("")
         result = self.update()
         self.assert_success(result)
+        probes = probe.read_text().split()
+        self.assertIn("online", probes)
+        self.assertEqual(set(probes[:probes.index("online")]), {"1"})
         for label, name in (("GitHub CLI", "gh"), ("Codex", "codex"), ("Cursor CLI", "cursor-agent")):
             self.assertIn(label + ": manual update only: " + str(shims / name) + " is managed by mise for Omarchy: "
                           "omarchy update updates it", result.stdout)
@@ -4679,13 +4706,15 @@ os.execv(executable, [executable, *args])
         self.assertEqual(self.native_updates("claude"), [["update"]])
         self.assertEqual(self.native_updates("no-mistakes"), [["update"]])
         self.assertIn(["extension", "upgrade", "dash"], [c["args"] for c in self.calls("gh")])
-        # Discovery runs gh with mise offline; only the upgrade you approve, and the setup run after it, run it online.
+        # Discovery and the gh-dash upgrade you approve run gh with mise offline, so mise updates gh only in the setup
+        # run after them.
         calls = self.calls("gh")
         approved = [c["args"] for c in calls].index(["extension", "upgrade", "dash"])
         self.assertTrue(calls[:approved])
-        self.assertEqual({c["env"].get("MISE_OFFLINE") for c in calls[:approved]}, {"1"})
-        self.assertIsNone(calls[approved]["env"].get("MISE_OFFLINE"))
-        self.assertEqual((self.mock / "auto-updated-gh").read_text().splitlines()[0], "extension upgrade dash")
+        self.assertEqual({c["env"].get("MISE_OFFLINE") for c in calls[:approved + 1]}, {"1"})
+        updated = (self.mock / "auto-updated-gh").read_text().splitlines()
+        self.assertTrue(updated)
+        self.assertNotIn("extension upgrade dash", updated)
         for tool in ("gh", "codex", "cursor-agent", "herdr"):
             self.assertFalse(self.native_updates(tool), tool)
         # No system, Omarchy, or mise upgrade stage runs.
@@ -4790,8 +4819,8 @@ os.execv(executable, [executable, *args])
         # Gum is missing, so the plain bootstrap prompt asks; declining changes nothing.
         result = self.interactive_setup("n")
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("Install missing packages with Omarchy's package route, omarchy pkg add gum herdr?",
-                      " ".join(result.stdout.split()))
+        self.assertIn("Install missing packages with Omarchy's package route, omarchy pkg add gum herdr? It runs sudo "
+                      "pacman -S --noconfirm --needed", " ".join(result.stdout.split()))
         self.assertIn("dependencies pending: gum herdr", result.stdout)
         self.assertFalse(self.calls("omarchy") + self.calls("sudo"))
         self.log.write_text("")

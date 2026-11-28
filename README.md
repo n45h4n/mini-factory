@@ -169,8 +169,9 @@ packages and tools, and setup reuses them:
 
 - Missing system prerequisites go through Omarchy's package route,
   `omarchy pkg add <packages>`, after your consent (it runs
-  `sudo pacman -S --needed` from Omarchy's current package databases; no system
-  upgrade). Herdr is Omarchy's `herdr` package.
+  `sudo pacman -S --noconfirm --needed` from Omarchy's current package
+  databases, so pacman asks for no further confirmation; no system upgrade).
+  Herdr is Omarchy's `herdr` package.
 - Omarchy 4.5 provides `gh`, Codex, Claude Code, Cursor CLI, and Node.js as lazy
   [mise tools](https://omarchy.org/manual/development-tools/): the first run of
   a tool's mise shim installs it. Setup runs the tools it needs as it would on
@@ -906,11 +907,13 @@ checks.
   (`omarchy update`, or `mise upgrade`): its own updater would install a copy
   mise does not track. Behind Omarchy's agent account wrappers, the installation
   the wrapper runs decides. Discovery probes (versions, help, the extension
-  list, npm's prefix, and Gum) run with `MISE_OFFLINE=1`, so they never install
-  or update a lazy mise tool before you approve anything. A tool that cannot
-  run offline (such as a lazy `gh` that is not installed yet) is left to the
-  setup run; rerun `make update` afterwards to update it. Approved updates and
-  the setup run stay online. `make update` has no system or Omarchy upgrade
+  list, npm's prefix, the No-Mistakes daemon's PATH, and Gum) run with
+  `MISE_OFFLINE=1`, so they never install or update a lazy mise tool before you
+  approve anything. A tool that cannot run offline (such as a lazy `gh` that is
+  not installed yet) is left to the setup run; rerun `make update` afterwards
+  to update it. Approved updates and the setup run stay online; the approved
+  gh-dash upgrade runs `gh` with only mise offline, so mise does not update
+  `gh` along with it. `make update` has no system or Omarchy upgrade
   stage; its setup run offers only genuinely missing dependencies, under
   setup's consent rules. Independent user-level installations (for example your
   own native Claude Code), setup's `acpx`, No-Mistakes, and the gh-dash
@@ -1050,7 +1053,7 @@ Before committing changes, review the diff and run the focused checks:
 git diff --check
 make test
 # For changes to the launcher, setup/doctor, or worker shell scripts:
-bash -n bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/platform.sh scripts/integrations/gh-dash/*.sh tests/arch-smoke.sh
+(for file in bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/platform.sh scripts/integrations/gh-dash/*.sh tests/arch-smoke.sh; do bash -n "$file" || exit; done)
 shellcheck -x bin/ghd bin/mf-config bin/nm-config scripts/setup.sh scripts/update.sh scripts/doctor.sh scripts/platform.sh scripts/integrations/gh-dash/*.sh tests/arch-smoke.sh
 # For setup changes affecting Arch (needs Docker; CI runs it too):
 tests/arch-smoke.sh
@@ -1153,7 +1156,11 @@ up to date), also run the checks below. They observe the state before setup
 (setup's first package offer and, on Omarchy, its pending lazy tools), so they
 need a fresh, disposable account that has never run `make setup`, and they run
 separately from step 1 above. An account that has already completed step 1
-cannot show that state; use another fresh account for these checks.
+cannot show that state; use another fresh account for these checks. A fresh
+account does not remove system packages, so the first package offer also
+needs a host that lacks at least one required package; on a host that has
+them all, setup correctly offers no transaction, so record that offer as not
+exercised.
 
 1. `make setup` names the platform: ordinary Arch offers one
    `sudo pacman -Syu --needed ...` with the upgrade warning, and Omarchy offers
