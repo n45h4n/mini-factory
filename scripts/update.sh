@@ -5,8 +5,11 @@
 set -euo pipefail
 
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/platform.sh
+. "$bundle/scripts/platform.sh"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/mini-factory"
 bin_directory="$HOME/.local/bin"
+platform=''
 home=''
 codex_home=''
 upstream=''
@@ -120,14 +123,17 @@ fast_forward() {
 	notice "Clone: $clone_status."
 }
 
+# Discovery probes (versions, help, extension lists, npm's prefix, the daemon's PATH, Gum) run with MISE_OFFLINE=1, so
+# a mise shim neither installs a lazy tool nor updates one before you approve anything; a tool that cannot run offline
+# is left to setup. Approved updates and the setup run stay online (the gh-dash upgrade keeps only mise offline).
 tool_version() {
 	local text=''
 	if [ "$1" = gh-dash ]; then
-		text="$(gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
+		text="$(MISE_OFFLINE=1 gh extension list 2>/dev/null | awk -F '\t' '$2 == "dlvhdr/gh-dash" { print $3 }')" || true
 	elif [ "$1" = acpx ] || [ "$1" = node ]; then
-		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$plan_path" --version 2>/dev/null)" || true
+		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 MISE_OFFLINE=1 "$plan_path" --version 2>/dev/null)" || true
 	else
-		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$1" --version 2>/dev/null)" || true
+		text="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 MISE_OFFLINE=1 "$1" --version 2>/dev/null)" || true
 	fi
 	printf '%s\n' "${text%%$'\n'*}"
 }
@@ -148,7 +154,7 @@ plan_package() {
 			;;
 		esac
 	fi
-	if [ "$(uname -s)" = Linux ] && command -v dpkg >/dev/null 2>&1 && owner="$(dpkg -S "$real" 2>/dev/null)"; then
+	if [ "$platform" = ubuntu ] && command -v dpkg >/dev/null 2>&1 && owner="$(dpkg -S "$real" 2>/dev/null)"; then
 		owner="${owner%%: *}"
 		case ", $owner," in
 		*", $package,"* | *", $package:"*)
@@ -185,7 +191,7 @@ plan_acpx() {
 		plan_targets=(install -g --prefix "$HOME/.local" acpx@latest)
 		;;
 	*)
-		prefix="$(npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
+		prefix="$(MISE_OFFLINE=1 npm prefix -g 2>/dev/null)" && prefix="$(physical_path "$prefix")" || prefix=''
 		case "$real" in
 		"$prefix/lib/node_modules/acpx/"*)
 			if [ ! -w "$prefix/lib/node_modules" ]; then
@@ -212,12 +218,15 @@ plan_gh_dash() {
 		plan_manual='GitHub CLI is missing; make setup installs it and then offers the extension'
 		return 0
 	fi
-	list="$(gh extension list 2>/dev/null)" || true
+	if ! list="$(MISE_OFFLINE=1 gh extension list 2>/dev/null)"; then
+		plan_manual='GitHub CLI did not list its extensions (for example it is not logged in yet, or is a lazy mise tool that is not installed yet, which this check never installs); make setup checks it and offers the extension if missing; rerun make update afterwards to update an installed one'
+		return 0
+	fi
 	if grep -Eq "[[:space:]]dlvhdr/gh-dash([[:space:]]|\$)" <<<"$list"; then
 		plan_kind=extension
 		plan_text='gh extension upgrade dash'
 		plan_detail='the dlvhdr/gh-dash GitHub CLI extension; never --force'
-	elif gh dash --version >/dev/null 2>&1; then
+	elif MISE_OFFLINE=1 gh dash --version >/dev/null 2>&1; then
 		plan_manual='gh dash is not the dlvhdr/gh-dash extension; update it the way you installed it'
 	else
 		plan_manual='not installed; make setup offers gh extension install dlvhdr/gh-dash'
@@ -260,7 +269,7 @@ plan_upgrade() {
 	# acpx and the node it starts run from the No-Mistakes daemon's PATH, as setup and doctor check them.
 	if [ "$tool" = acpx ] || [ "$tool" = node ]; then
 		[ "$tool" = acpx ] || acpx=node
-		daemon_path="$(python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
+		daemon_path="$(MISE_OFFLINE=1 python3 -I -B "$bundle/scripts/nm_config.py" daemon-path)"
 		# shellcheck disable=SC2016 # Resolve the executable using the daemon's PATH, not this shell's.
 		if ! path="$(env PATH="$daemon_path" /bin/sh -c 'command -v "$1"' sh "$acpx" 2>/dev/null)"; then
 			if [ "$tool" = node ]; then
@@ -271,12 +280,19 @@ plan_upgrade() {
 			return 0
 		fi
 		plan_path="$path"
-	elif ! path="$(command -v "$tool" 2>/dev/null)"; then
+	# Omarchy's agent account wrappers run the command PATH finds past them, whose owner decides its update.
+	elif ! path="$(mf_past_wrappers "$tool" 2>/dev/null)"; then
 		plan_manual='not installed; make setup offers its installer'
 		return 0
 	fi
 	if ! real="$(physical_path "$path")"; then
 		plan_manual="cannot resolve $path; update it with the tool that installed it"
+		return 0
+	fi
+	# A tool mise or pacman manages (on Omarchy, Omarchy's) updates through that manager; acpx keeps plan_acpx's npm
+	# ownership checks.
+	if [ "$tool" != acpx ] && plan_manual="$(mf_update_hint "$path" "$real" "$platform")"; then
+		plan_manual="$plan_manual; make update never runs its own updater, which would install a copy its manager does not track, or upgrades system packages"
 		return 0
 	fi
 	case "$tool" in
@@ -324,7 +340,7 @@ plan_upgrade() {
 		plan_manual="$real is not the native installation that '$tool update' manages; update it with the tool that installed it"
 		return 0
 	fi
-	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 "$path" --help 2>&1)" || true
+	help="$(NO_MISTAKES_NO_UPDATE_CHECK=1 NO_MISTAKES_TELEMETRY=0 MISE_OFFLINE=1 "$path" --help 2>&1)" || true
 	if ! grep -Eq "^[[:space:]]*(${tool}[[:space:]]+)?update([[:space:]|]|\$)" <<<"$help"; then
 		plan_detail=''
 		plan_manual="the installed $tool does not list an update command; update it with its native installer"
@@ -346,8 +362,10 @@ run_plan() {
 		fi
 		sudo apt-get install -y --only-upgrade --no-install-recommends "${plan_targets[@]}"
 		;;
-	npm) PATH="$bin_directory:$PATH" npm "${plan_targets[@]}" ;;
-	extension) gh extension upgrade dash ;;
+	# The npm whose global prefix plan_acpx checked.
+	npm) npm "${plan_targets[@]}" ;;
+	# You approved the extension, not gh: mise stays offline so a mise gh does not update itself; gh still downloads.
+	extension) MISE_OFFLINE=1 gh extension upgrade dash ;;
 	# Keeping the bin directory on PATH avoids the native installers' profile-editing branches, as in setup.
 	native) PATH="$bin_directory:$PATH" "$plan_path" update ;;
 	esac
@@ -356,7 +374,7 @@ run_plan() {
 # Gum 0.15+ distinguishes Ctrl+C (130) from a declined confirmation (1).
 gum_is_suitable() {
 	command -v gum >/dev/null 2>&1 || return 1
-	gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
+	MISE_OFFLINE=1 gum --version 2>/dev/null | awk 'NR == 1 {sub(/^v/, "", $3); split($3,v,"."); exit !($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && (v[1] > 0 || v[2] >= 15))} END {if (!NR) exit 1}'
 }
 
 offer_upgrade() {
@@ -435,6 +453,8 @@ main() {
 	local setup_status=0
 	[ "$#" -eq 0 ] || die 'usage: scripts/update.sh (run make update)'
 	check_clone
+	# An unsupported platform still fast-forwards (a newer release may support it); setup below reports it.
+	platform="$(mf_detect_platform)" || platform=unsupported
 	notice '== Mini-Factory clone =='
 	fast_forward
 	offer_upgrades
