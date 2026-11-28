@@ -4494,6 +4494,22 @@ os.execv(executable, [executable, *args])
         self.assert_success(self.setup())
         self.assertFalse(self.calls("sudo"))
 
+    def test_mocked_arch_gives_reinstall_guidance_for_a_broken_or_old_pacman_package_instead_of_needed(self):
+        self.arch_system()
+        self.env["MOCK_PACMAN_OWNERS"] = json.dumps({str(self.mock / "gum"): "gum"})
+        # pacman -Syu --needed skips an installed, up-to-date package, so it cannot repair Arch's Gum.
+        for label, env in (("broken", {"MOCK_GUM": "broken"}), ("old", {"MOCK_GUM_VERSION": "0.14.0"})):
+            with self.subTest(label):
+                self.log.write_text("")
+                result = self.interactive_setup("y", **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(str(self.mock / "gum") + " cannot run or is older than Gum 0.15; it belongs to pacman "
+                              "package gum: reinstall it within a full upgrade, sudo pacman -Syu gum, then rerun make "
+                              "setup", " ".join(result.stdout.split()))
+                self.assertFalse(self.calls("sudo") + self.calls("omarchy"))
+                self.assertFalse(self.installed.exists())
+                self.assert_no_apt()
+
     def test_mocked_omarchy_setup_lets_mise_install_only_its_required_lazy_tools_and_keeps_its_settings(self):
         system, shims = self.omarchy_system()
         settings = {self.home / ".config/mise/config.toml": '[settings]\ndisable_tools = ["crush"]\n',

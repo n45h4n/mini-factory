@@ -406,12 +406,12 @@ install_arch_dependencies() {
 	# The native installers unpack with gzip, part of Arch's base like their other tools.
 	command -v gzip >/dev/null 2>&1 || packages+=(gzip)
 	[ -r /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
-	# A missing Git, GitHub CLI, or Gum gets its official package, as does a pacman-owned one on Arch (its full upgrade
-	# also upgrades an old one). Any other installation, such as one mise manages or an Omarchy package (omarchy pkg add
-	# skips installed packages), is its owner's to repair; no competing package is added.
+	# A missing Git, GitHub CLI, or Gum gets its official package. An installed one that cannot run or is too old, such
+	# as one mise manages or a pacman package (pacman -S --needed skips installed packages), is its owner's to repair;
+	# no competing package is added.
 	for name in git gh gum; do
 		"${name}_is_suitable" && continue
-		if path="$(command -v "$name" 2>/dev/null)" && { [ "$platform" = omarchy ] || ! pacman_owned "$path"; }; then
+		if path="$(command -v "$name" 2>/dev/null)"; then
 			case "$name" in
 			git) floor='Git 2.29' ;;
 			gh) floor='GitHub CLI 2.47' ;;
